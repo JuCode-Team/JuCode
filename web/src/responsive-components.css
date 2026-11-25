@@ -1,0 +1,25 @@
+/* Narrow, component-scoped responsive fixes kept separate from the shared stylesheet. */
+@media (max-width: 640px) {
+  .jc-payment-dialog,
+  .jc-announcement-dialog { max-height: calc(100dvh - 24px); overflow-y: auto; }
+  .jc-payment-actions > *,
+  .jc-announcement-actions > * { flex: 1 1 auto; }
+  .jc-announcement-actions { width: 100%; }
+
+
+  .ep-snippet-head { align-items: stretch; flex-direction: column; gap: 12px; }
+  .ep-tabbar { width: 100%; overflow-x: auto; }
+  .ep-tab { flex: 0 0 auto; white-space: nowrap; }
+  .ep-codeblock-head { align-items: flex-start; gap: 8px; }
+  .ep-codeblock-title { overflow-wrap: anywhere; }
+  .ep-card-url { min-width: 0; }
+  .ep-card-url code { overflow-wrap: anywhere; word-break: break-word; }
+  .status-group > .rt-Flex:first-child { min-width: 0; }
+  .status-page-title { font-size: 40px !important; }
+}
+
+@media (max-width: 420px) {
+  .trace-home-actions { align-items: stretch; flex-direction: column; }
+  .trace-home-actions > a { width: 100%; text-align: center; }
+  .trace-home-hero-grid { min-height: 620px; }
+}

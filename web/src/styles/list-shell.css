@@ -1,0 +1,285 @@
+/* ============ List shell: filter bar · applied chips · list card · pager ============
+   Layout and structure only. Control, table, card and button appearance
+   comes from console-radix.css; this file never restyles those.
+   The filter controls share class names with the usage ledger's filter bar
+   (ledger.css), so every rule for them is scoped under .jc-list-filters. */
+
+/* ---- Filter card wrapper ---- */
+.radix-themes .rt-Card.jc-filter-card {
+  --pn-card-pad: 0;
+  padding: 0;
+  overflow: visible;
+}
+
+/* ---- Filter bar ---- */
+.jc-list-filters { display: flex; flex-direction: column; }
+.jc-filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 12px 16px;
+}
+.jc-filter-controls {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.jc-filter-trailing {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+.jc-filter-trailing .rt-Text { color: var(--c-on-surface-variant); }
+
+/* Desktop width comes from the component's --jc-filter-width; phones drop it. */
+.jc-list-filters .jc-filter-select,
+.jc-list-filters .jc-filter-input { width: var(--jc-filter-width, auto); }
+
+/* Labelled select: 「字段：值」 */
+.jc-list-filters .rt-SelectTrigger.jc-filter-select { padding-inline: 10px 8px; gap: 4px; }
+.jc-list-filters .jc-filter-select .rt-SelectTriggerInner {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+.jc-filter-field-label {
+  flex: 0 0 auto;
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-caption);
+}
+.jc-filter-field-label::after { content: "："; }
+.jc-filter-field-value {
+  font-size: var(--text-body-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* An applied filter keeps a primary edge; focus and open states keep the
+   shared focus ring from console-radix. */
+.jc-list-filters .rt-SelectTrigger.jc-filter-select.is-active:not(:focus-visible):not([data-state="open"]),
+.jc-list-filters .rt-TextFieldRoot.jc-filter-input.is-active:not(:focus-within) {
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c-primary-bright) 55%, var(--c-outline-variant));
+}
+
+/* Labelled text input */
+.jc-list-filters .jc-filter-input-label {
+  padding-left: 10px;
+  padding-right: 0;
+  color: var(--c-on-surface-variant);
+}
+.jc-list-filters .jc-filter-input-label .rt-Text { white-space: nowrap; }
+.jc-list-filters .jc-filter-input-label .rt-Text::after { content: "："; }
+.jc-list-filters .jc-filter-input .rt-TextFieldInput { font-size: var(--text-body-sm); }
+
+/* Date range inside the bar: fixed width so the row stays stable; same
+   field surface as the inputs next to it. */
+.jc-list-filters .jc-filter-field { flex: 0 1 auto; min-width: 0; }
+.jc-list-filters .jc-filter-field .jc-log-filter-range {
+  --jc-date-range-min-width: 300px;
+  flex: 0 1 auto;
+  width: 380px;
+  max-width: 100%;
+  min-width: 0;
+}
+.jc-list-filters .jc-filter-field .jc-date-range-trigger {
+  padding: 5px 10px;
+  background: var(--c-surface-container-lowest);
+  font-size: var(--text-body-sm);
+  transition: border-color var(--dur-fast) var(--ease-io);
+}
+.jc-list-filters .jc-filter-field .jc-date-range-trigger span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.jc-list-filters .jc-filter-field.is-active .jc-date-range-trigger {
+  border-color: color-mix(in oklab, var(--c-primary-bright) 55%, var(--c-outline-variant));
+}
+
+/* 更多筛选 toggle */
+.jc-list-filters .rt-Button.jc-filter-more { padding-inline: 8px; gap: 4px; }
+.jc-filter-more-icon { transition: transform var(--dur-base) var(--ease-io); }
+.jc-list-filters .jc-filter-more.is-open .jc-filter-more-icon { transform: rotate(180deg); }
+.jc-filter-more-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in oklab, var(--c-primary) 18%, transparent);
+  color: var(--c-primary-bright);
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* Collapsible advanced row: grid-rows 0fr→1fr keeps height animatable. */
+.jc-filter-advanced {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--dur-base) var(--ease-io);
+}
+.jc-filter-advanced.is-open { grid-template-rows: 1fr; }
+.jc-filter-advanced-inner { min-height: 0; overflow: hidden; }
+.jc-filter-advanced .jc-filter-row { padding-top: 0; padding-bottom: 12px; }
+.jc-filter-advanced:not(.is-open) .jc-filter-row { visibility: hidden; }
+
+/* Applied filters row */
+.jc-filter-applied {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  min-height: 40px;
+  padding: 6px 16px;
+  border-top: 1px solid var(--c-outline-variant);
+}
+.jc-filter-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.jc-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 6px 0 9px;
+  border: 1px solid color-mix(in oklab, var(--c-primary-bright) 40%, var(--c-outline-variant));
+  border-radius: var(--radius-pill);
+  background: color-mix(in oklab, var(--c-primary) 10%, transparent);
+  color: var(--c-on-surface);
+  font: inherit;
+  font-size: var(--text-caption);
+  line-height: 1;
+  cursor: pointer;
+  animation: jc-chip-in var(--dur-fast) var(--ease-out);
+  transition: border-color var(--dur-fast) var(--ease-io), background-color var(--dur-fast) var(--ease-io);
+}
+.jc-filter-chip:hover {
+  border-color: var(--c-primary-bright);
+  background: color-mix(in oklab, var(--c-primary) 16%, transparent);
+}
+.jc-filter-chip:focus-visible { outline: 2px solid var(--c-focus-ring); outline-offset: 1px; }
+.jc-filter-chip svg { color: var(--c-on-surface-variant); }
+.jc-filter-chip:hover svg { color: var(--c-on-surface); }
+.jc-filter-chip-label { color: var(--c-on-surface-variant); }
+.jc-filter-chip-label::after { content: "："; }
+.jc-filter-chip-value { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@keyframes jc-chip-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.rt-Button.jc-filter-clear { height: 26px; padding-inline: 6px; }
+.jc-filter-summary {
+  flex: 0 0 auto;
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.jc-filter-summary strong { color: var(--c-on-surface); font-weight: 500; }
+
+/* ---- List card: head · flush table · pager (mirrors .jc-data-table-card) ---- */
+.radix-themes .rt-Card.jc-list-card {
+  --pn-card-pad: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.jc-list-card .rt-TableRoot { border-radius: 0; box-shadow: none; background: transparent; }
+.jc-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-height: 48px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--c-outline-variant);
+}
+.jc-list-head-title {
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-body-sm);
+  font-variant-numeric: tabular-nums;
+}
+.jc-list-head-title strong { color: var(--c-on-surface); font-weight: 500; }
+.jc-list-head-actions { display: flex; align-items: center; gap: 8px; }
+
+/* Cell helpers — same mono/tabular treatment as the usage ledger. */
+.jc-admin-page .jc-cell-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.jc-admin-page .jc-cell-muted { color: var(--c-on-surface-variant); }
+.jc-cell-actions { white-space: nowrap; }
+.jc-cell-actions > .rt-Flex { justify-content: flex-end; gap: 4px; }
+
+/* Expand handle column */
+.radix-themes .jc-list-card .rt-TableRootTable :where(.rt-TableColumnHeaderCell, .rt-TableCell).jc-cell-expand {
+  width: 28px;
+  padding-inline: 8px 0;
+  color: var(--c-on-surface-variant);
+}
+.jc-cell-expand svg { display: block; transition: transform var(--dur-fast) var(--ease-io); }
+.rt-TableRow.is-expanded .jc-cell-expand svg { transform: rotate(90deg); color: var(--c-on-surface); }
+/* Detail / empty rows span the table; their content owns its padding. */
+.radix-themes .jc-list-card .rt-TableRootTable .rt-TableBody .rt-TableRow.jc-list-detail-row > .rt-TableCell {
+  height: auto;
+  padding: 0;
+}
+
+/* Empty state */
+.jc-list-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 160px;
+  padding: 32px 16px;
+  color: var(--c-on-surface-variant);
+  text-align: center;
+}
+.jc-list-empty svg { color: var(--c-outline); }
+.jc-list-empty-title { color: var(--c-on-surface); font-size: var(--text-ui); font-weight: 500; }
+.jc-list-empty-hint { font-size: var(--text-caption); }
+
+/* Pager footer */
+.jc-list-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 16px;
+  border-top: 1px solid var(--c-outline-variant);
+}
+.jc-list-pager-nav { display: flex; align-items: center; gap: 4px; }
+.rt-Button.jc-list-pager-page { min-width: 56px; }
+
+@media (max-width: 768px) {
+  .jc-filter-row { flex-wrap: wrap; padding: 10px 12px; }
+  .jc-filter-controls { width: 100%; }
+  /* On a phone the controls share the row in pairs. */
+  .jc-filter-controls > * { flex: 1 1 calc(50% - 4px); min-width: 0; max-width: 100%; }
+  .jc-list-filters .jc-filter-select,
+  .jc-list-filters .jc-filter-input { width: auto; }
+  .jc-filter-controls > .jc-filter-field { flex-basis: 100%; }
+  .jc-list-filters .jc-filter-field .jc-log-filter-range { width: 100%; min-width: 0; }
+  .jc-filter-trailing { width: 100%; margin-left: 0; justify-content: space-between; }
+  .jc-filter-applied { flex-direction: column; align-items: flex-start; padding: 8px 12px; }
+  .jc-list-head { padding: 8px 12px; }
+  .jc-list-pager { padding: 6px 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jc-filter-advanced,
+  .jc-filter-chip,
+  .jc-filter-more-icon,
+  .jc-cell-expand svg { transition: none; animation: none; }
+}

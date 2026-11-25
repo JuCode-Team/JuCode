@@ -1,0 +1,26 @@
+/* Responsive rules scoped to user and customer-support pages. */
+@media (max-width: 767px) {
+  .pn-console .jc-usage-quota-grid { grid-template-columns: 1fr; }
+
+  .pn-console .jc-billing-section > .rt-TableRoot { overflow-x: auto; }
+  .pn-console .jc-billing-section .rt-TableRootTable { min-width: 620px; }
+
+  .pn-console .jc-ticket-page { height: auto !important; min-height: 0; }
+  .pn-console .jc-ticket-layout { display: flex; flex-direction: column; flex-wrap: nowrap; }
+  .pn-console .jc-ticket-list-pane,
+  .pn-console .jc-ticket-detail-pane { flex: 0 0 auto !important; width: 100%; min-width: 0 !important; }
+  .pn-console .jc-ticket-list-pane { max-height: 42dvh; }
+  .pn-console .jc-ticket-detail-pane { min-height: 360px !important; }
+  .pn-console .jc-ticket-thread-actions { width: 100%; }
+  .pn-console .jc-ticket-thread-actions > * { flex: 1 1 140px; }
+  .pn-console .jc-ticket-messages { max-height: 55dvh; }
+
+  .pn-console .jc-adjust-balance-row { display: flex; flex-direction: column; gap: 12px; }
+  .pn-console .jc-adjust-balance-row > * { width: 100%; }
+
+}
+
+@media (max-width: 479px) {
+  .pn-console .jc-ticket-thread-actions > * { flex-basis: 100%; width: 100%; }
+  .pn-console .jc-ticket-detail-card { padding-inline: 12px; }
+}

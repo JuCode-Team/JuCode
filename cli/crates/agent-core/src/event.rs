@@ -1,0 +1,291 @@
+use crate::hunks::HunkView;
+
+#[derive(Debug, Clone)]
+pub struct TreeNodeView {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub label: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionListItemView {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelOptionView {
+    pub model: String,
+    /// What the gateway calls it for people; None: the id.
+    pub label: Option<String>,
+    pub active: bool,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    pub reasoning_efforts: Vec<String>,
+}
+
+/// One row of the `/login` provider picker.
+#[derive(Debug, Clone)]
+pub struct LoginProviderView {
+    pub id: String,
+    pub label: String,
+    /// Flow kind and sign-in state, e.g. "oauth · signed in".
+    pub detail: String,
+    /// Currently configured provider.
+    pub active: bool,
+    /// The flow is a pasted API key, not a browser/device dance.
+    pub wants_key: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandView {
+    pub command: String,
+    pub marker: Option<String>,
+    pub args: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpToolView {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerView {
+    pub name: String,
+    pub transport: String,
+    /// "connected" | "connecting" | "failed" | "disabled"
+    pub state: String,
+    pub error: Option<String>,
+    pub tools: Vec<McpToolView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GoalView {
+    pub objective: String,
+    pub status: String,
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanItem {
+    pub step: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum TranscriptItem {
+    User(String),
+    /// A user message with the images attached to it.
+    UserWithImages {
+        content: String,
+        images: Vec<String>,
+    },
+    Assistant(String),
+    Tool {
+        name: String,
+        output: String,
+    },
+    Branch(String),
+    /// A plan proposed in plan mode, with its latest status.
+    Plan {
+        id: String,
+        title: String,
+        content: String,
+        status: String,
+    },
+}
+
+/// One category of the context (`ContextBreakdown`): its name (as Claude
+/// Code names them, so clients label both alike), tokens, and kind — `used`,
+/// `buffer` (kept free for auto-compaction) or `free`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextCategory {
+    pub name: &'static str,
+    pub tokens: u64,
+    pub kind: &'static str,
+}
+
+#[derive(Debug)]
+pub enum AgentEvent {
+    Startup {
+        version: String,
+        session_id: String,
+        profile_dir: String,
+        config_path: String,
+        cwd: String,
+        model: String,
+        context_window: u64,
+    },
+    ModelStatus {
+        provider: String,
+        model: String,
+        model_label: Option<String>,
+        reasoning_effort: String,
+        context_window: u64,
+        context_limit: u64,
+        max_output_tokens: u64,
+        reasoning_efforts: Vec<String>,
+        state: String,
+    },
+    PendingMessages(Vec<String>),
+    /// A queued message taken back (`unqueue`): its text and images, for the
+    /// client to edit again.
+    Unqueued {
+        content: String,
+        images: Vec<String>,
+    },
+    UserMessage(String),
+    /// Pre-fill the input box (e.g. with a checked-out user message).
+    FillInput(String),
+    Connecting,
+    CompactionStart,
+    CompactionProgress {
+        output_tokens: u64,
+    },
+    CompactionEnd,
+    CompactionFailed(String),
+    ContextUsage {
+        tokens: u64,
+        tokenizer: String,
+        /// Cumulative USD cost so far this session. 0 when prices are unconfigured.
+        cost: f64,
+    },
+    /// What the context holds, by category (`context_usage` op); `error`
+    /// when it could not be worked out.
+    ContextBreakdown {
+        total: u64,
+        max: u64,
+        categories: Vec<ContextCategory>,
+        memory_files: Vec<(String, u64)>,
+        error: Option<String>,
+    },
+    ThinkingStart,
+    ReasoningDelta(String),
+    AssistantStart,
+    AssistantDelta(String),
+    /// A model request failed with `reason` and is re-sent after `delay_ms`
+    /// as attempt `attempt` of `max_attempts`.
+    Retrying {
+        attempt: usize,
+        max_attempts: usize,
+        reason: String,
+        delay_ms: u64,
+    },
+    ToolStart {
+        call_id: String,
+        name: String,
+    },
+    ToolUpdate {
+        call_id: String,
+        name: String,
+        output: String,
+    },
+    ToolOutput {
+        call_id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+    SubagentLifecycle {
+        path: String,
+        status: String,
+        message: String,
+        /// The agent's task name, model and the spawn_agent call that started it.
+        label: String,
+        model: String,
+        tool_use_id: String,
+    },
+    /// Every subagent of the session (`agent_runs` rows, oldest first).
+    AgentRuns(Vec<serde_json::Value>),
+    /// One subagent's work (`subagent_transcript`); None: unknown id.
+    SubagentTranscript {
+        agent_id: String,
+        items: Option<Vec<serde_json::Value>>,
+    },
+    Usage {
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    },
+    TreeView(Vec<TreeNodeView>),
+    ResumeView(Vec<SessionListItemView>),
+    /// Ask the user whether to trust the current project's local resources.
+    TrustPrompt {
+        cwd: String,
+        repo_root: Option<String>,
+    },
+    ModelView {
+        models: Vec<ModelOptionView>,
+        active_effort: String,
+    },
+    /// Interactive provider picker emitted by bare `/login`.
+    LoginPicker(Vec<LoginProviderView>),
+    CommandList(Vec<CommandView>),
+    Goal(Option<GoalView>),
+    Plan(Vec<PlanItem>),
+    /// Plan mode: the plan while the model writes it (`append` is the text
+    /// added since the last draft event); `id` is the propose_plan call id
+    /// the finished plan comes with.
+    PlanDraft {
+        id: String,
+        title: String,
+        append: String,
+    },
+    /// Plan mode: a plan waiting for the user (`pending`), approved, or being
+    /// revised; `id` is the propose_plan call id.
+    ProposedPlan {
+        id: String,
+        title: String,
+        markdown: String,
+        status: String,
+    },
+    ApprovalRequest {
+        call_id: String,
+        name: String,
+        summary: String,
+        /// Path of the subagent that issued the gated call; None for the main agent.
+        subagent_id: Option<String>,
+        /// Hunk breakdown of a gated edit tool call; the client may answer
+        /// with a subset of these ids to apply only part of the change. None
+        /// for non-edit tools (or when planning failed): whole-call only.
+        hunks: Option<Vec<HunkView>>,
+    },
+    /// A gated call made while no client was watching: recorded instead of
+    /// blocking the turn. Decide it later with `AgentCore::decide_action`.
+    ActionDeferred(crate::actions::DeferredAction),
+    /// A deferred action was decided. `output` is set when it ran.
+    ActionDecided {
+        id: String,
+        allow: bool,
+        output: Option<String>,
+        is_error: bool,
+    },
+    /// Whether a client is watching; unattended sessions defer gated calls.
+    Attended(bool),
+    /// The session's current tool approval mode (emitted on startup and on change).
+    ApprovalMode {
+        mode: String,
+    },
+    CheckpointView(Vec<SessionListItemView>),
+    /// Configured MCP servers with their connection state and tools (emitted
+    /// at startup, on state changes, and after every mcp_* serve mutation).
+    McpServers {
+        servers: Vec<McpServerView>,
+    },
+    /// The conversation, each item with when it was written (seconds; 0:
+    /// unknown).
+    Transcript(Vec<(TranscriptItem, u64)>),
+    Info(String),
+    Error(String),
+    Status(String),
+}

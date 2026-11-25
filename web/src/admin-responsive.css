@@ -1,0 +1,25 @@
+/* Page-local responsive safeguards for admin and agent screens. */
+.jc-local-table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.jc-local-table-scroll > table,
+.jc-local-table-scroll > .rt-TableRoot {
+  min-width: max-content;
+}
+
+@media (max-width: 767px) {
+  .jc-table-panel {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .rt-DialogContent {
+    width: calc(100vw - 1.5rem);
+    max-width: calc(100vw - 1.5rem) !important;
+  }
+}

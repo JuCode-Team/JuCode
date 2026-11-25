@@ -1,0 +1,365 @@
+/* Legacy mobile adaptation block - prefer component-level responsive rules for new work. */
+/* ============ Mobile adaptation ============ */
+@media (max-width: 768px) {
+  :root,
+  .dark,
+  .light {
+    --spacing-gutter: 16px;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  .jc-root-main {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .jc-truncate {
+    max-width: min(100%, 240px);
+  }
+
+  .jc-hide-md {
+    display: none !important;
+  }
+
+  .jc-stat-grid,
+  .jc-chart-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .jc-chart-grid > *,
+  .jc-stat-grid > * {
+    min-width: 0;
+  }
+
+  .pn-console .jc-responsive-min-width {
+    min-width: 0 !important;
+  }
+
+  .pn-console .jc-responsive-stack {
+    flex: 1 1 100% !important;
+    max-width: 100%;
+  }
+
+  .pn-console .rt-Flex {
+    min-width: 0;
+  }
+
+  .pn-console .rt-Card {
+    max-width: 100%;
+  }
+
+  .pn-console .rt-TableRoot {
+    max-width: 100%;
+  }
+
+  .pn-console .rt-TableRootTable {
+    min-width: 680px;
+  }
+
+  .pn-console .rt-TableCell,
+  .pn-console .rt-TableColumnHeaderCell {
+    white-space: nowrap;
+  }
+
+  /* Dialog content is portaled OUTSIDE .pn-console, so the table rules
+     above never reach tables embedded in dialogs (member lists, settlement
+     breakdowns, API-key tables, etc.) — they overflow the dialog on mobile
+     with no scroll. Re-apply the same scroll + min-width contract scoped to
+     dialog/alert-dialog content. Floor is smaller (520px) since dialogs are
+     narrower than the full page. */
+  .rt-DialogContent .rt-TableRoot,
+  .rt-AlertDialogContent .rt-TableRoot {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .rt-DialogContent .rt-TableRootTable,
+  .rt-AlertDialogContent .rt-TableRootTable {
+    min-width: 520px;
+  }
+
+  .rt-DialogContent .rt-TableCell,
+  .rt-DialogContent .rt-TableColumnHeaderCell,
+  .rt-AlertDialogContent .rt-TableCell,
+  .rt-AlertDialogContent .rt-TableColumnHeaderCell {
+    white-space: nowrap;
+  }
+
+  .pn-console .rt-Button {
+    min-height: 34px;
+  }
+
+  .pn-console .rt-TextFieldRoot,
+  .pn-console .rt-TextAreaRoot,
+  .pn-console .rt-SelectTrigger,
+  .rt-DialogContent .rt-TextFieldRoot,
+  .rt-DialogContent .rt-TextAreaRoot,
+  .rt-DialogContent .rt-SelectTrigger,
+  .rt-AlertDialogContent .rt-TextFieldRoot,
+  .rt-AlertDialogContent .rt-TextAreaRoot,
+  .rt-AlertDialogContent .rt-SelectTrigger {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .pn-console .jc-ticket-thread-actions {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+    max-width: 100%;
+  }
+
+  .pn-console .jc-ticket-thread-actions > .rt-Button,
+  .pn-console .jc-ticket-thread-actions > .rt-SelectTrigger {
+    flex: 0 0 auto !important;
+  }
+
+  .pn-console .jc-ticket-thread-actions > .rt-SelectTrigger {
+    width: auto !important;
+    min-width: 104px !important;
+  }
+
+  .rt-DialogContent,
+  .rt-AlertDialogContent {
+    width: calc(100vw - 32px) !important;
+    max-width: calc(100vw - 32px) !important;
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
+  }
+
+  .rt-BaseMenuContent {
+    max-width: calc(100vw - 24px);
+  }
+
+  .jc-data-table-toolbar,
+  .jc-data-table-controls,
+  .jc-data-table-pager {
+    width: 100%;
+  }
+
+  .jc-data-table-toolbar {
+    align-items: stretch !important;
+  }
+
+  .jc-data-table-controls {
+    flex-direction: column;
+    align-items: stretch !important;
+  }
+
+  .jc-data-table-search {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+  }
+
+  .jc-data-table-pager {
+    justify-content: flex-end;
+    flex-wrap: nowrap;
+    row-gap: 8px;
+  }
+
+  .jc-data-table-scroll,
+  .jc-data-table-viewport {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .jc-data-table-viewport table,
+  .jc-data-table-scroll .rt-TableRootTable {
+    min-width: 680px;
+  }
+
+  .jc-log-filters {
+    display: contents;
+  }
+
+  .jc-log-filter-row {
+    display: contents;
+  }
+
+  .jc-log-filter-select {
+    flex: 1 1 calc(50% - 30px);
+    width: auto;
+    min-width: 92px !important;
+  }
+
+  .jc-log-filter-input {
+    flex: 1 1 calc(50% - 30px);
+    width: auto;
+    min-width: 92px !important;
+    max-width: none;
+  }
+
+  .jc-admin-log-filter-bar .jc-log-filter-range {
+    flex: 1 1 100%;
+    width: auto;
+    min-width: 0 !important;
+    max-width: 100%;
+  }
+
+  .jc-admin-log-filter-bar .jc-log-filter-select,
+  .jc-admin-log-filter-bar .jc-log-filter-input {
+    flex: 1 1 calc(50% - 4px);
+    width: auto;
+    min-width: 92px !important;
+    max-width: none;
+  }
+
+  .jc-admin-log-filter-reset {
+    flex: 0 0 auto;
+  }
+
+  .pn-splash-brand {
+    font-size: 30px;
+  }
+
+  .thinking-line {
+    max-width: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .thinking-line > span {
+    min-width: 0;
+  }
+
+  .btn-premium-primary,
+  .btn-premium-secondary,
+  .btn-premium-ghost,
+  .btn-premium-danger {
+    min-height: 44px;
+  }
+
+  .ep-shell {
+    padding: 40px 16px 64px;
+  }
+
+  .ep-container {
+    gap: 28px;
+  }
+
+  .ep-grid,
+  .ep-tips {
+    grid-template-columns: 1fr;
+  }
+
+  .ep-card {
+    padding: 18px;
+  }
+
+  .ep-card-url {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ep-card-copy {
+    width: fit-content;
+  }
+
+  .ep-snippet-head,
+  .ep-codeblock-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ep-tabbar {
+    width: 100%;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .ep-tab {
+    flex: 0 0 auto;
+  }
+
+  .ep-codeblock-pre {
+    padding: 14px;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  .ep-tip-card {
+    padding: 14px;
+  }
+
+  footer {
+    text-align: left;
+  }
+}
+
+@media (max-width: 640px) {
+  .jc-hide-sm {
+    display: none !important;
+  }
+
+  .jc-container {
+    padding-inline: 12px;
+  }
+
+  .pn-console .rt-ContainerInner {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .rt-DialogContent,
+  .rt-AlertDialogContent {
+    width: calc(100vw - 24px) !important;
+    max-width: calc(100vw - 24px) !important;
+  }
+
+  .pn-hero-title {
+    max-width: 100%;
+    font-size: clamp(32px, 11vw, 44px);
+    line-height: 1.1;
+  }
+
+  .typewriter-wrap,
+  .thinking-pulse {
+    min-width: 0;
+  }
+
+  .coin {
+    flex: 0 0 auto;
+  }
+
+  .ep-title {
+    font-size: 30px;
+  }
+
+  .ep-sub {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 480px) {
+  :root,
+  .dark,
+  .light {
+    --spacing-gutter: 14px;
+  }
+
+  .jc-data-table-viewport table,
+  .jc-data-table-scroll .rt-TableRootTable,
+  .pn-console .rt-TableRootTable {
+    min-width: 620px;
+  }
+
+  .ep-shell {
+    padding-inline: 14px;
+  }
+
+  .ep-card-title {
+    font-size: var(--text-heading-sm);
+  }
+}

@@ -1,0 +1,364 @@
+/* forms.css — admin form vocabulary (see components/form/FormLayout.tsx).
+   One owner file for: Field / FieldGrid / FormSection / FormDialog /
+   DangerZone / SaveBar and the settings side navigation. */
+
+/* ---------- Field ---------- */
+.jc-field { min-width: 0; }
+.jc-field-label {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: var(--c-on-surface);
+  font-family: var(--font-body);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+.jc-field-code {
+  padding: 0 5px;
+  border-radius: var(--radius-xs);
+  background: var(--c-surface-container-high);
+  color: var(--c-on-surface-variant);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  font-weight: 400;
+  line-height: 1.6;
+}
+.jc-field-req {
+  color: var(--c-danger-text);
+  font-weight: 600;
+  line-height: 1;
+}
+.jc-field-control > .rt-TextFieldRoot,
+.jc-field-control > .rt-TextAreaRoot,
+.jc-field-control > .rt-SelectTrigger { width: 100%; }
+.jc-field-hint,
+.jc-field-error {
+  margin-top: 6px;
+  font-size: var(--text-caption);
+  line-height: 1.55;
+}
+.jc-field-hint { color: var(--c-on-surface-variant); }
+.jc-field-hint code { font-family: var(--font-mono); font-size: inherit; color: var(--c-on-surface); }
+.jc-field-error { color: var(--c-danger-text); }
+
+/* ---------- FieldGrid ---------- */
+.jc-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 20px;
+  align-items: start;
+}
+.jc-field-grid[data-columns="1"] { grid-template-columns: minmax(0, 1fr); }
+.jc-field-grid[data-columns="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.jc-field-span-full { grid-column: 1 / -1; }
+@media (max-width: 640px) {
+  .jc-field-grid[data-columns="2"],
+  .jc-field-grid[data-columns="3"] { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------- FormSection ---------- */
+.jc-form-section { min-width: 0; }
+.jc-form-section + .jc-form-section { margin-top: 28px; }
+.jc-form-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--c-outline-variant);
+}
+.jc-form-section-heading { min-width: 0; }
+.jc-form-section-title {
+  margin: 0;
+  color: var(--c-on-surface);
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+.jc-form-section-desc {
+  margin: 4px 0 0;
+  max-width: 68ch;
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-body-sm);
+  line-height: 1.6;
+}
+.jc-form-section-desc code { font-family: var(--font-mono); font-size: inherit; color: var(--c-on-surface); }
+.jc-form-section-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.jc-form-section-body { padding-top: 16px; }
+.jc-form-section-body > * + * { margin-top: 16px; }
+.jc-form-stack > * + * { margin-top: 16px; }
+
+/* ---------- FormDialog ---------- */
+.rt-DialogContent.jc-form-dialog {
+  display: flex;
+  flex-direction: column;
+  max-height: min(88vh, 920px);
+  padding: 0;
+  overflow: hidden;
+}
+.jc-form-dialog-head {
+  flex: 0 0 auto;
+  padding: 20px 24px 14px;
+  border-bottom: 1px solid var(--c-outline-variant);
+}
+.jc-form-dialog-head > .jc-form-dialog-title { margin: 0; }
+.jc-form-dialog-head > .jc-form-dialog-desc { margin-top: 4px; color: var(--c-on-surface-variant); }
+.jc-form-dialog-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 20px 24px 24px;
+  overflow-y: auto;
+}
+.jc-form-dialog-foot {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 24px 16px;
+  border-top: 1px solid var(--c-outline-variant);
+  background: var(--c-surface-container);
+}
+.jc-form-dialog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.jc-form-dialog-actions-left,
+.jc-form-dialog-actions-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.jc-form-dialog-actions-right { justify-content: flex-end; margin-left: auto; }
+.jc-form-error.rt-CalloutRoot { padding: 8px 12px; }
+
+/* Step indicator used by the account wizard header. */
+.jc-steps {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 14px;
+}
+.jc-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 4px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--c-on-surface-variant);
+  font: 500 var(--text-body-sm)/1.2 var(--font-body);
+  cursor: default;
+  transition: background-color var(--dur-fast) var(--ease-io), color var(--dur-fast) var(--ease-io);
+}
+.jc-step[data-state="done"] { cursor: pointer; }
+.jc-step[data-state="done"]:hover { background: var(--c-surface-container-high); color: var(--c-on-surface); }
+.jc-step[data-state="current"] { color: var(--c-on-surface); }
+.jc-step:focus-visible { outline: 2px solid var(--c-focus-ring); outline-offset: 1px; }
+.jc-step-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--c-outline-variant);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  line-height: 1;
+}
+.jc-step[data-state="current"] .jc-step-dot { border-color: var(--c-primary); background: var(--c-primary); color: var(--c-on-primary); }
+.jc-step[data-state="done"] .jc-step-dot { border-color: var(--c-primary); color: var(--c-primary-bright); }
+.jc-step-sep { width: 14px; height: 1px; background: var(--c-outline-variant); }
+.jc-form-dialog[data-size="md"] .jc-step:not([data-state="current"]) .jc-step-label { display: none; }
+.jc-form-dialog[data-size="md"] .jc-step:not([data-state="current"]) { padding-right: 4px; }
+.jc-steps-count {
+  margin-left: auto;
+  color: var(--c-on-surface-variant);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+}
+
+/* Source segmented control (wizard step 0) — tabs share the dialog head. */
+/* The head already draws the bottom rule; drop the tab list's own to avoid a double line. */
+.jc-form-dialog-head .rt-TabsList { margin-top: 12px; border-bottom: 0; }
+.jc-form-dialog-body .rt-TabsContent:focus-visible { outline: none; }
+
+/* Choice list rows (wizard sources / model picks). */
+.jc-choice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-io), background-color var(--dur-fast) var(--ease-io);
+}
+.jc-choice:hover { border-color: var(--c-outline); }
+.jc-choice[data-selected="true"] { border-color: var(--c-primary); background: color-mix(in oklab, var(--c-primary) 8%, transparent); }
+.jc-choice:focus-visible { outline: 2px solid var(--c-focus-ring); outline-offset: 2px; }
+.jc-choice-main { flex: 1 1 auto; min-width: 0; }
+.jc-choice-title { display: flex; align-items: center; gap: 8px; font-size: var(--text-ui); font-weight: 500; }
+.jc-choice-sub {
+  margin-top: 2px;
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-caption);
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.jc-choice-sub.jc-mono-text { font-family: var(--font-mono); }
+.jc-choice-meta { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.jc-choice-check { flex: 0 0 auto; color: var(--c-primary-bright); }
+.jc-choice-list { display: flex; flex-direction: column; gap: 8px; }
+.jc-choice-group-title {
+  margin: 4px 0 8px;
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-caption);
+  font-weight: 500;
+}
+.jc-choice-list + .jc-choice-group-title { margin-top: 16px; }
+
+/* Plain checkbox / toggle rows inside forms. */
+.jc-check-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: var(--text-ui);
+}
+.jc-check-row input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--c-primary); }
+.jc-check-rows { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+.jc-toggle-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: var(--radius-control);
+}
+.jc-toggle-row[data-disabled="true"] { opacity: .6; }
+.jc-toggle-row-title { font-size: var(--text-ui); font-weight: 500; }
+.jc-toggle-row-hint { margin-top: 2px; color: var(--c-on-surface-variant); font-size: var(--text-caption); line-height: 1.55; }
+.jc-toggle-row-hint code { font-family: var(--font-mono); font-size: inherit; color: var(--c-on-surface); }
+.jc-toggle-row > .rt-SwitchRoot { flex: 0 0 auto; margin-top: 2px; }
+.jc-toggle-rows { display: flex; flex-direction: column; gap: 8px; }
+
+/* ---------- DangerZone ---------- */
+.jc-danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 28px;
+  padding: 14px 16px;
+  border: 1px solid var(--c-danger-line);
+  border-radius: var(--radius-control);
+  background: var(--c-danger-soft);
+}
+.jc-danger-zone-title { color: var(--c-danger-text); font-size: var(--text-ui); font-weight: 500; }
+.jc-danger-zone-desc { margin-top: 2px; color: var(--c-on-surface-variant); font-size: var(--text-caption); line-height: 1.55; }
+.jc-danger-zone-action { flex: 0 0 auto; }
+
+/* ---------- SaveBar ---------- */
+.jc-savebar {
+  position: sticky;
+  bottom: 12px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 12px 20px;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: var(--radius-control);
+  background: var(--c-surface-container);
+  box-shadow: var(--shadow-1);
+}
+.jc-savebar-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.jc-savebar-status { display: flex; align-items: center; gap: 8px; color: var(--c-on-surface-variant); font-size: var(--text-body-sm); }
+.jc-savebar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+/* ---------- Settings: side navigation + content ---------- */
+.jc-settings-layout {
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  align-items: start;
+}
+.jc-settings-nav {
+  position: sticky;
+  top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 16px 12px 16px 0;
+  border-right: 1px solid var(--c-outline-variant);
+}
+.jc-settings-nav-group {
+  margin: 18px 12px 6px;
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-caption);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.jc-settings-nav-group:first-child { margin-top: 0; }
+.jc-settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--c-on-surface-variant);
+  font: 400 var(--text-body-sm)/1.4 var(--font-body);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-io), color var(--dur-fast) var(--ease-io);
+}
+.jc-settings-nav-item:hover { background: var(--c-surface-container-high); color: var(--c-on-surface); }
+.jc-settings-nav-item[aria-current="true"] {
+  background: color-mix(in oklab, var(--c-primary) 10%, transparent);
+  color: var(--c-on-surface);
+  font-weight: 500;
+  box-shadow: inset 2px 0 0 var(--c-primary);
+}
+.jc-settings-nav-item:focus-visible { outline: 2px solid var(--c-focus-ring); outline-offset: -2px; }
+.jc-settings-nav-item svg { flex: 0 0 auto; color: var(--c-on-surface-variant); }
+.jc-settings-nav-item[aria-current="true"] svg { color: var(--c-primary-bright); }
+.jc-settings-content { min-width: 0; max-width: 880px; padding: 16px 0 8px 28px; }
+.jc-settings-content-head { margin-bottom: 24px; }
+.jc-settings-content-title { margin: 0; font-size: var(--text-heading-sm); font-weight: 500; line-height: 1.3; letter-spacing: 0; }
+.jc-settings-content-sub { margin: 4px 0 0; color: var(--c-on-surface-variant); font-size: var(--text-body-sm); line-height: 1.6; }
+
+@media (max-width: 900px) {
+  .jc-settings-layout { grid-template-columns: minmax(0, 1fr); }
+  .jc-settings-nav {
+    position: static;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 4px;
+    padding: 0 0 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--c-outline-variant);
+    scrollbar-width: none;
+  }
+  .jc-settings-nav-group { display: none; }
+  .jc-settings-nav-item { width: auto; flex: 0 0 auto; white-space: nowrap; }
+  .jc-settings-nav-item[aria-current="true"] { box-shadow: inset 0 -2px 0 var(--c-primary); border-radius: var(--radius-control) var(--radius-control) 0 0; }
+  .jc-settings-content { padding: 16px 0 0; }
+}

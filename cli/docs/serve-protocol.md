@@ -1,0 +1,363 @@
+# `jucode serve` Protocol
+
+`jucode serve` is a persistent bidirectional protocol mode for GUI/IDE
+front-ends. The process reads newline-delimited JSON commands on stdin and
+emits the engine's `AgentEvent` stream as newline-delimited JSON on stdout —
+the same schema `--headless` uses. It runs until stdin closes, an `op:"shutdown"`
+arrives, or a `command` op carries `/quit` or `/exit`.
+
+`jucode serve --chat` starts a chat session instead: it runs in `~/.jucode/chats`
+with the chat prompt (conversation and web research) and without project
+instructions or project skills. Any engine started in that directory, or
+inside it, is a chat session as well.
+
+This is the richer of JuCode's two embedding protocols. `jucode acp` is the
+standardized subset for ACP clients.
+
+## Framing
+
+- One JSON object per line, both directions. No length prefixes, no batching.
+- stdout is flushed after every event line; consumers should read incrementally.
+- Empty lines are ignored.
+- A line that fails to parse produces `{"type":"error","message":"invalid command: ..."}`
+  and the process keeps running. An unknown op produces
+  `{"type":"error","message":"unknown op: ..."}`. Malformed input never exits
+  the process.
+
+## Protocol version
+
+This document describes protocol version 2. The first line on stdout is
+
+```json
+{"type":"hello","protocol":2,"version":"0.3.0"}
+```
+
+A client that does not support `protocol` must stop instead of guessing.
+Every later event carries a `session` field with the engine's current
+session id, the same shape the daemon uses to multiplex several sessions on
+one connection (`docs/daemon-protocol.md`). Ops may carry a `session`
+field; `jucode serve` hosts exactly one session and ignores it.
+
+## Lifecycle
+
+After `hello`, before any command, the engine emits its startup batch:
+
+```jsonl
+{"type":"startup","version":"0.2.0","session_id":"...","profile_dir":"...","config_path":"...","cwd":"...","model":"...","context_window":200000}
+{"type":"model_status","provider":"...","model":"...","reasoning_effort":"...","context_window":200000,"context_limit":160000,"max_output_tokens":32000,"reasoning_efforts":["low","medium","high"],"state":"ready"}
+{"type":"command_list","commands":[{"command":"/help","marker":null,"args":"","description":"..."}]}
+{"type":"approval_mode","mode":"manual"}
+{"type":"mcp_servers","servers":[...]}
+{"type":"trust_prompt","cwd":"...","repo_root":"..."}        // only when an untrusted project has local resources
+{"type":"info","message":"..."}                              // session_start hook output, if any
+```
+
+`startup.version` is the CLI version; front-ends should record it for
+compatibility checks.
+
+After startup the loop polls every ~30 ms. `model_status` is deduplicated:
+it is re-emitted only when its content changes. All other events are emitted
+as they occur — command responses first, then background worker events
+(streaming deltas, tool progress, MCP state changes, update notices) as they
+arrive.
+
+The process exits with code 0 on `shutdown`, stdin EOF, or `/quit` / `/exit`
+sent through the `command` op.
+
+## Commands (stdin)
+
+Every command is a JSON object with an `op` field.
+
+### `user_message`
+
+```json
+{"op":"user_message","content":"refactor the parser","images":["/abs/path.png"]}
+```
+
+Submits a user turn. `images` is an optional array of local image paths;
+unattachable paths produce `info` events and are skipped. `files` is an
+optional array of other local files (absolute paths, any type): they are not
+inlined; the model is told where each is saved, one line
+`[Attached file "<name>" is saved at: <path>]` per file after the text, and
+opens it with its own tools. Events and the transcript carry them back as
+`files` next to `content`, without those lines.
+
+If a turn is already running, the message is queued instead: the engine emits
+`pending_messages` (the full queue) and `status:"queued: N"`. Queued messages
+start automatically when the current turn ends — no client action needed.
+
+### `command`
+
+```json
+{"op":"command","input":"/model gpt-5.5 medium"}
+```
+
+Runs any slash command exactly as the TUI would (`/model`, `/resume`,
+`/compact`, `/approve`, `/mcp`, custom commands, MCP prompt commands, ...).
+Structured views come back as events (`model_view`, `resume_view`,
+`tree_view`, ...). `/quit` and `/exit` terminate the process.
+
+### `steer`
+
+```json
+{"op":"steer","index":-1}
+```
+
+Sends a queued message into the in-flight turn: `index` picks it (the next
+one when absent; negative counts from the last, so `-1` is the message just
+sent; out of range is a no-op). The model reads it
+before its next request (once the current tool calls finish), and running
+tools and subagents keep going. Emits `status:"steering"` and the updated
+`pending_messages`; when the model reads it, a `user_message` event (it is
+saved as the user's message). If the turn ends before reading it, it runs as
+the next turn. A queued message with images still stops the turn and starts
+a new one with it. No-op when idle or when the queue is empty.
+
+### `unqueue`
+
+```json
+{"op":"unqueue","index":0}
+```
+
+Takes a queued message back out of the queue (`index` as for `steer`).
+Emits the updated `pending_messages` and
+`{"type":"unqueued","content":"…","images":[…],"files":[…]}` (`files` only
+when it had some) with what it held, for the
+client to edit again. No-op when nothing is there.
+
+### `interrupt`
+
+```json
+{"op":"interrupt"}
+```
+
+Stops the in-flight turn without touching the queue: aborts the worker,
+closes subagents, clears pending approvals. Emits
+`info:"request interrupted"` and `status:"interrupted"`. Queued messages still
+auto-start as the next turn; send `interrupt` again (or avoid queueing) to
+stop those too. No-op when idle.
+
+```json
+{"op":"interrupt","index":-1}
+```
+
+With `index` (as for `steer`), queued message `index` moves to the front and
+starts the next turn at once: the client's "interrupt and send". The daemon's
+Claude Code, Codex and ACP sessions take the same field.
+
+### `approve`
+
+```json
+{"op":"approve","call_id":"call_9","decision":"allow","always":false,"hunks":["f0h1"]}
+```
+
+Structured answer to an `approval_request` event; equivalent to the
+`/approve` slash command.
+
+- `call_id` (required): the `call_id` from the request.
+- `decision` (required): `"allow"` or `"deny"`.
+- `always` (optional, default `false`): on allow, add the tool to the
+  per-session allowlist so it stops asking.
+- `hunks` (optional): for edit-tool requests that carried a `hunks` list,
+  apply only these hunk ids. Omit or `null` for the whole call. Cannot be
+  combined with `always`.
+
+Validation errors emit `error` and leave the request pending, so the client
+can retry with a corrected op.
+
+### `set_approval_mode`
+
+```json
+{"op":"set_approval_mode","mode":"manual"}
+```
+
+`mode` is `manual`, `plan`, `auto-edit`, `auto`, or `full-access`. Emits
+`status:"approval mode: ..."` and an `approval_mode` event. The change
+applies to new turns; an in-flight turn's gating can only loosen.
+
+`plan` is plan mode: only read-only tools run (reads, listing, search,
+web search/fetch, read-only shell commands, MCP tools marked
+`readOnlyHint`, subagents, which inherit the mode). Every other call
+returns an error telling the model to plan instead. The model delivers
+its plan with the `propose_plan` tool, which emits `proposed_plan` and
+ends the turn.
+
+### `agent_runs` / `subagent_transcript`
+
+```json
+{"op":"agent_runs"}
+{"op":"subagent_transcript","agent_id":"/root/lister"}
+```
+
+The agent trace. `agent_runs` answers with the `agent_runs` event (also
+sent on its own while subagents work, at most twice a second, and at once
+on a lifecycle change). `subagent_transcript` answers with one agent's
+work: `{"type":"subagent_transcript","agent_id","items":[...]}`, items
+`{"role":"user","content"}` (the task first, then messages the parent
+sent), `{"role":"assistant","content"}`, `{"role":"reasoning","content"}`
+and `{"role":"tool","call_id","name","input","output","running","is_error"}`.
+Each agent keeps at most 300 items and 256 KB of text (older steps are
+replaced by one "… earlier steps trimmed" item); tool input and output are
+cut to 4 KB (output keeps its end). An unknown id answers with `"error"`
+instead of `items`. Agents of earlier turns (the 24 most recent) stay
+listed and readable.
+
+### `approve_plan`
+
+```json
+{"op":"approve_plan","id":"plan-1a2b3c4d5e6f7a8b","decision":"approve","mode":"auto-edit"}
+{"op":"approve_plan","id":"plan-1a2b3c4d5e6f7a8b","decision":"revise","feedback":"Also add a test"}
+```
+
+`approve` re-emits the plan with `status:"approved"`, switches the
+approval mode to `mode` (default `auto-edit`; `plan` is not allowed) and
+starts a turn that implements the plan (optional `feedback` is passed
+along as notes). `revise` re-emits it with `status:"revising"`, keeps
+plan mode, and starts a turn asking for a complete revised plan with the
+`feedback`, which is required. An unknown or already approved `id`
+returns an `error` event. The text command `/plan <id> approve [mode]
+[notes]` / `/plan <id> revise <feedback>` does the same (the TUI uses it).
+
+### `set_attended`
+
+```json
+{"op":"set_attended","attended":false}
+```
+
+Marks whether a client is watching the session (default `true`). While
+unattended, a tool call that would emit `approval_request` is recorded as a
+deferred action instead: the engine emits `action_deferred`, the model gets a
+"submitted for confirmation" result, and the turn continues without waiting.
+Switching to `false` also converts calls already waiting on an
+`approval_request` into deferred actions. Emits `attended`.
+
+An identical call (same tool, arguments and working directory) reuses the
+open deferred action, or the decision already made for it in this engine.
+
+### `decide_action`
+
+```json
+{"op":"decide_action","action":"act-1727500000000-3f9a1c2b","decision":"allow"}
+```
+
+Decides the deferred action whose id is `action`. `allow` runs the call with its original arguments
+in the background; `deny` does not run it. Either way the engine emits
+`action_decided` and sends the outcome to the session as a user message,
+which starts a turn (or queues behind the running one). Unknown ids emit
+`error`.
+
+### MCP ops
+
+`mcp_list`, `mcp_set`, `mcp_remove`, `mcp_toggle` manage configured MCP
+servers and emit the `mcp_servers` view. See `docs/mcp.md` → "Serve protocol
+ops" for the full shapes.
+
+### `shutdown`
+
+```json
+{"op":"shutdown"}
+```
+
+Exits the process with code 0. Closing stdin has the same effect.
+
+## Events (stdout)
+
+Every line is `{"type": <name>, ...}`. All types emitted by the engine:
+
+| `type` | Fields | Meaning |
+| --- | --- | --- |
+| `startup` | `version`, `session_id`, `profile_dir`, `config_path`, `cwd`, `model`, `context_window` | First event; identifies the session. |
+| `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code and ACP sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
+| `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
+| `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
+| `agent_runs` | `workflows: []`, `agents: [{id, label, model, effort, state, started_at, duration_ms, tokens, tool_calls, prompt, result, error, type: "subagent", tool_use_id, activity}]` | Every subagent of the session, oldest first. `id` is its path (`/root/<task_name>`), `state` ∈ `pending`/`running`/`completed`/`errored`/`interrupted`/`closed`, `started_at` epoch ms, `tool_use_id` the parent's `spawn_agent` call, `activity` its latest action in a few words ("Running cargo test"). |
+| `plan_draft` | `id`, `title`, `append` | Plan mode: the plan while the model writes its `propose_plan` call. `append` is the Markdown added since the previous `plan_draft` of the same `id`; `title` is the title so far. The finished plan follows as `proposed_plan` with the same `id`. Not replayed. |
+| `proposed_plan` | `id`, `title`, `markdown`, `status` | Plan mode: a plan from `propose_plan`. `status` is `pending`, then `approved` or `revising` after `approve_plan`. Session replay (`transcript`) carries it as `{"role":"plan","id","title","content","status"}` with the latest status. |
+| `mcp_servers` | `servers: [{name, transport, state, tools, error?}]` | MCP server states; `state` ∈ `connecting`/`connected`/`failed`/`disabled`. |
+| `trust_prompt` | `cwd`, `repo_root` | Project has local resources (skills, commands, hooks) and no stored trust decision; answer via `command` `/trust yes\|no\|repo`. |
+| `user_message` | `content` | A user turn was accepted and started (echoes the submitted text). |
+| `pending_messages` | `messages` | The queued-message list after it changed. |
+| `fill_input` | `content` | Front-end should pre-fill its input box (e.g. after `/checkout`). |
+| `connecting` | — | A model request is starting. |
+| `thinking_start` | — | The model answered the request; its first token is on the way. |
+| `reasoning_delta` | `delta` | Reasoning text chunk. |
+| `assistant_start` | — | Assistant reply begins. |
+| `assistant_delta` | `delta` | Reply text chunk. |
+| `retrying` | `attempt` | The request is being retried after a transient failure. |
+| `tool_start` | `call_id`, `name` | Tool call begins. |
+| `tool_update` | `call_id`, `name`, `output` | Intermediate tool progress (e.g. long-running bash). |
+| `tool_output` | `call_id`, `name`, `output`, `is_error` | Tool call finished. |
+| `approval_request` | `call_id`, `name`, `summary`, `subagent_id`, `hunks` | A gated tool call waits for an `approve` op. `hunks` is a list of `{id, file, header, lines}` for partial approval, `null` otherwise. `subagent_id` is set when a subagent issued the call. |
+| `action_deferred` | `id`, `session_id`, `cwd`, `call_id`, `name`, `arguments`, `summary`, `subagent_id`, `digest`, `created_at` | An unattended session recorded a gated call instead of prompting; decide it with `decide_action`. |
+| `action_decided` | `id`, `decision`, `output`, `is_error` | A deferred action was decided; `output` is the tool result when it ran, `null` when declined. |
+| `attended` | `attended` | Current attended state, after `set_attended`. |
+| `subagent_lifecycle` | `path`, `status`, `message`, `label`, `model`, `tool_use_id` | Subagent spawn/progress/finish notices. |
+| `usage` | `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens` | Real API usage for the completed turn. |
+| `context_usage` | `tokens`, `tokenizer`, `cost` | Tokenizer-counted context size; `cost` is cumulative USD (0 when unpriced). |
+| `compaction_start` / `compaction_end` | — | Context compaction began/finished. |
+| `compaction_progress` | `output_tokens` | Compaction summary tokens produced so far. |
+| `compaction_failed` | `error` | Compaction failed; the session continues uncompacted. |
+| `model_view` | `models: [{model, active, context_window, max_output_tokens, reasoning_efforts}]`, `active_effort` | Model picker data (`/model`). |
+| `tree_view` | `nodes: [{id, parent_id, label, active}]` | Session branch tree (`/tree`). |
+| `resume_view` | `items: [{id, label, active}]` | Session picker data (`/resume`). |
+| `checkpoint_view` | `items: [{id, label, detail}]` | Checkpoint picker data. |
+| `goal` | `goal: {objective, status, token_budget, tokens_used, time_used_seconds, created_at, updated_at} \| null` | Goal state; `null` clears it. |
+| `plan` | `plan: [{step, status}]` | Goal/plan step list. |
+| `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`). |
+| `info` | `message` | Informational line (hook output, notices, update available). |
+| `error` | `message` | Error line. Also used for malformed commands and unknown ops. |
+| `surface` / `term_*` | see `docs/daemon-protocol.md` → Terminals | Daemon sessions only: the conversation moved to its engine's TUI on a terminal clients attach to, and back. |
+| `engine_caps` / `session_options` | see `docs/daemon-protocol.md` → ACP agents | Daemon ACP sessions only: what the agent can do, and its settings besides model and effort (set with the `set_session_option` op). |
+| `tool_provider` | `provider: {id, name, model} \| null` | Daemon Claude Code / Codex / ACP sessions only: the custom provider the session runs on, sent when its engine starts; null on the JuCode gateway or the tool's own configuration. See `docs/daemon-protocol.md` → Custom provider traffic and usage. |
+| `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
+
+## Turn sequence
+
+A normal turn looks like:
+
+```jsonl
+{"op":"user_message","content":"fix the test"}
+< {"type":"user_message","content":"fix the test"}
+< {"type":"connecting"}
+< {"type":"thinking_start"}            // the model answered
+< {"type":"reasoning_delta","delta":"..."}
+< {"type":"assistant_start"}
+< {"type":"assistant_delta","delta":"..."}
+< {"type":"tool_start","call_id":"call_1","name":"bash"}
+< {"type":"tool_output","call_id":"call_1","name":"bash","output":"...","is_error":false}
+< {"type":"usage","input_tokens":1234,"cached_input_tokens":800,"output_tokens":56,"reasoning_tokens":12}
+< {"type":"context_usage","tokens":5678,"tokenizer":"o200k","cost":0.0123}
+< {"type":"status","message":"ready"}
+```
+
+Approval round-trip:
+
+```jsonl
+< {"type":"approval_request","call_id":"call_2","name":"bash","summary":"rm -rf build","subagent_id":null,"hunks":null}
+> {"op":"approve","call_id":"call_2","decision":"deny"}
+```
+
+Interrupt:
+
+```jsonl
+> {"op":"interrupt"}
+< {"type":"info","message":"request interrupted"}
+< {"type":"status","message":"interrupted"}
+```
+
+## Mapping to UI
+
+Suggested rendering (as used by JuCode Desktop):
+
+| Events | UI |
+| --- | --- |
+| `assistant_start` / `assistant_delta` | streaming message bubble |
+| `reasoning_delta` | collapsible thinking section |
+| `tool_start` / `tool_update` / `tool_output` | tool cards keyed by `call_id` |
+| `approval_request` | approval dialog → `approve` op |
+| `model_view` / `tree_view` / `resume_view` / `checkpoint_view` | pickers/sidebars |
+| `goal` / `context_usage` / `usage` | status bar |
+| `compaction_*` | compaction progress |
+| `status` / `info` / `error` | status line / toasts |
+| `pending_messages` | queued-message indicator |
+| `fill_input` | pre-fill the input box |

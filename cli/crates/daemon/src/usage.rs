@@ -1,0 +1,1242 @@
+//! What each agent turn used: tokens per turn, whatever engine ran it.
+//!
+//! Records are kept in `usage.jsonl` with the project they ran in (that
+//! never leaves this computer). Turns billed through the JuCode gateway
+//! made while signed in are also uploaded without it to the account
+//! (`POST /v1/oauth/agent-usage`) so every computer on the account shows the
+//! same totals; local and third-party channels are never uploaded. JuCode gateway requests
+//! carry the turn id (`X-JuCode-Turn`), so the gateway puts their cost and
+//! group on the same turn.
+//!
+//! A turn opens at its first usage (or, for Claude Code and Codex, at the
+//! user message, so the local gateway can tag its requests) and is written
+//! when the session is ready again. The JuCode engine tags its own turns;
+//! its usage events carry the tag as `turn`.
+
+use crate::store::{now, random_hex, Store};
+use serde_json::{json, Value};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::PathBuf,
+    sync::{Condvar, Mutex},
+    time::Duration,
+};
+
+const FILE: &str = "usage.jsonl";
+/// Byte offset in FILE up to which records have been uploaded.
+const SENT_FILE: &str = "usage.sent";
+/// Set once the desktop's older per-day counts were imported.
+const LEGACY_SETTING: &str = "usage_legacy_imported";
+const BATCH: usize = 200;
+/// Upload at least this often while records wait (sooner after a turn).
+const UPLOAD_EVERY: Duration = Duration::from_secs(60);
+const TOKEN_FIELDS: [&str; 5] = [
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+];
+
+/// The session facts a record needs, read from the session list.
+pub struct SessionInfo {
+    /// jucode, claude, codex or acp.
+    pub engine: String,
+    /// Claude / Codex through the JuCode gateway.
+    pub gateway: bool,
+    pub cwd: String,
+}
+
+#[derive(Default)]
+struct State {
+    /// Session → the provider and model its engine last reported.
+    routes: HashMap<String, (String, String)>,
+    /// Session → the turn the daemon opened for it (Claude, Codex, ACP).
+    current: HashMap<String, String>,
+    /// Turn id → its record so far.
+    open: HashMap<String, Value>,
+    /// A turn was written since the last upload.
+    dirty: bool,
+    gateway_active: HashMap<String, usize>,
+    gateway_closing: HashSet<String>,
+}
+
+pub struct Usage {
+    dir: PathBuf,
+    state: Mutex<State>,
+    /// Serializes appends to FILE.
+    file: Mutex<()>,
+    wake: Condvar,
+}
+
+impl Usage {
+    pub fn new(store: &Store) -> Self {
+        Self {
+            dir: store.dir().to_path_buf(),
+            state: Mutex::default(),
+            file: Mutex::new(()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Takes one session event. `info` is read only for events that need it.
+    pub fn observe(
+        &self,
+        session: &str,
+        event: &Value,
+        info: impl FnOnce() -> Option<SessionInfo>,
+    ) {
+        match event["type"].as_str() {
+            Some("model_status") => {
+                let text = |key: &str| event[key].as_str().unwrap_or_default().to_string();
+                if !text("model").is_empty() || !text("provider").is_empty() {
+                    self.lock()
+                        .routes
+                        .insert(session.to_string(), (text("provider"), text("model")));
+                }
+            }
+            Some("user_message") => {
+                let Some(info) = info() else { return };
+                // The JuCode engine tags its own turns.
+                if info.engine != "jucode" || crate::gateway::custom_for_session(session).is_some()
+                {
+                    let mut state = self.lock();
+                    let previous_closing = state.gateway_closing.remove(session);
+                    if previous_closing || !state.current.contains_key(session) {
+                        let turn = new_turn_id();
+                        crate::gateway::set_turn(session, Some(&turn));
+                        state.current.insert(session.to_string(), turn);
+                    }
+                }
+            }
+            Some("usage") => {
+                let Some(info) = info() else { return };
+                if event["gateway_metered"] == true
+                    || (info.engine != "jucode"
+                        && crate::gateway::custom_for_session(session).is_some())
+                {
+                    return;
+                }
+                self.add(session, event, &info);
+            }
+            Some("status") if event["message"] == "ready" => self.close(session),
+            _ => {}
+        }
+    }
+
+    /// Give the UI the same stable key used by the gateway's charge ledger.
+    /// Called after observe, before broadcasting a usage event.
+    pub fn tag_event(&self, session: &str, event: &mut Value) {
+        if event["type"] != "usage" {
+            return;
+        }
+        let state = self.lock();
+        let turn = event["turn"]
+            .as_str()
+            .or_else(|| state.current.get(session).map(String::as_str));
+        if let Some(record) = turn.and_then(|turn| state.open.get(turn)) {
+            event["billing_turn"] = record["turn_id"].clone();
+            event["billing_gateway"] = json!(record["channel_kind"] == "jucode");
+        }
+    }
+
+    fn add(&self, session: &str, event: &Value, info: &SessionInfo) {
+        let mut state = self.lock();
+        let turn = match event["turn"].as_str().filter(|turn| !turn.is_empty()) {
+            Some(turn) => turn.to_string(),
+            None => match state.current.get(session) {
+                Some(turn) => turn.clone(),
+                None => {
+                    let turn = new_turn_id();
+                    if info.engine != "jucode" {
+                        crate::gateway::set_turn(session, Some(&turn));
+                    }
+                    state.current.insert(session.to_string(), turn.clone());
+                    turn
+                }
+            },
+        };
+        let (provider, model) = state.routes.get(session).cloned().unwrap_or_default();
+        let (kind, channel) = if let Some(provider) = event["gateway_provider"].as_str() {
+            ("local", provider.to_string())
+        } else {
+            channel(&info.engine, info.gateway, &provider)
+        };
+        let record = state.open.entry(turn.clone()).or_insert_with(|| {
+            json!({
+                "turn_id": turn,
+                "session": session,
+                "engine": info.engine,
+                "cwd": info.cwd,
+                "started_at": now(),
+                "requests": 0,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+            })
+        });
+        record["channel_kind"] = json!(kind);
+        record["channel"] = json!(channel);
+        let model = event["model"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&model)
+            .to_string();
+        // An aggregate (Claude's subagents and the like, summed over several
+        // requests, maybe on another model) leaves the turn's model and
+        // request count as they are.
+        let aggregate = event["aggregate"] == true;
+        if !aggregate || record["model"].is_null() {
+            record["model"] = json!(model);
+        }
+        if !aggregate {
+            record["requests"] = json!(record["requests"].as_u64().unwrap_or(0) + 1);
+        }
+        for field in TOKEN_FIELDS {
+            let sum = record[field].as_u64().unwrap_or(0) + event[field].as_u64().unwrap_or(0);
+            record[field] = json!(sum);
+        }
+        if kind != "jucode" {
+            match estimate(&channel, &model, event) {
+                Some(cost) => {
+                    record["estimated_cost_usd"] =
+                        json!(record["estimated_cost_usd"].as_f64().unwrap_or(0.0) + cost);
+                }
+                None => {
+                    record["unpriced_requests"] =
+                        json!(record["unpriced_requests"].as_u64().unwrap_or(0) + 1);
+                }
+            }
+        }
+    }
+
+    pub fn gateway_started(&self, session: &str) -> String {
+        let mut state = self.lock();
+        *state.gateway_active.entry(session.to_string()).or_default() += 1;
+        state
+            .current
+            .entry(session.to_string())
+            .or_insert_with(new_turn_id)
+            .clone()
+    }
+
+    pub fn gateway_finished(&self, session: &str) {
+        let close = {
+            let mut state = self.lock();
+            let count = state.gateway_active.entry(session.to_string()).or_default();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.gateway_active.remove(session);
+                state.gateway_closing.remove(session)
+            } else {
+                false
+            }
+        };
+        if close {
+            self.close(session);
+        }
+    }
+
+    /// Custom upstreams are metered once at the local gateway, independently
+    /// of the tool's aggregate usage events.
+    pub fn record_gateway(
+        &self,
+        session: &str,
+        turn: &str,
+        provider: &Value,
+        model: &str,
+        usage: Value,
+        cwd: &str,
+    ) {
+        let cached = usage["cache_read_input_tokens"]
+            .as_u64()
+            .or(usage["input_tokens_details"]["cached_tokens"].as_u64())
+            .or(usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+            .unwrap_or(0);
+        let raw_input = usage["input_tokens"]
+            .as_u64()
+            .or(usage["prompt_tokens"].as_u64())
+            .unwrap_or(0);
+        let input = if provider["format"] != "anthropic" {
+            raw_input
+        } else {
+            raw_input
+                .saturating_add(cached)
+                .saturating_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0))
+        };
+        let event = json!({"type":"usage", "turn":turn, "model":model,
+            "gateway_provider": format!("{}:{}", provider["tool"].as_str().unwrap_or(""), provider["id"].as_str().unwrap_or("")),
+            "input_tokens":input, "cached_input_tokens":cached,
+            "cache_write_tokens":usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+            "output_tokens":usage["output_tokens"].as_u64().or(usage["completion_tokens"].as_u64()).unwrap_or(0),
+            "reasoning_tokens":usage["output_tokens_details"]["reasoning_tokens"].as_u64().or(usage["completion_tokens_details"]["reasoning_tokens"].as_u64()).unwrap_or(0)});
+        self.add(
+            session,
+            &event,
+            &SessionInfo {
+                engine: provider["tool"].as_str().unwrap_or("").to_string(),
+                gateway: false,
+                cwd: cwd.to_string(),
+            },
+        );
+    }
+
+    /// The session's engine stopped: its model route goes (a reopened
+    /// engine announces it again).
+    pub fn forget(&self, session: &str) {
+        self.lock().routes.remove(session);
+        crate::gateway::set_turn(session, None);
+    }
+
+    /// The session is ready again: its turns are written.
+    pub fn close(&self, session: &str) {
+        // The engine can report ready before the final response bytes arrive.
+        // Keep its turn open until every in-flight gateway request is recorded.
+        let mut state = self.lock();
+        if state.gateway_active.get(session).copied().unwrap_or(0) > 0 {
+            state.gateway_closing.insert(session.to_string());
+            return;
+        }
+        // The gateway keeps tagging requests with this turn until the next
+        // one opens: Claude's background agents and Workflows run on after
+        // the turn ends, and are this turn's cost.
+        state.current.remove(session);
+        let turns: Vec<String> = state
+            .open
+            .iter()
+            .filter(|(_, record)| record["session"] == session)
+            .map(|(turn, _)| turn.clone())
+            .collect();
+        let records: Vec<Value> = turns
+            .iter()
+            .filter_map(|turn| state.open.remove(turn))
+            .collect();
+        if records.is_empty() {
+            return;
+        }
+        // Turns billed through the JuCode gateway while signed in go to that
+        // account; local and third-party channels stay on this computer.
+        let signed_in = jucode_agent_core::jucode_signed_in();
+        let mut upload = false;
+        let ended = now();
+        let lines: String = records
+            .into_iter()
+            .filter(|record| {
+                record["requests"].as_u64().unwrap_or(0) > 0
+                    || TOKEN_FIELDS
+                        .iter()
+                        .any(|f| record[*f].as_u64().unwrap_or(0) > 0)
+            })
+            .map(|mut record| {
+                record["ended_at"] = json!(ended);
+                let uploaded = signed_in && record["channel_kind"] == "jucode";
+                upload |= uploaded;
+                record["upload"] = json!(uploaded);
+                format!("{record}\n")
+            })
+            .collect();
+        if let Err(error) = self.append(&lines) {
+            jucode_agent_core::log_warn!("usage", "cannot record usage", error = error.to_string());
+            return;
+        }
+        if upload {
+            state.dirty = true;
+            self.wake.notify_all();
+        }
+    }
+
+    fn append(&self, lines: &str) -> std::io::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let _guard = self
+            .file
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        fs::create_dir_all(&self.dir)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(FILE))?;
+        file.write_all(lines.as_bytes())
+    }
+
+    fn records(&self) -> Vec<Value> {
+        let _guard = self
+            .file
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Ok(file) = fs::File::open(self.dir.join(FILE)) else {
+            return Vec::new();
+        };
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str(&line).ok())
+            .collect()
+    }
+
+    /// Imports the desktop's older per-day counts once (`days`: day →
+    /// `{in, out, prov, models, agents}`). False when already imported.
+    pub fn import_legacy(&self, store: &Store, days: &Value) -> Result<bool, String> {
+        if store.setting(LEGACY_SETTING) == json!(true) {
+            return Ok(false);
+        }
+        let lines: String = days
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(day, _)| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok())
+            .map(|(day, usage)| {
+                let line = json!({
+                    "legacy": true,
+                    "day": day,
+                    "input_tokens": usage["in"].as_u64().unwrap_or(0),
+                    "output_tokens": usage["out"].as_u64().unwrap_or(0),
+                    "prov": usage["prov"],
+                    "models": usage["models"],
+                    "agents": usage["agents"],
+                });
+                format!("{line}\n")
+            })
+            .collect();
+        self.append(&lines).map_err(|error| error.to_string())?;
+        store
+            .set_setting(LEGACY_SETTING, json!(true))
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// This computer's usage over the last `days` days (local days at
+    /// `tz_offset` minutes, as JavaScript's getTimezoneOffset), with the
+    /// project each turn ran in.
+    pub fn local_json(&self, days: u64, tz_offset: i64) -> Value {
+        local_summary(&self.records(), days, tz_offset, now())
+    }
+
+    /// Persistent turns of the selected sessions, plus any turn still running.
+    /// Gateway charges remain authoritative in the account's ledger.
+    pub fn sessions_json(&self, sessions: &[String]) -> Value {
+        let selected: HashSet<&str> = sessions.iter().map(String::as_str).collect();
+        let state = self.lock();
+        let mut records = self.records();
+        records.extend(state.open.values().cloned());
+        drop(state);
+        records.retain(|r| r["session"].as_str().is_some_and(|s| selected.contains(s)));
+        let turns: Vec<String> = records
+            .iter()
+            .filter(|r| r["channel_kind"] == "jucode")
+            .filter_map(|r| r["turn_id"].as_str().map(str::to_string))
+            .collect();
+        let (charges, error) = match fetch_charges(&turns) {
+            Ok(charges) => (charges, None),
+            Err(error) => (HashMap::new(), Some(error)),
+        };
+        let mut out = sessions_summary(&records, sessions, &charges);
+        if let Some(error) = error {
+            out["billing_error"] = json!(error);
+        }
+        out
+    }
+
+    /// Uploads waiting records until the process exits.
+    pub fn run_uploads(&self) {
+        loop {
+            {
+                let state = self.lock();
+                if !state.dirty {
+                    let _ = self.wake.wait_timeout(state, UPLOAD_EVERY);
+                }
+            }
+            self.lock().dirty = false;
+            while let Ok(true) = self.upload_batch() {}
+        }
+    }
+
+    /// Sends the next batch; Ok(true) when more may wait.
+    fn upload_batch(&self) -> Result<bool, String> {
+        let sent_path = self.dir.join(SENT_FILE);
+        let offset: u64 = fs::read_to_string(&sent_path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0);
+        let (turns, end) = {
+            let _guard = self
+                .file
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let Ok(mut file) = fs::File::open(self.dir.join(FILE)) else {
+                return Ok(false);
+            };
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| error.to_string())?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)
+                .map_err(|error| error.to_string())?;
+            pending(&text, offset)
+        };
+        if end == offset {
+            return Ok(false);
+        }
+        if !turns.is_empty() {
+            let (api, token) = jucode_agent_core::jucode_gateway_token()?;
+            let url = format!("{}/v1/oauth/agent-usage", api.trim_end_matches('/'));
+            match ureq::post(&url)
+                .timeout(Duration::from_secs(30))
+                .set("Authorization", &format!("Bearer {token}"))
+                .send_json(json!({ "turns": turns }))
+            {
+                Ok(_) => {}
+                // The gateway refused these records for good: skip them.
+                Err(ureq::Error::Status(400, response)) => {
+                    jucode_agent_core::log_warn!(
+                        "usage",
+                        "usage upload rejected",
+                        error = response.into_string().unwrap_or_default()
+                    );
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        fs::write(&sent_path, end.to_string()).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+}
+
+/// The next batch to upload from `text` (FILE from `offset`): the upload
+/// bodies and the offset after the last line it covers. Records kept local,
+/// and any not billed through the JuCode gateway, are passed over.
+fn pending(text: &str, offset: u64) -> (Vec<Value>, u64) {
+    let mut turns = Vec::new();
+    let mut end = offset;
+    for line in text.split_inclusive('\n') {
+        if !line.ends_with('\n') || turns.len() >= BATCH {
+            break;
+        }
+        end += line.len() as u64;
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record["upload"] != true || record["channel_kind"] != "jucode" {
+            continue;
+        }
+        let mut turn = json!({
+            "turn_id": record["turn_id"],
+            "session_id": record["session"],
+            "engine": record["engine"],
+            "channel_kind": record["channel_kind"],
+            "channel": record["channel"],
+            "model": record["model"],
+            "requests": record["requests"],
+            "started_at": record["started_at"],
+            "ended_at": record["ended_at"],
+        });
+        for field in TOKEN_FIELDS {
+            turn[field] = json!(record[field].as_u64().unwrap_or(0));
+        }
+        turns.push(turn);
+    }
+    (turns, end)
+}
+
+/// The channel a turn ran on: (kind, id). See `provider_channel_kind`.
+fn channel(engine: &str, gateway: bool, provider: &str) -> (&'static str, String) {
+    match engine {
+        "jucode" => (
+            jucode_agent_core::provider_channel_kind(provider),
+            provider.to_string(),
+        ),
+        "claude" | "acp" if gateway => ("jucode", "jucode".to_string()),
+        "claude" => ("local", "anthropic".to_string()),
+        "codex" if provider == "jucode_gateway" || (gateway && provider.is_empty()) => {
+            ("jucode", "jucode".to_string())
+        }
+        "codex" => (
+            "local",
+            if provider.is_empty() {
+                "openai"
+            } else {
+                provider
+            }
+            .to_string(),
+        ),
+        _ => ("local", engine.to_string()),
+    }
+}
+
+// A reference estimate is captured when the tokens arrive. Unknown models
+// stay unknown, rather than borrowing another model's price.
+fn estimate(provider: &str, model: &str, usage: &Value) -> Option<f64> {
+    let writes = usage["cache_write_tokens"].as_u64().unwrap_or(0);
+    let writes_1h = usage["cache_write_1h_tokens"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(writes);
+    // Only Anthropic's cache-write prices are known (below).
+    if (writes > 0 && provider != "anthropic")
+        || !jucode_agent_core::builtin_providers()
+            .iter()
+            .any(|(id, _, _)| id == provider)
+    {
+        return None;
+    }
+    // Claude Code names a long-context model "claude-opus-4-8[1m]".
+    let model = model.split('[').next().unwrap_or(model);
+    let prices = jucode_agent_core::models_for_provider(provider)
+        .into_iter()
+        .find(|m| m.name == model)?;
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let cached = usage["cached_input_tokens"].as_u64().unwrap_or(0);
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    if (input > cached && prices.input_cost <= 0.0)
+        || (cached > 0 && prices.cached_input_cost <= 0.0)
+        || (output > 0 && prices.output_cost <= 0.0)
+    {
+        return None;
+    }
+    // Cache writes are input, already priced once; Anthropic bills them at
+    // 1.25× the input price for the 5-minute cache and 2× for the 1-hour one.
+    let write_surcharge =
+        ((writes - writes_1h) as f64 * 0.25 + writes_1h as f64) * prices.input_cost / 1_000_000.0;
+    Some(prices.cost_for(input, cached, output) + write_surcharge)
+}
+
+fn fetch_charges(turns: &[String]) -> Result<HashMap<String, Value>, String> {
+    let mut out = HashMap::new();
+    if turns.is_empty() {
+        return Ok(out);
+    }
+    let (api, token) = jucode_agent_core::jucode_gateway_token()?;
+    for batch in turns.chunks(2000) {
+        let response: Value = ureq::post(&format!(
+            "{}/v1/oauth/agent-usage/charges",
+            api.trim_end_matches('/')
+        ))
+        .timeout(Duration::from_secs(15))
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(json!({ "turn_ids": batch }))
+        .map_err(|e| e.to_string())?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+        for row in response["items"]
+            .as_array()
+            .ok_or("invalid usage charges response")?
+        {
+            let id = row["turn_id"].as_str().ok_or("missing charge turn_id")?;
+            out.insert(id.to_string(), row.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn sessions_summary(
+    records: &[Value],
+    sessions: &[String],
+    charges: &HashMap<String, Value>,
+) -> Value {
+    let mut by_session: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+    for session in sessions {
+        by_session.entry(session).or_default();
+    }
+    for record in records {
+        if let Some(rows) = record["session"]
+            .as_str()
+            .and_then(|s| by_session.get_mut(s))
+        {
+            rows.push(record);
+        }
+    }
+    let totals = turn_totals(by_session.values().flatten().copied(), charges);
+    let turns: Vec<Value> = by_session
+        .values()
+        .flatten()
+        .map(|record| {
+            let mut row = turn_totals(std::iter::once(*record), charges);
+            row["turn_id"] = record["turn_id"].clone();
+            row["session"] = record["session"].clone();
+            row
+        })
+        .collect();
+    let rows: Vec<Value> = by_session
+        .into_iter()
+        .map(|(session, records)| {
+            let mut row = turn_totals(records.iter().copied(), charges);
+            row["session"] = json!(session);
+            row["started_at"] = records
+                .iter()
+                .filter_map(|r| r["started_at"].as_u64())
+                .min()
+                .map_or(Value::Null, |at| json!(at));
+            row
+        })
+        .collect();
+    json!({ "totals": totals, "sessions": rows, "turns": turns })
+}
+
+fn turn_totals<'a>(
+    records: impl Iterator<Item = &'a Value>,
+    charges: &HashMap<String, Value>,
+) -> Value {
+    let mut sums = Sums::default();
+    let (mut actual, mut estimated) = (None::<f64>, None::<f64>);
+    let (mut pending, mut unknown, mut gateway_requests) = (0, 0, 0);
+    let mut running = false;
+    for record in records {
+        sums.add(record);
+        sums.turns += 1;
+        running |= record["ended_at"].is_null();
+        let requests = record["requests"].as_u64().unwrap_or(1);
+        if record["channel_kind"] == "jucode" {
+            gateway_requests += requests;
+            let charge = record["turn_id"].as_str().and_then(|id| charges.get(id));
+            let cost = charge
+                .and_then(|c| c["cost"].as_str()?.parse::<f64>().ok())
+                .filter(|c| c.is_finite() && *c >= 0.0);
+            if let Some(cost) = cost {
+                actual = Some(actual.unwrap_or(0.0) + cost);
+                pending +=
+                    requests.saturating_sub(charge.unwrap()["requests"].as_u64().unwrap_or(0));
+            } else {
+                pending += requests;
+            }
+        } else {
+            if let Some(cost) = record["estimated_cost_usd"].as_f64() {
+                estimated = Some(estimated.unwrap_or(0.0) + cost);
+                unknown += record["unpriced_requests"].as_u64().unwrap_or(0);
+            } else {
+                unknown += requests;
+            }
+        }
+    }
+    sums.json(json!({
+        "gateway_cost": actual, "estimated_cost_usd": estimated,
+        "pending_requests": pending, "unpriced_requests": unknown, "running": running,
+        "gateway_requests": gateway_requests,
+    }))
+}
+
+fn new_turn_id() -> String {
+    format!("t-{}", random_hex(12).unwrap_or_default())
+}
+
+#[derive(Default)]
+struct Sums {
+    tokens: [u64; 5],
+    turns: u64,
+}
+
+impl Sums {
+    fn add(&mut self, record: &Value) {
+        for (sum, field) in self.tokens.iter_mut().zip(TOKEN_FIELDS) {
+            *sum += record[field].as_u64().unwrap_or(0);
+        }
+    }
+
+    fn add_in_out(&mut self, usage: &Value) {
+        self.tokens[0] += usage["in"].as_u64().unwrap_or(0);
+        self.tokens[3] += usage["out"].as_u64().unwrap_or(0);
+    }
+
+    fn json(&self, mut row: Value) -> Value {
+        for (sum, field) in self.tokens.iter().zip(TOKEN_FIELDS) {
+            row[field] = json!(sum);
+        }
+        row["turns"] = json!(self.turns);
+        row
+    }
+}
+
+fn local_summary(records: &[Value], days: u64, tz_offset: i64, now_ms: u64) -> Value {
+    let day_of = |ms: u64| {
+        chrono::DateTime::from_timestamp_millis(ms as i64 - tz_offset * 60_000)
+            .map(|time| time.date_naive())
+    };
+    let Some(today) = day_of(now_ms) else {
+        return json!({ "type": "usage_local" });
+    };
+    let first = today - chrono::Days::new(days.clamp(1, 400) - 1);
+    let mut totals = Sums::default();
+    let mut by_day: BTreeMap<String, Sums> = BTreeMap::new();
+    let mut by_project: BTreeMap<String, Sums> = BTreeMap::new();
+    let mut by_channel: BTreeMap<(String, String), Sums> = BTreeMap::new();
+    let mut by_model: BTreeMap<String, Sums> = BTreeMap::new();
+    let mut by_engine: BTreeMap<String, Sums> = BTreeMap::new();
+    for record in records {
+        if record["legacy"] == true {
+            let Some(day) = record["day"]
+                .as_str()
+                .and_then(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok())
+                .filter(|day| *day >= first && *day <= today)
+            else {
+                continue;
+            };
+            let in_out = json!({ "in": record["input_tokens"], "out": record["output_tokens"] });
+            totals.add_in_out(&in_out);
+            by_day
+                .entry(day.to_string())
+                .or_default()
+                .add_in_out(&in_out);
+            by_project
+                .entry(String::new())
+                .or_default()
+                .add_in_out(&in_out);
+            for (provider, usage) in record["prov"].as_object().into_iter().flatten() {
+                let key = match provider.as_str() {
+                    "jucode" | "jucode_gateway" => ("jucode".to_string(), "jucode".to_string()),
+                    // Claude through the gateway and on its own login alike.
+                    "anthropic" => ("legacy".to_string(), "anthropic".to_string()),
+                    other => (
+                        jucode_agent_core::provider_channel_kind(other).to_string(),
+                        other.to_string(),
+                    ),
+                };
+                by_channel.entry(key).or_default().add_in_out(usage);
+            }
+            for (model, usage) in record["models"].as_object().into_iter().flatten() {
+                by_model.entry(model.clone()).or_default().add_in_out(usage);
+            }
+            for (agent, usage) in record["agents"].as_object().into_iter().flatten() {
+                let engine = agent.split(':').next().unwrap_or(agent).to_string();
+                by_engine.entry(engine).or_default().add_in_out(usage);
+            }
+            continue;
+        }
+        let Some(day) = record["started_at"]
+            .as_u64()
+            .and_then(day_of)
+            .filter(|day| *day >= first && *day <= today)
+        else {
+            continue;
+        };
+        let text = |key: &str| record[key].as_str().unwrap_or_default().to_string();
+        let groups = [
+            &mut totals,
+            by_day.entry(day.to_string()).or_default(),
+            by_project.entry(text("cwd")).or_default(),
+            by_channel
+                .entry((text("channel_kind"), text("channel")))
+                .or_default(),
+            by_model.entry(text("model")).or_default(),
+            by_engine.entry(text("engine")).or_default(),
+        ];
+        for sums in groups {
+            sums.add(record);
+            sums.turns += 1;
+        }
+    }
+    let rows = |map: BTreeMap<String, Sums>, key: &str| -> Vec<Value> {
+        map.into_iter()
+            .map(|(name, sums)| sums.json(json!({ key: name })))
+            .collect()
+    };
+    json!({
+        "type": "usage_local",
+        "totals": totals.json(json!({})),
+        "days": rows(by_day, "day"),
+        "by_project": rows(by_project, "cwd"),
+        "by_channel": by_channel
+            .into_iter()
+            .map(|((kind, channel), sums)| sums.json(json!({ "channel_kind": kind, "channel": channel })))
+            .collect::<Vec<_>>(),
+        "by_model": rows(by_model, "model"),
+        "by_engine": rows(by_engine, "engine"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spend(input: u64, output: u64) -> Value {
+        json!({ "type": "usage", "input_tokens": input, "cached_input_tokens": 1, "output_tokens": output })
+    }
+
+    fn info(engine: &str, gateway: bool) -> Option<SessionInfo> {
+        Some(SessionInfo {
+            engine: engine.to_string(),
+            gateway,
+            cwd: "/p".to_string(),
+        })
+    }
+
+    fn usage_in(name: &str) -> (Usage, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("jucode-usage-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let usage = Usage {
+            dir: dir.clone(),
+            state: Mutex::default(),
+            file: Mutex::new(()),
+            wake: Condvar::new(),
+        };
+        (usage, dir)
+    }
+
+    #[test]
+    fn a_turn_sums_its_requests_and_is_written_when_ready() {
+        let (usage, _dir) = usage_in("turn");
+        usage.observe(
+            "s1",
+            &json!({ "type": "model_status", "provider": "jucode_gateway", "model": "gpt-5.5" }),
+            || None,
+        );
+        usage.observe(
+            "s1",
+            &json!({ "type": "user_message", "content": "hi" }),
+            || info("codex", true),
+        );
+        usage.observe("s1", &spend(10, 2), || info("codex", true));
+        usage.observe("s1", &spend(5, 3), || info("codex", true));
+        assert!(usage.records().is_empty());
+        usage.observe(
+            "s1",
+            &json!({ "type": "status", "message": "ready" }),
+            || None,
+        );
+        let records = usage.records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["input_tokens"], 15);
+        assert_eq!(record["cached_input_tokens"], 2);
+        assert_eq!(record["output_tokens"], 5);
+        assert_eq!(record["requests"], 2);
+        assert_eq!(record["channel_kind"], "jucode");
+        assert_eq!(record["model"], "gpt-5.5");
+        assert_eq!(record["cwd"], "/p");
+    }
+
+    #[test]
+    fn jucode_engine_turns_are_keyed_by_the_engine_tag() {
+        let (usage, _dir) = usage_in("tag");
+        let tagged = |turn: &str| json!({ "type": "usage", "turn": turn, "input_tokens": 4, "output_tokens": 1 });
+        usage.observe("s", &tagged("t-a"), || info("jucode", false));
+        usage.observe("s", &tagged("t-b"), || info("jucode", false));
+        usage.observe(
+            "s",
+            &json!({ "type": "status", "message": "ready" }),
+            || None,
+        );
+        let ids: Vec<Value> = usage
+            .records()
+            .iter()
+            .map(|r| r["turn_id"].clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&json!("t-a")) && ids.contains(&json!("t-b")));
+    }
+
+    #[test]
+    fn schedule_totals_keep_currencies_separate_and_do_not_count_reused_sessions_twice() {
+        let records = vec![
+            json!({ "turn_id": "gw1", "session": "s1", "channel_kind": "jucode", "requests": 2, "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20, "started_at": 1, "ended_at": 2 }),
+            json!({ "turn_id": "gw2", "session": "s1", "channel_kind": "jucode", "requests": 1, "input_tokens": 10, "output_tokens": 2, "started_at": 3, "ended_at": 4 }),
+            json!({ "turn_id": "direct", "session": "s2", "channel_kind": "local", "requests": 1, "input_tokens": 50, "output_tokens": 5, "estimated_cost_usd": 0.12, "started_at": 5, "ended_at": 6 }),
+            json!({ "turn_id": "old", "session": "s2", "channel_kind": "local", "requests": 1, "input_tokens": 5, "output_tokens": 1, "ended_at": 6 }),
+            json!({ "turn_id": "unrelated", "session": "s3", "channel_kind": "jucode", "requests": 1, "input_tokens": 99999 }),
+        ];
+        let sessions = vec!["s1".into(), "s2".into(), "s1".into(), "no-record".into()];
+        let charges = HashMap::from([
+            ("gw1".into(), json!({ "cost": "0.05", "requests": 2 })),
+            ("gw2".into(), json!({ "cost": "0", "requests": 1 })),
+        ]);
+        let summary = sessions_summary(&records, &sessions, &charges);
+        assert_eq!(summary["sessions"].as_array().unwrap().len(), 3);
+        assert_eq!(summary["totals"]["turns"], 4);
+        assert_eq!(summary["totals"]["input_tokens"], 165);
+        assert_eq!(summary["totals"]["cached_input_tokens"], 80);
+        assert_eq!(summary["totals"]["gateway_cost"], 0.05);
+        assert_eq!(summary["totals"]["gateway_requests"], 3);
+        let turns = summary["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 4);
+        assert_eq!(
+            turns.iter().find(|t| t["turn_id"] == "gw1").unwrap()["gateway_cost"],
+            0.05
+        );
+        assert_eq!(
+            turns.iter().find(|t| t["turn_id"] == "gw2").unwrap()["gateway_cost"],
+            0.0
+        );
+        assert_eq!(summary["totals"]["estimated_cost_usd"], 0.12);
+        assert_eq!(summary["totals"]["unpriced_requests"], 1);
+        assert_eq!(summary["totals"]["pending_requests"], 0);
+        assert_eq!(summary["totals"]["running"], false);
+        let missing = sessions_summary(&records, &sessions, &HashMap::new());
+        assert!(missing["totals"]["gateway_cost"].is_null());
+        assert_eq!(missing["totals"]["pending_requests"], 3);
+        let partial = HashMap::from([("gw1".into(), json!({ "cost": "0.025", "requests": 1 }))]);
+        assert_eq!(
+            sessions_summary(&records, &sessions, &partial)["totals"]["pending_requests"],
+            2
+        );
+    }
+
+    #[test]
+    fn billing_tags_match_persisted_turns_for_each_engine() {
+        let (usage, dir) = usage_in("billing-tags");
+        for (engine, gateway, provider) in [
+            ("jucode", false, "jucode"),
+            ("claude", true, "anthropic"),
+            ("codex", true, "jucode_gateway"),
+            ("claude", false, "anthropic"),
+        ] {
+            usage.observe(
+                "s",
+                &json!({ "type": "model_status", "provider": provider }),
+                || None,
+            );
+            let mut ids = Vec::new();
+            for i in 0..2 {
+                usage.observe("s", &json!({ "type": "user_message" }), || {
+                    info(engine, gateway)
+                });
+                let mut event = spend(10, 2);
+                if engine == "jucode" {
+                    event["turn"] = json!(format!("native-{i}"));
+                }
+                usage.observe("s", &event, || info(engine, gateway));
+                usage.tag_event("s", &mut event);
+                let id = event["billing_turn"].as_str().unwrap().to_string();
+                assert_eq!(event["billing_gateway"], engine == "jucode" || gateway);
+                // Further requests carry the same key, not a new per-event id.
+                usage.observe("s", &event, || info(engine, gateway));
+                usage.tag_event("s", &mut event);
+                assert_eq!(event["billing_turn"], id);
+                usage.close("s");
+                assert!(usage
+                    .records()
+                    .iter()
+                    .any(|r| r["turn_id"] == id && r["requests"] == 2));
+                ids.push(id);
+            }
+            assert_ne!(ids[0], ids[1]);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gateway_counts_cached_input_once_and_keeps_custom_cost_unknown() {
+        let (usage, dir) = usage_in("custom-gateway");
+        usage.record_gateway("s-custom", "t-claude", &json!({"id":"private","tool":"claude","format":"anthropic"}), "model", json!({"input_tokens":12,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":8}), "");
+        usage.record_gateway("s-custom", "t-codex", &json!({"id":"private","tool":"codex","format":"responses"}), "model", json!({"input_tokens":100,"input_tokens_details":{"cached_tokens":60},"output_tokens":15,"output_tokens_details":{"reasoning_tokens":4}}), "");
+        usage.close("s-custom");
+        let records = usage.records();
+        assert_eq!(records.len(), 2);
+        let claude = records.iter().find(|r| r["engine"] == "claude").unwrap();
+        let codex = records.iter().find(|r| r["engine"] == "codex").unwrap();
+        assert_eq!(claude["input_tokens"], 37);
+        assert_eq!(claude["cached_input_tokens"], 20);
+        assert_eq!(claude["cache_write_tokens"], 5);
+        assert_eq!(codex["input_tokens"], 100);
+        assert_eq!(codex["cached_input_tokens"], 60);
+        assert_eq!(codex["reasoning_tokens"], 4);
+        assert!(records.iter().all(|r| r["channel_kind"] == "local"
+            && r["requests"] == 1
+            && r["estimated_cost_usd"].is_null()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ready_waits_for_gateway_requests_and_records_one_turn_without_tool_duplicates() {
+        let (usage, dir) = usage_in("gateway-race");
+        let turn = usage.gateway_started("s-race");
+        assert_eq!(usage.gateway_started("s-race"), turn);
+        let provider = json!({"id":"custom","tool":"jucode","format":"chat"});
+        usage.close("s-race");
+        usage.record_gateway(
+            "s-race",
+            &turn,
+            &provider,
+            "m",
+            json!({"prompt_tokens":30,"completion_tokens":5}),
+            "",
+        );
+        usage.gateway_finished("s-race");
+        assert!(usage.records().is_empty());
+        usage.observe(
+            "s-race",
+            &json!({"type":"usage","gateway_metered":true,"input_tokens":9999}),
+            || info("jucode", false),
+        );
+        usage.record_gateway(
+            "s-race",
+            &turn,
+            &provider,
+            "m",
+            json!({"prompt_tokens":20,"completion_tokens":3}),
+            "",
+        );
+        usage.gateway_finished("s-race");
+        let records = usage.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["requests"], 2);
+        assert_eq!(records[0]["input_tokens"], 50);
+        assert_eq!(records[0]["output_tokens"], 8);
+        assert!(usage.lock().gateway_active.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_turn_does_not_merge_with_a_previous_stream_that_is_still_closing() {
+        let (usage, dir) = usage_in("gateway-next-turn");
+        let first = usage.gateway_started("s-next");
+        usage.close("s-next");
+        usage.observe("s-next", &json!({"type":"user_message"}), || {
+            info("claude", false)
+        });
+        let second = usage.gateway_started("s-next");
+        assert_ne!(first, second);
+        let provider = json!({"id":"custom","tool":"claude","format":"anthropic"});
+        usage.record_gateway(
+            "s-next",
+            &first,
+            &provider,
+            "m",
+            json!({"input_tokens":10}),
+            "",
+        );
+        usage.gateway_finished("s-next");
+        usage.record_gateway(
+            "s-next",
+            &second,
+            &provider,
+            "m",
+            json!({"input_tokens":20}),
+            "",
+        );
+        usage.gateway_finished("s-next");
+        assert!(usage.records().is_empty());
+        usage.close("s-next");
+        assert_eq!(usage.records().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_aggregate_adds_tokens_but_not_the_model_or_a_request() {
+        let (usage, dir) = usage_in("aggregate");
+        usage.observe(
+            "s1",
+            &json!({ "type": "model_status", "model": "claude-opus-5-5" }),
+            || None,
+        );
+        usage.observe("s1", &spend(100, 10), || info("claude", true));
+        let aggregate = json!({ "type": "usage", "aggregate": true, "model": "claude-haiku-5-5", "input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 5 });
+        usage.observe("s1", &aggregate, || info("claude", true));
+        let record = usage.lock().open.values().next().unwrap().clone();
+        assert_eq!(record["model"], "claude-opus-5-5");
+        assert_eq!(record["requests"], 1);
+        assert_eq!(record["input_tokens"], 150);
+        assert_eq!(record["output_tokens"], 15);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_cost_estimates_are_saved_and_unknown_prices_stay_unknown() {
+        let (usage, dir) = usage_in("estimates");
+        let model = jucode_agent_core::models_for_provider("anthropic")
+            .into_iter()
+            .find(|m| m.input_cost > 0.0 && m.cached_input_cost > 0.0 && m.output_cost > 0.0)
+            .unwrap();
+        let event = json!({ "type": "usage", "input_tokens": 1000, "cached_input_tokens": 600, "output_tokens": 100 });
+        usage.observe(
+            "s1",
+            &json!({ "type": "model_status", "provider": "anthropic", "model": model.name }),
+            || info("claude", false),
+        );
+        usage.observe("s1", &event, || info("claude", false));
+        let live = usage.sessions_json(&["s1".into()]);
+        assert_eq!(live["totals"]["running"], true);
+        let expected = model.cost_for(1000, 600, 100);
+        assert!((live["totals"]["estimated_cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+        usage.close("s1");
+        let store = Store::open(dir.clone()).unwrap();
+        let reopened = Usage::new(&store);
+        let saved = reopened.sessions_json(&["s1".into()]);
+        assert_eq!(
+            saved["totals"]["estimated_cost_usd"],
+            live["totals"]["estimated_cost_usd"]
+        );
+        assert_eq!(saved["totals"]["running"], false);
+        assert!(estimate("my-provider", "unknown-model", &event).is_none());
+        assert!(estimate("anthropic", "unknown-model", &event).is_none());
+        // Writes (part of input): 5-minute ones at 1.25× the input price, 1-hour ones at 2×.
+        let mut writes = event.clone();
+        writes["cache_write_tokens"] = json!(300);
+        writes["cache_write_1h_tokens"] = json!(100);
+        let priced = estimate("anthropic", &format!("{}[1m]", model.name), &writes).unwrap();
+        let surcharge = (200.0 * 0.25 + 100.0) * model.input_cost / 1_000_000.0;
+        assert!((priced - (expected + surcharge)).abs() < 1e-12);
+        assert!(estimate("openai", &model.name, &writes).is_none());
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn channels_follow_the_route() {
+        assert_eq!(channel("claude", true, "anthropic").0, "jucode");
+        assert_eq!(channel("claude", false, "anthropic").0, "local");
+        assert_eq!(channel("codex", false, "openai").0, "local");
+        assert_eq!(channel("codex", true, "jucode_gateway").0, "jucode");
+        assert_eq!(channel("jucode", false, "jucode").0, "jucode");
+        assert_eq!(channel("jucode", false, "deepseek").0, "third_party");
+        assert_eq!(channel("jucode", false, "my-relay").0, "local");
+        assert_eq!(channel("acp", false, "").0, "local");
+        assert_eq!(channel("acp", true, "").0, "jucode");
+    }
+
+    #[test]
+    fn uploads_carry_only_gateway_turns_and_stop_at_a_partial_line() {
+        let text = concat!(
+            "{\"turn_id\":\"t-1\",\"upload\":true,\"channel_kind\":\"jucode\",\"input_tokens\":3,\"cwd\":\"/secret\"}\n",
+            "{\"turn_id\":\"t-2\",\"upload\":false,\"channel_kind\":\"jucode\"}\n",
+            "{\"turn_id\":\"t-local\",\"upload\":true,\"channel_kind\":\"local\"}\n",
+            "{\"turn_id\":\"t-third\",\"upload\":true,\"channel_kind\":\"third_party\"}\n",
+            "{\"legacy\":true}\n",
+            "{\"turn_id\":\"t-3\",\"upl"
+        );
+        let (turns, end) = pending(text, 7);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["turn_id"], "t-1");
+        assert_eq!(turns[0]["input_tokens"], 3);
+        assert!(turns[0].get("cwd").is_none());
+        let complete = text.rfind('\n').unwrap() + 1;
+        assert_eq!(end, 7 + complete as u64);
+    }
+
+    #[test]
+    fn the_local_summary_splits_by_day_project_and_channel() {
+        let day_ms = 86_400_000;
+        let now_ms = 20_000 * day_ms + 3_600_000;
+        let yesterday = chrono::DateTime::from_timestamp_millis((now_ms - day_ms) as i64)
+            .unwrap()
+            .date_naive()
+            .to_string();
+        let records = vec![
+            json!({ "started_at": now_ms, "cwd": "/a", "channel_kind": "jucode", "channel": "jucode", "model": "m", "engine": "jucode", "input_tokens": 10, "output_tokens": 1 }),
+            json!({ "started_at": now_ms - day_ms, "cwd": "/b", "channel_kind": "local", "channel": "anthropic", "model": "c", "engine": "claude", "input_tokens": 5, "output_tokens": 2 }),
+            json!({ "started_at": now_ms - 40 * day_ms, "cwd": "/old", "input_tokens": 99 }),
+            json!({ "legacy": true, "day": yesterday, "input_tokens": 7, "output_tokens": 0, "prov": { "jucode_gateway": { "in": 4, "out": 0 }, "anthropic": { "in": 3, "out": 0 } } }),
+        ];
+        let summary = local_summary(&records, 30, 0, now_ms);
+        assert_eq!(summary["totals"]["input_tokens"], 15 + 7);
+        assert_eq!(summary["totals"]["turns"], 2);
+        assert_eq!(summary["by_project"].as_array().unwrap().len(), 3);
+        let channels = summary["by_channel"].as_array().unwrap();
+        assert!(channels
+            .iter()
+            .any(|c| c["channel_kind"] == "legacy" && c["input_tokens"] == 3));
+        let jucode = channels
+            .iter()
+            .find(|c| c["channel_kind"] == "jucode")
+            .unwrap();
+        assert_eq!(jucode["input_tokens"], 14);
+    }
+}

@@ -1,0 +1,439 @@
+/* Brand faces are self-hosted via @fontsource (see main.tsx imports). */
+@import "tailwindcss";
+
+/* Class-based dark mode — toggled on <html> by main.tsx. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ============ Design tokens ============
+   All semantic colors resolve through CSS vars so the same Tailwind utility
+   (e.g. `bg-surface`) works in both light and dark. This file is the only
+   place a literal color value may appear. */
+@theme {
+  --color-background: var(--c-background);
+  --color-surface: var(--c-surface);
+  --color-surface-container-lowest: var(--c-surface-container-lowest);
+  --color-surface-container-low: var(--c-surface-container-low);
+  --color-surface-container: var(--c-surface-container);
+  --color-surface-container-high: var(--c-surface-container-high);
+  --color-surface-container-highest: var(--c-surface-container-highest);
+  --color-on-surface: var(--c-on-surface);
+  --color-on-surface-variant: var(--c-on-surface-variant);
+  --color-on-surface-subtle: var(--c-on-surface-subtle);
+  --color-outline: var(--c-outline);
+  --color-outline-variant: var(--c-outline-variant);
+  --color-border-hairline: var(--c-border-hairline);
+  --color-border: var(--c-border);
+  --color-border-strong: var(--c-border-strong);
+  --color-primary: var(--c-primary);
+  --color-primary-hover: var(--c-primary-hover);
+  --color-primary-bright: var(--c-primary-bright);
+  --color-on-primary: var(--c-on-primary);
+  --color-secondary: var(--c-secondary);
+  --color-tertiary: var(--c-tertiary);
+  --color-error: var(--c-error);
+  --color-danger: var(--c-danger);
+  --color-danger-text: var(--c-danger-text);
+  --color-success: var(--c-success);
+  --color-success-fill: var(--c-success-fill);
+  --color-warning: var(--c-warning);
+  --color-warning-text: var(--c-warning-text);
+
+  --font-display: "Space Grotesk", "Noto Sans SC", system-ui, sans-serif;
+  --font-body: "Noto Sans SC", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  /* Large numeric readouts (metric cards, quotas, counters) share one face
+     so the same number looks the same on every page. */
+  --font-readout: var(--font-mono);
+
+  /* Type scale — no readable UI text below 12px. Lives in @theme so the
+     same values also generate Tailwind utilities (text-caption, …). */
+  --text-caption: 12px;
+  --text-label: 12px;
+  --text-body-sm: 13px;
+  --text-ui: 14px;
+  --text-body: 15px;
+  --text-heading-sm: 20px;
+  --text-heading: 24px;
+  --text-display-sm: clamp(30px, 2.4vw, 38px);
+  --text-page-title: clamp(28px, 2.2vw, 34px);
+
+  /* Tracking — three values only. Negative tracking is for Latin display
+     faces; CJK glyphs are never tightened; positive tracking only for
+     uppercase Latin labels. */
+  --tracking-display: -0.04em;
+  --tracking-cjk: 0;
+  --tracking-label: 0.02em;
+
+  --radius-sm: 0.25rem;
+  --radius-DEFAULT: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.5rem;
+
+  --spacing-container-max: 1180px;
+  --spacing-gutter: 24px;
+
+  --shadow-glow-primary: none;
+
+  /* Component tiers (shape and depth). Every component radius resolves to
+     one of these five; anything else is a bug. */
+  --radius-xs: 4px;       /* code, tag, tiny chip */
+  --radius-control: 8px;  /* button, input, select, badge */
+  --radius-panel: 12px;   /* card, dialog, menu */
+  --radius-shell: 16px;   /* large shell containers */
+  --radius-pill: 999px;   /* segmented filters, status pills */
+
+  /* Motion — the only durations and curves allowed in transitions/animations.
+     fast: color/border/opacity swaps · base: position, expand, dialog close ·
+     slow: page-level reveals, dialog open. --ease-io for property fades,
+     --ease-out for anything that moves. Tailwind transition-* utilities
+     pick the same defaults so TSX and CSS share one clock. */
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 320ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-io: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --default-transition-duration: var(--dur-fast);
+  --default-transition-timing-function: var(--ease-io);
+}
+
+/* Dark (default) */
+:root,
+.dark {
+  --c-background: #131314;
+  --c-surface: #131314;
+  --c-surface-container-lowest: #0e0e0f;
+  --c-surface-container-low: #1c1b1c;
+  --c-surface-container: #222124;
+  --c-surface-container-high: #2a2a2b;
+  --c-surface-container-highest: #353436;
+  --c-on-surface: #e5e2e3;
+  --c-on-surface-variant: #a3a0a8;
+  /* Third text level (5.2:1 on --c-background). Use this instead of
+     lowering the opacity of --c-on-surface-variant. */
+  --c-on-surface-subtle: #8a8790;
+  --c-outline: #958ea0;
+  --c-outline-variant: rgba(255, 255, 255, 0.08);
+  --c-primary: #6d3bd7;
+  --c-primary-hover: color-mix(in oklab, var(--c-primary) 86%, white);
+  --c-primary-active: color-mix(in oklab, var(--c-primary) 86%, black);
+  --c-primary-bright: #d0bcff;
+  --c-on-primary: #ffffff;
+  --c-secondary: #89ceff;
+  /* Signal Raster mint only — not a status color. */
+  --c-tertiary: #4fdbc8;
+
+  /* Status — one source per hue. Fill vs text are separate steps so the
+     same hue works as a badge background and as readable text. */
+  --c-danger: var(--red-9);
+  --c-danger-text: var(--red-11);
+  --c-danger-soft: var(--red-a3);
+  --c-error: var(--c-danger-text);
+  --c-success: var(--green-11);
+  --c-success-fill: var(--green-9);
+  --c-warning: var(--amber-9);
+  --c-warning-text: var(--amber-11);
+
+  /* Availability tiers, validated as a set (worst adjacent CVD ΔE 15.8).
+     --c-status-critical is a literal on purpose: red-9 is too close to
+     orange-9 and red-11 inverts to a pale tint in dark mode. */
+  --c-status-ok: var(--green-9);
+  --c-status-warn: var(--amber-9);
+  --c-status-serious: var(--orange-9);
+  --c-status-critical: #b02a37;
+  --c-status-none: var(--gray-5);
+
+  /* Brand border and focus ring. Hover / active live above. */
+  --c-primary-border: color-mix(in oklab, var(--c-primary-bright) 34%, transparent);
+  --c-focus-ring: var(--c-primary-bright);
+
+  /* Status soft/line steps: soft = alpha 3, line = alpha 6. */
+  --c-success-soft: var(--green-a3);
+  --c-success-line: var(--green-a6);
+  --c-warning-soft: var(--amber-a3);
+  --c-warning-line: var(--amber-a6);
+  --c-danger-hover: var(--red-10);
+  --c-danger-line: var(--red-a6);
+  --c-info: var(--blue-11);
+  --c-info-fill: var(--blue-9);
+  --c-info-soft: var(--blue-a3);
+  --c-info-line: var(--blue-a6);
+  --c-neutral-fill: var(--gray-a6);
+
+  /* Depth: two neutral shadows, no colored glow. Cards use none. */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-2: 0 16px 40px rgba(0, 0, 0, 0.32);
+
+  /* Border hierarchy: hairline (passive group separators) → border (cards,
+     inputs, table rules) → strong (hover / active / selected). */
+  --c-hairline: rgba(255, 255, 255, 0.05);
+  --c-scrollbar-thumb: rgba(255, 255, 255, 0.16);
+  --c-scrollbar-thumb-hover: rgba(255, 255, 255, 0.3);
+  --c-border-hairline: var(--c-hairline);
+  --c-border: var(--c-outline-variant);
+  --c-border-strong: rgba(255, 255, 255, 0.18);
+
+  --c-glass-bg-from: rgba(30, 30, 34, 0.7);
+  --c-glass-bg-to: rgba(20, 20, 22, 0.7);
+  --c-glass-border: rgba(255, 255, 255, 0.08);
+  --c-glass-surface-glow: rgba(109, 59, 215, 0.15);
+  --c-glass-border-glow: rgba(255, 255, 255, 0.4);
+  --c-nav-bg: rgba(11, 11, 12, 0.35);
+  --c-btn-secondary-bg: rgba(255, 255, 255, 0.03);
+  --c-btn-secondary-bg-hover: rgba(255, 255, 255, 0.08);
+  --c-btn-secondary-border: rgba(255, 255, 255, 0.1);
+  --c-btn-secondary-border-hover: rgba(255, 255, 255, 0.2);
+  --c-grid-line: rgba(255, 255, 255, 0.02);
+  --nav-glow-primary-mix: 4%;
+  --nav-glow-secondary-mix: 3%;
+  --c-pro-highlight-from: rgba(40, 30, 60, 0.7);
+  --c-pro-highlight-to: rgba(20, 20, 22, 0.7);
+  --c-pro-highlight-border: rgba(109, 59, 215, 0.4);
+  --c-hero-glow: rgba(109, 59, 215, 0.15);
+  --c-terminal-bg: rgba(19, 19, 21, 0.8);
+  --c-terminal-header-bg: rgba(28, 28, 30, 0.8);
+  --c-card-faint-bg: rgba(255, 255, 255, 0.02);
+
+  /* recharts: grid + axis + tooltip — dark variant */
+  --c-chart-grid: rgba(255, 255, 255, 0.08);
+  --c-chart-axis: rgba(255, 255, 255, 0.55);
+  --c-chart-tooltip-bg: rgba(28, 28, 30, 0.96);
+  --c-chart-tooltip-text: #e5e2e3;
+  --c-chart-tooltip-border: rgba(255, 255, 255, 0.12);
+  --c-chart-cursor: rgba(255, 255, 255, 0.04);
+}
+
+/* Light — a calmer variant of the same palette */
+:root.light,
+.light {
+  --c-background: #f7f7f8;
+  --c-surface: #ffffff;
+  --c-surface-container-lowest: #ffffff;
+  --c-surface-container-low: #f7f7f8;
+  --c-surface-container: #f1f1f3;
+  --c-surface-container-high: #e9e9ec;
+  --c-surface-container-highest: #dededf;
+  --c-on-surface: #131314;
+  --c-on-surface-variant: #5a5a64;
+  --c-on-surface-subtle: #6f6b78;
+  --c-outline: #8b8694;
+  --c-outline-variant: rgba(0, 0, 0, 0.08);
+  --c-primary: #5b2aba;
+  --c-primary-hover: color-mix(in oklab, var(--c-primary) 90%, black);
+  --c-primary-active: color-mix(in oklab, var(--c-primary) 82%, black);
+  --c-primary-bright: #6d3bd7;
+  --c-on-primary: #ffffff;
+  --c-secondary: #006b9c;
+  --c-tertiary: #006b60;
+
+  --c-danger: var(--red-9);
+  --c-danger-text: var(--red-11);
+  --c-danger-soft: var(--red-a3);
+  --c-error: var(--c-danger-text);
+  --c-success: var(--green-11);
+  --c-success-fill: var(--green-9);
+  --c-warning: var(--amber-9);
+  --c-warning-text: var(--amber-11);
+
+  --c-status-ok: var(--green-9);
+  --c-status-warn: var(--amber-9);
+  --c-status-serious: var(--orange-9);
+  --c-status-critical: #b02a37;
+  --c-status-none: var(--gray-5);
+
+  --c-primary-border: color-mix(in oklab, var(--c-primary) 30%, transparent);
+  --c-focus-ring: var(--c-primary);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --shadow-2: 0 16px 40px rgba(0, 0, 0, 0.12);
+
+  --c-hairline: rgba(0, 0, 0, 0.05);
+  --c-border-hairline: var(--c-hairline);
+  --c-border: var(--c-outline-variant);
+  --c-border-strong: rgba(0, 0, 0, 0.18);
+
+  --c-glass-bg-from: rgba(255, 255, 255, 0.7);
+  --c-glass-bg-to: rgba(247, 247, 248, 0.7);
+  --c-glass-border: rgba(0, 0, 0, 0.08);
+  --c-glass-surface-glow: rgba(109, 59, 215, 0.12);
+  --c-glass-border-glow: rgba(91, 42, 186, 0.45);
+  --c-nav-bg: rgba(255, 255, 255, 0.45);
+  --c-btn-secondary-bg: rgba(0, 0, 0, 0.03);
+  --c-btn-secondary-bg-hover: rgba(0, 0, 0, 0.06);
+  --c-btn-secondary-border: rgba(0, 0, 0, 0.1);
+  --c-btn-secondary-border-hover: rgba(0, 0, 0, 0.18);
+  --c-grid-line: rgba(0, 0, 0, 0.04);
+  --nav-glow-primary-mix: 14%;
+  --nav-glow-secondary-mix: 11%;
+  --c-pro-highlight-from: rgba(240, 232, 255, 0.85);
+  --c-pro-highlight-to: rgba(247, 247, 248, 0.85);
+  --c-pro-highlight-border: rgba(91, 42, 186, 0.35);
+  --c-hero-glow: rgba(109, 59, 215, 0.12);
+  --c-terminal-bg: rgba(255, 255, 255, 0.9);
+  --c-terminal-header-bg: rgba(241, 241, 243, 0.9);
+  --c-card-faint-bg: rgba(0, 0, 0, 0.02);
+
+  /* recharts: grid + axis + tooltip — light variant */
+  --c-chart-grid: rgba(0, 0, 0, 0.09);
+  --c-chart-axis: rgba(0, 0, 0, 0.55);
+  --c-chart-tooltip-bg: rgba(255, 255, 255, 0.98);
+  --c-chart-tooltip-text: #131314;
+  --c-chart-tooltip-border: rgba(0, 0, 0, 0.1);
+  --c-chart-cursor: rgba(0, 0, 0, 0.04);
+  --c-scrollbar-thumb: rgba(0, 0, 0, 0.2);
+  --c-scrollbar-thumb-hover: rgba(0, 0, 0, 0.36);
+}
+
+/* ============ Radix Themes → brand tokens ============
+   The Theme is mounted with accentColor="violet" grayColor="mauve" (the
+   scales closest to the brand). Steps that carry the brand are pinned to
+   the semantic tokens above so Switch / Tabs / Badge / Text color="gray"
+   and the custom .jc-* classes resolve to the same violet and the same grey. */
+.radix-themes {
+  --accent-9: var(--c-primary);
+  --accent-10: var(--c-primary-hover);
+  --accent-11: var(--c-primary-bright);
+  --accent-a11: var(--c-primary-bright);
+  --accent-contrast: var(--c-on-primary);
+  --accent-indicator: var(--c-primary);
+  --accent-track: var(--c-primary);
+  --gray-11: var(--c-on-surface-variant);
+  --gray-a11: var(--c-on-surface-variant);
+  --gray-12: var(--c-on-surface);
+  --gray-a12: var(--c-on-surface);
+  --color-background: var(--c-background);
+  --color-panel-solid: var(--c-surface-container-low);
+  /* Radix Text size 1/2 ship 16/20px line-height (1.33/1.43). Console body
+     copy sits mostly at these sizes; lift toward the 1.6 body rhythm. */
+  --line-height-1: 18px;
+  --line-height-2: 22px;
+}
+
+/* ============ Base ============ */
+@layer base {
+  html {
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
+  }
+  /* 全站滚动条：细、圆、无轨道，颜色随主题。Chromium / Safari 走 ::-webkit-scrollbar；
+     Firefox 走标准属性。两者不能同时写在 Chromium 上（标准属性一旦生效就会
+     关掉 ::-webkit 样式），所以标准属性只在 Firefox 内生效。 */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--c-scrollbar-thumb);
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--c-scrollbar-thumb-hover); }
+  @supports (-moz-appearance: none) {
+    * { scrollbar-width: thin; scrollbar-color: var(--c-scrollbar-thumb) transparent; }
+  }
+  html, body, #root {
+    margin: 0;
+    padding: 0;
+  }
+  html { height: 100%; }
+  /* min-height, not height: responsive-legacy.css sets overflow-x hidden on
+     body/#root at mobile widths, and a fixed-height box with that overflow
+     becomes the scroll container, so window.scrollTo and scrollY stop working. */
+  body, #root { min-height: 100%; }
+  body {
+    background: var(--c-background);
+    color: var(--c-on-surface);
+    font-family: var(--font-body);
+    font-size: var(--text-body);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--c-primary) 30%, transparent);
+  }
+
+  /* Keyboard focus — one ring for every custom interactive element. Radix
+     controls (class rt-*) keep their own ring, recolored below so the two
+     match. Nothing in src may write `outline: none` without a replacement. */
+  :where(a, button, [role="button"], summary, [tabindex]):not([class^="rt-"], [class*=" rt-"]):focus-visible {
+    outline: 2px solid var(--c-focus-ring);
+    outline-offset: 2px;
+  }
+  :where(input, select, textarea):not([class^="rt-"], [class*=" rt-"]):focus-visible {
+    outline: 2px solid var(--c-focus-ring);
+    outline-offset: 0;
+  }
+}
+
+/* Radix Themes: share the motion clock (the focus color lives with the rest
+   of the Radix skin in console-radix.css). Radix declares its portal
+   animations under prefers-reduced-motion: no-preference, so the global
+   reduce block below never has to fight them. */
+.rt-BaseDialogOverlay:where([data-state="open"])::before {
+  animation-duration: var(--dur-base);
+  animation-timing-function: var(--ease-io);
+}
+.rt-BaseDialogContent:where([data-state="open"]) {
+  animation-duration: var(--dur-slow);
+  animation-timing-function: var(--ease-out);
+}
+.rt-BaseDialogOverlay:where([data-state="closed"])::before,
+.rt-BaseDialogContent:where([data-state="closed"]) {
+  animation-duration: var(--dur-fast);
+  animation-timing-function: var(--ease-io);
+}
+.rt-BaseMenuContent:where([data-state="open"]),
+.rt-PopoverContent:where([data-state="open"]),
+.rt-SelectContent:where([data-state="open"]),
+.rt-HoverCardContent:where([data-state="open"]) {
+  animation-duration: var(--dur-base);
+  animation-timing-function: var(--ease-out);
+}
+.rt-BaseMenuContent:where([data-state="closed"]),
+.rt-PopoverContent:where([data-state="closed"]),
+.rt-SelectContent:where([data-state="closed"]),
+.rt-HoverCardContent:where([data-state="closed"]) {
+  animation-duration: var(--dur-fast);
+  animation-timing-function: var(--ease-io);
+}
+
+/* Reduced motion — single global switch. Every animation and transition
+   collapses to its end state; nothing may rely on motion to be readable. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Tabular figures only where numbers line up in columns or tick over
+   (tables, readouts, prices). Prose keeps proportional figures. */
+.jc-num,
+.jc-mono,
+.jc-readout,
+.rt-TableCell,
+.rt-TableColumnHeaderCell,
+.rt-TableRowHeaderCell {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.jc-readout {
+  font-family: var(--font-readout);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+/* Radix Select locks scroll by setting overflow:hidden and position:relative
+   on body. The page already keeps a stable scrollbar on html, and that body
+   overflow turns body into the sticky scrollport, so the console topbar jumps
+   by the current scroll offset. Leave the scrollbar and the sticky root alone. */
+html body[data-scroll-locked] {
+  margin-right: 0 !important;
+  padding-right: 0 !important;
+  position: static !important;
+  overflow: visible !important;
+}

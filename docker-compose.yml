@@ -1,0 +1,74 @@
+# Runs the whole stack: Postgres, Redis, the backend and the web console.
+# Before the first start: cp backend/configs/config.example.yaml backend/configs/config.yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jucode
+      POSTGRES_PASSWORD: jucode
+      POSTGRES_DB: jucode
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - jucode-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jucode -d jucode"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - jucode-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Applies the schema, then exits. Safe to re-run on every start.
+  migrate:
+    build: ./backend
+    entrypoint: ["/usr/local/bin/jucode-migrate"]
+    command: ["--config", "/app/configs/config.yaml"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &jucode-env
+      JUCODE_DATABASE_DSN: "postgres://jucode:jucode@postgres:5432/jucode?sslmode=disable"
+      JUCODE_REDIS_ADDR: "redis:6379"
+      # Development placeholders only. Generate real values for any shared
+      # deployment: `openssl rand -hex 32`.
+      JUCODE_JWT_SECRET: "dev-only-jwt-secret-change-me-0123456789"
+      JUCODE_ENCRYPT_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    volumes:
+      - ./backend/configs:/app/configs:ro
+
+  jucode:
+    build: ./backend
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment: *jucode-env
+    volumes:
+      - ./backend/configs:/app/configs:ro
+      - jucode-data:/app/data
+
+  # The console; also forwards the API paths to `jucode`, so clients can use
+  # this one address as their base URL.
+  web:
+    build: ./web
+    depends_on:
+      - jucode
+    ports:
+      - "8080:80"
+
+volumes:
+  jucode-pg:
+  jucode-redis:
+  jucode-data:

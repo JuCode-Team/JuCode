@@ -1,0 +1,462 @@
+/* ============ Component skin — single owner for Radix primitives ============
+   Every rule here targets a Radix Themes component (or the .jc-* helper that
+   sits next to one). No other stylesheet may restyle Card / Button / TextField /
+   Select / Badge / Table / Dialog / Menu; page modules only lay them out.
+
+   Tiers (see index.css tokens):
+     radius   xs 4 · control 8 · panel 12 · shell 16 · pill
+     shadow   shadow-1 (hairline lift) · shadow-2 (floating layer). Cards: none.
+     motion   color/border → duration-fast + ease-standard
+     buttons  primary = solid · secondary = soft gray · ghost · danger = solid red
+     surfaces page bg → card (surface-container-low) → nested (…-high);
+              inputs recess to …-lowest.
+
+   Scoping: rules apply on .radix-themes (not .pn-console) so Dialog / Menu /
+   Popover portals — which render outside the console shell — get the same
+   look as the page they were opened from. */
+
+/* ---- Theme scale overrides ------------------------------------------- */
+.radix-themes,
+.radix-themes[data-radius] {
+  --radius-1: 6px;
+  --radius-2: var(--radius-control);
+  --radius-3: var(--radius-control);
+  --radius-4: var(--radius-panel);
+  --radius-5: var(--radius-panel);
+  --radius-6: var(--radius-shell);
+  /* Keyboard focus ring — every Radix control reads --focus-8. */
+  --focus-8: var(--c-focus-ring);
+  --focus-a8: color-mix(in oklab, var(--c-focus-ring) 70%, transparent);
+  /* Floating layers */
+  --color-panel-solid: var(--c-surface-container);
+  --shadow-6: var(--shadow-2);
+  --shadow-5: var(--shadow-2);
+  --shadow-4: var(--shadow-2);
+  --shadow-3: var(--shadow-1);
+}
+
+/* ---- Buttons ----------------------------------------------------------- */
+.radix-themes :where(.rt-Button, .rt-IconButton) {
+  font-weight: 500;
+  transition:
+    background-color var(--dur-fast) var(--ease-io),
+    border-color var(--dur-fast) var(--ease-io),
+    color var(--dur-fast) var(--ease-io),
+    box-shadow var(--dur-fast) var(--ease-io);
+}
+.radix-themes .rt-Button:where(.rt-variant-ghost) { font-weight: 500; }
+
+/* primary — brand violet, thin lavender edge. Buttons with no explicit color
+   (Radix renders data-accent-color="" for them) or the theme accent are
+   primary; colored solids fall through to danger. */
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-solid):where([data-accent-color=""], [data-accent-color="iris"], [data-accent-color="violet"], [data-accent-color="purple"]) {
+  --accent-9: var(--c-primary);
+  --accent-10: var(--c-primary-hover);
+  --accent-contrast: var(--c-on-primary);
+  box-shadow: inset 0 0 0 1px var(--c-primary-border);
+}
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-solid):where([data-accent-color=""], [data-accent-color="iris"], [data-accent-color="violet"], [data-accent-color="purple"]):where(:active:not([data-state="open"])) {
+  --accent-10: var(--c-primary-active);
+  filter: none;
+}
+
+/* danger — solid red. */
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-solid):where([data-accent-color="red"], [data-accent-color="tomato"], [data-accent-color="crimson"]) {
+  --accent-9: var(--c-danger);
+  --accent-10: var(--c-danger-hover);
+  --accent-contrast: #fff;
+}
+
+/* secondary — soft (or legacy outline) with gray / no color: surface tint +
+   1px neutral border, text on-surface. */
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-soft, .rt-variant-outline):where([data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"]) {
+  background-color: var(--c-btn-secondary-bg);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+  color: var(--c-on-surface);
+}
+@media (hover: hover) {
+  .radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-soft, .rt-variant-outline):where([data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"]):where(:hover) {
+    background-color: var(--c-btn-secondary-bg-hover);
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c-outline) 55%, var(--c-outline-variant));
+  }
+}
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-soft, .rt-variant-outline):where([data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"]):where(:active:not([data-state="open"]), [data-state="open"]) {
+  background-color: var(--c-btn-secondary-bg-hover);
+}
+/* soft with a status color keeps its tint but gains the same 1px edge so it
+   sits on cards at the same weight as secondary. */
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-soft):where([data-accent-color]:not([data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"])) {
+  box-shadow: inset 0 0 0 1px var(--accent-a6);
+}
+
+/* ghost — text only; hover fills 4% and lifts text to on-surface. */
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-ghost):where([data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"]) {
+  color: var(--c-on-surface-variant);
+}
+@media (hover: hover) {
+  .radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-ghost):where([data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"]):where(:hover) {
+    color: var(--c-on-surface);
+    background-color: color-mix(in oklab, var(--c-on-surface) 6%, transparent);
+  }
+}
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-ghost):where(:active:not([data-state="open"]), [data-state="open"]) {
+  background-color: color-mix(in oklab, var(--c-on-surface) 9%, transparent);
+}
+
+/* disabled: one rule for all tiers. */
+.radix-themes :where(.rt-Button, .rt-IconButton):where(:disabled, [data-disabled]) {
+  --accent-9: color-mix(in oklab, var(--c-on-surface) 8%, transparent);
+  --accent-10: var(--accent-9);
+  --accent-contrast: var(--c-on-surface-variant);
+  background-color: color-mix(in oklab, var(--c-on-surface) 6%, transparent);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+  color: color-mix(in oklab, var(--c-on-surface-variant) 70%, transparent);
+  filter: none;
+}
+.radix-themes :where(.rt-Button, .rt-IconButton):where(.rt-variant-ghost):where(:disabled, [data-disabled]) {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+/* ---- Inputs ------------------------------------------------------------ */
+.radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot, .rt-SelectTrigger):where(.rt-variant-surface) {
+  --text-field-focus-color: var(--c-focus-ring);
+  --text-area-focus-color: var(--c-focus-ring);
+  background-color: var(--c-surface-container-lowest);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+  color: var(--c-on-surface);
+  transition: box-shadow var(--dur-fast) var(--ease-io);
+}
+.radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot):where(.rt-variant-surface) :where(.rt-TextFieldInput, .rt-TextAreaInput)::placeholder {
+  color: color-mix(in oklab, var(--c-on-surface-variant) 75%, transparent);
+}
+.radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot):where(.rt-variant-surface) :where(.rt-TextFieldSlot) {
+  color: var(--c-on-surface-variant);
+}
+@media (hover: hover) {
+  .radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot, .rt-SelectTrigger):where(.rt-variant-surface):where(:hover:not(:focus-within)) {
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c-outline) 45%, var(--c-outline-variant));
+  }
+}
+.radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot):where(.rt-variant-surface):where(:focus-within),
+.radix-themes .rt-SelectTrigger:where(.rt-variant-surface):where(:focus-visible, [data-state="open"]) {
+  outline: none;
+  box-shadow:
+    inset 0 0 0 1px var(--c-focus-ring),
+    0 0 0 2px color-mix(in oklab, var(--c-focus-ring) 22%, transparent);
+}
+/* Radix draws its own outline on the inner input; the ring above replaces it. */
+.radix-themes .rt-TextFieldRoot:where(.rt-variant-surface):where(:focus-within)::after,
+.radix-themes .rt-TextAreaRoot:where(.rt-variant-surface):where(:focus-within)::after,
+.radix-themes .rt-TextAreaRoot:where(.rt-variant-surface) :where(.rt-TextAreaInput):focus-visible { outline: none; }
+/* invalid — red edge, same ring geometry. */
+.radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot, .rt-SelectTrigger):where([data-invalid="true"], [aria-invalid="true"]) {
+  box-shadow: inset 0 0 0 1px var(--c-danger);
+}
+.radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot):where([data-invalid="true"], [aria-invalid="true"]):where(:focus-within) {
+  box-shadow: inset 0 0 0 1px var(--c-danger), 0 0 0 2px var(--c-danger-soft);
+}
+.radix-themes :where(.rt-TextFieldRoot, .rt-TextAreaRoot, .rt-SelectTrigger):where(.rt-variant-surface):where(:disabled, [data-disabled], :has(:disabled)) {
+  background-color: color-mix(in oklab, var(--c-on-surface) 3%, transparent);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+  color: var(--c-on-surface-variant);
+}
+/* Select trigger variant="soft" (filter bars) reads as a secondary button. */
+.radix-themes .rt-SelectTrigger:where(.rt-variant-soft):where(:not([data-accent-color]), [data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"]) {
+  background-color: var(--c-btn-secondary-bg);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+  color: var(--c-on-surface);
+  transition: box-shadow var(--dur-fast) var(--ease-io), background-color var(--dur-fast) var(--ease-io);
+}
+@media (hover: hover) {
+  .radix-themes .rt-SelectTrigger:where(.rt-variant-soft):where(:not([data-accent-color]), [data-accent-color=""], [data-accent-color="gray"], [data-accent-color="iris"]):where(:hover) {
+    background-color: var(--c-btn-secondary-bg-hover);
+  }
+}
+.radix-themes .rt-SelectTrigger:where(.rt-variant-soft):where(:focus-visible, [data-state="open"]) {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--c-focus-ring), 0 0 0 2px color-mix(in oklab, var(--c-focus-ring) 22%, transparent);
+}
+.radix-themes .rt-SelectTrigger .rt-SelectTriggerIcon { color: var(--c-on-surface-variant); }
+.radix-themes .rt-SelectContent,
+.radix-themes .rt-PopoverContent,
+.radix-themes .rt-BaseMenuContent,
+.radix-themes .rt-HoverCardContent {
+  border: 1px solid var(--c-outline-variant);
+  border-radius: var(--radius-panel);
+  background: var(--c-surface-container);
+  box-shadow: var(--shadow-2);
+}
+.radix-themes .rt-SelectItem:where([data-highlighted]),
+.radix-themes .rt-BaseMenuItem:where([data-highlighted]) {
+  background-color: color-mix(in oklab, var(--c-on-surface) 7%, transparent);
+  color: var(--c-on-surface);
+}
+.radix-themes .rt-SwitchRoot:where(.rt-variant-surface) { box-shadow: inset 0 0 0 1px var(--c-outline-variant); }
+/* Switch / Checkbox / Radio render no data-accent-color when uncolored. */
+.radix-themes :where(.rt-SwitchRoot, .rt-CheckboxRoot, .rt-RadioGroupItem, .rt-BaseCheckboxRoot, .rt-BaseRadioRoot, .rt-RadioGroupRoot, .rt-CheckboxGroupRoot):where(:not([data-accent-color]), [data-accent-color=""], [data-accent-color="iris"]) {
+  --accent-9: var(--c-primary);
+  --accent-10: var(--c-primary-hover);
+  --accent-contrast: var(--c-on-primary);
+  --accent-a8: color-mix(in oklab, var(--c-primary) 60%, transparent);
+  --accent-a11: var(--c-primary-bright);
+  --accent-indicator: var(--c-primary);
+  --accent-track: var(--c-primary);
+}
+.radix-themes .rt-SegmentedControlRoot {
+  background-color: color-mix(in oklab, var(--c-on-surface) 4%, transparent);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+  border-radius: var(--radius-control);
+}
+.radix-themes .rt-SegmentedControlIndicator::before {
+  background-color: var(--c-surface-container-high);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+}
+.radix-themes .rt-SegmentedControlItemLabel { color: var(--c-on-surface-variant); }
+.radix-themes .rt-SegmentedControlItem[data-state="on"] .rt-SegmentedControlItemLabel { color: var(--c-on-surface); }
+
+/* ---- Tabs -------------------------------------------------------------- */
+.radix-themes .rt-TabsList {
+  gap: 0;
+  border-bottom: 1px solid var(--c-outline-variant);
+  box-shadow: none;
+}
+.radix-themes .rt-TabsTrigger {
+  min-height: 40px;
+  padding-inline: 14px;
+  color: var(--c-on-surface-variant);
+  font-size: var(--text-body-sm);
+  font-weight: 500;
+}
+.radix-themes .rt-TabsTrigger[data-state="active"] { color: var(--c-on-surface); }
+.radix-themes .rt-TabsTrigger::before { height: 2px; border-radius: 0; background-color: var(--c-primary-bright); }
+
+/* ---- Badge & status ---------------------------------------------------- */
+.radix-themes .rt-Badge {
+  font-family: var(--font-body);
+  font-size: var(--text-caption);
+  line-height: 1;
+  letter-spacing: 0;
+  font-weight: 500;
+  padding: 3px 7px;
+  border-radius: var(--radius-xs);
+}
+.radix-themes .rt-Badge:where(.rt-r-size-2) { padding: 4px 8px; }
+.radix-themes .rt-Badge:where(.rt-variant-soft) {
+  background-color: var(--accent-a3);
+  box-shadow: inset 0 0 0 1px var(--accent-a5);
+  color: var(--accent-a11);
+}
+/* brand badges use the brand violet, not the Radix iris accent. */
+.radix-themes .rt-Badge:where([data-accent-color="iris"], [data-accent-color="violet"], [data-accent-color="purple"]) {
+  --accent-a3: color-mix(in oklab, var(--c-primary) 14%, transparent);
+  --accent-a5: color-mix(in oklab, var(--c-primary) 34%, transparent);
+  --accent-a8: color-mix(in oklab, var(--c-primary) 60%, transparent);
+  --accent-a11: var(--c-primary-bright);
+}
+.radix-themes .rt-Badge:where([data-accent-color="gray"]) {
+  --accent-a3: color-mix(in oklab, var(--c-on-surface) 5%, transparent);
+  --accent-a5: var(--c-outline-variant);
+  --accent-a11: var(--c-on-surface-variant);
+}
+/* .jc-status — static dot + word. tone → color via the status tokens. */
+.jc-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--c-on-surface);
+  font-size: var(--text-body-sm);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.jc-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: var(--radius-pill);
+  background: var(--c-neutral-fill);
+}
+.jc-status[data-tone="ok"] .jc-status-dot { background: var(--c-success-fill); }
+.jc-status[data-tone="warn"] .jc-status-dot { background: var(--c-warning); }
+.jc-status[data-tone="serious"] .jc-status-dot { background: var(--c-status-serious); }
+.jc-status[data-tone="critical"] .jc-status-dot { background: var(--c-status-critical); }
+.jc-status[data-tone="info"] .jc-status-dot { background: var(--c-info-fill); }
+.jc-status[data-tone="neutral"] { color: var(--c-on-surface-variant); }
+.jc-status[data-tone="pending"] .jc-status-dot {
+  background: var(--c-primary-bright);
+  animation: jc-status-pulse 1.2s var(--ease-io) infinite;
+}
+@keyframes jc-status-pulse { 50% { opacity: .35; } }
+
+.radix-themes .rt-CalloutRoot {
+  border: 1px solid var(--accent-a5);
+  border-radius: var(--radius-control);
+  background: var(--accent-a2);
+}
+.radix-themes .rt-CalloutRoot:where(:not([data-accent-color]), [data-accent-color=""], [data-accent-color="iris"], [data-accent-color="gray"]) {
+  border-color: var(--c-outline-variant);
+  background: transparent;
+  color: var(--c-on-surface);
+}
+.radix-themes .rt-CalloutRoot:where(:not([data-accent-color]), [data-accent-color=""], [data-accent-color="iris"], [data-accent-color="gray"]) .rt-CalloutIcon { color: var(--c-on-surface-variant); }
+.radix-themes .rt-Code:where(.rt-variant-soft) {
+  border-radius: var(--radius-xs);
+  background: color-mix(in oklab, var(--c-on-surface) 6%, transparent);
+  color: var(--c-on-surface);
+  font-family: var(--font-mono);
+}
+.radix-themes .rt-Separator { background: var(--c-outline-variant); }
+
+/* ---- Card -------------------------------------------------------------- */
+.radix-themes .rt-Card:where(.rt-variant-surface, .rt-variant-classic) {
+  --card-background-color: var(--c-surface-container-low);
+  --card-border-width: 0;
+  --pn-card-pad: 20px;
+  padding: var(--pn-card-pad);
+  border: 1px solid var(--c-outline-variant);
+  border-radius: var(--radius-panel);
+  background: var(--c-surface-container-low);
+  box-shadow: none;
+}
+.radix-themes .rt-Card:where(.rt-variant-surface, .rt-variant-classic)::after { display: none; }
+.radix-themes .rt-Card.pn-card-tight { --pn-card-pad: 14px; }
+/* Nested card: one step up in surface, radius drops to control. */
+.radix-themes .rt-Card.jc-card-nested {
+  --pn-card-pad: 14px;
+  background: var(--c-surface-container-high);
+  border-radius: var(--radius-control);
+}
+/* Only clickable cards react to hover, and only by border. */
+.radix-themes .rt-Card.jc-card-interactive {
+  cursor: pointer;
+  text-align: inherit;
+  transition: border-color var(--dur-fast) var(--ease-io);
+}
+@media (hover: hover) {
+  .radix-themes .rt-Card.jc-card-interactive:hover { border-color: var(--c-outline); }
+}
+.radix-themes .rt-Card.jc-card-interactive:focus-visible {
+  outline: 2px solid var(--c-focus-ring);
+  outline-offset: 2px;
+}
+/* Deprecated alias — every console card is flat now; kept so existing
+   className="pn-card-flat" call sites keep compiling until they are removed. */
+.pn-card-flat {}
+
+/* ---- Table ------------------------------------------------------------- */
+/* Shared table grammar for Radix Table (SimpleDataTable) and the virtualized
+   DataTable (.jc-table). Header: body face 12px/500 muted, 40px tall.
+   Cells: 13px, 8px 12px padding, 40px rows, hairline separators.
+   Numbers: .jc-cell-num right-aligns with tabular figures. */
+.radix-themes .rt-TableRoot {
+  --table-row-box-shadow: inset 0 -1px var(--c-outline-variant);
+  border-radius: var(--radius-control);
+  box-shadow: inset 0 0 0 1px var(--c-outline-variant);
+  background: var(--c-surface-container-low);
+}
+.radix-themes .rt-TableRootTable .rt-TableHeader :where(.rt-TableColumnHeaderCell, .rt-TableCell),
+.jc-table thead th {
+  height: 40px;
+  padding: 0 12px;
+  background: color-mix(in oklab, var(--c-on-surface) 3%, transparent);
+  color: var(--c-on-surface-variant);
+  font-family: var(--font-body);
+  font-size: var(--text-caption);
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.4;
+  vertical-align: middle;
+  white-space: nowrap;
+  box-shadow: inset 0 -1px var(--c-outline-variant);
+}
+.radix-themes .rt-TableRootTable .rt-TableBody .rt-TableCell,
+.radix-themes .rt-TableRootTable .rt-TableBody .rt-TableRowHeaderCell,
+.jc-table tbody td {
+  height: 40px;
+  padding: 8px 12px;
+  font-size: var(--text-body-sm);
+  line-height: 1.5;
+  vertical-align: middle;
+  color: var(--c-on-surface);
+}
+.radix-themes .rt-TableRootTable .rt-TableRow { transition: background-color var(--dur-fast) var(--ease-io); }
+.radix-themes .rt-TableRootTable .rt-TableBody .rt-TableRow:last-child { --table-row-box-shadow: none; }
+@media (hover: hover) {
+  .radix-themes .rt-TableRootTable .rt-TableBody .rt-TableRow:hover,
+  .jc-table tbody tr:hover { background: color-mix(in oklab, var(--c-on-surface) 3%, transparent); }
+}
+.jc-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: auto;
+}
+.jc-table thead { position: sticky; top: 0; z-index: 2; }
+.jc-table thead tr { background: var(--c-surface-container-low); }
+.jc-table tbody td { box-shadow: inset 0 -1px var(--c-outline-variant); }
+.jc-table tbody tr:last-child td { box-shadow: none; }
+.jc-cell-num,
+.jc-table .jc-cell-num,
+.radix-themes .rt-TableRootTable .jc-cell-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.jc-cell-truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jc-cell-wrap { white-space: normal; }
+/* Usage-log row drill-down: keep the expanded summary row highlighted and
+   let its detail row read as one continuous panel. */
+.radix-themes .rt-TableRootTable .rt-TableRow.jc-admin-log-row-active { background: color-mix(in oklab, var(--c-on-surface) 3%, transparent); }
+.radix-themes .rt-TableRootTable .rt-TableRow.jc-admin-log-detail-row,
+.radix-themes .rt-TableRootTable .rt-TableRow.jc-admin-log-detail-row:hover { background: transparent; box-shadow: none; }
+
+/* DataTable / SimpleDataTable shell: toolbar · body · pager inside one card. */
+.radix-themes .rt-Card.jc-data-table-card {
+  --pn-card-pad: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.jc-data-table-card .jc-data-table-toolbar {
+  min-height: 56px;
+  margin: 0 !important;
+  padding: 12px 16px;
+  align-items: center;
+  border-bottom: 1px solid var(--c-outline-variant);
+}
+.jc-data-table-card .jc-data-table-bulkbar {
+  margin: 12px 16px 0 !important;
+  padding: 8px 12px;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: var(--radius-control);
+  background: color-mix(in oklab, var(--c-primary) 8%, transparent);
+}
+.jc-data-table-card .rt-TableRoot { border-radius: 0; box-shadow: none; background: transparent; }
+.jc-data-table-card .jc-data-table-pager {
+  min-height: 48px;
+  margin: 0 !important;
+  padding: 8px 16px;
+  border-top: 1px solid var(--c-outline-variant);
+}
+.jc-data-table-pager .rt-Text { font-variant-numeric: tabular-nums; }
+
+/* ---- Dialog / menu / tooltip (portals) --------------------------------- */
+.radix-themes :where(.rt-DialogContent, .rt-AlertDialogContent) {
+  border: 1px solid var(--c-outline-variant);
+  border-radius: var(--radius-panel);
+  background: var(--c-surface-container);
+  box-shadow: var(--shadow-2);
+}
+.radix-themes .rt-DialogOverlay,
+.radix-themes .rt-AlertDialogOverlay { background: color-mix(in oklab, var(--c-background) 62%, transparent); }
+.light .rt-DialogOverlay,
+.light .rt-AlertDialogOverlay { background: rgba(19, 19, 20, 0.36); }
+/* Tooltip — Radix uses an inverted gray-12 surface. Rich tooltip content
+   can include nested Text color="gray", which otherwise keeps the page's
+   theme gray and becomes low-contrast against the tooltip background. */
+.rt-TooltipContent { color: var(--gray-1); border-radius: var(--radius-control); }
+.rt-TooltipContent :where(.rt-Text[data-accent-color="gray"]) {
+  color: color-mix(in oklab, var(--gray-1) 72%, var(--gray-12));
+}
+.rt-TooltipContent :where(.rt-Code) {
+  color: var(--gray-1);
+  background-color: color-mix(in oklab, var(--gray-1) 10%, transparent);
+}

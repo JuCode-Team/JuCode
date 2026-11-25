@@ -1,0 +1,36 @@
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local-only configs (example template is committed)
+configs/config.yaml
+configs/*.local.yaml
+.env
+.env.*
+.secrets/
+
+# Local secrets
+api_key
+data/ticket-attachments/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# atlas / migration scratch
+atlas.sum
+.atlas/
+
+# go workspace files
+go.work
+go.work.sum
+
+# OS junk
+Thumbs.db
+
+# codegraph local index cache
+.codegraph/

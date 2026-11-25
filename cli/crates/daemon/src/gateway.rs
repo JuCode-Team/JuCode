@@ -1,0 +1,1291 @@
+//! The local gateway. Claude Code and Codex sessions on the JuCode gateway
+//! send their requests here (`http://127.0.0.1:<port>/gw/v1/…`), not to the
+//! gateway itself, and the daemon forwards them:
+//!
+//! - with a JuCode access token valid at that moment: the engines would keep
+//!   the one they started with, which expires after an hour (every request
+//!   then fails with 401);
+//! - with the session's group (`X-JuCode-Group`), when that group serves
+//!   the requested model; else the model's default group from `jucode_groups`
+//!   in config.json; else none, and the gateway routes on its own.
+//!
+//! Only engines the daemon started pass here: native tools keep their own
+//! settings. An engine holds a per-session local key the daemon swaps for the
+//! real token, so the token never reaches its environment or disk. A request
+//! must name a loopback host (no DNS rebinding) and carry a key the daemon
+//! issued (a web page cannot set that header on a cross-site request).
+
+use serde_json::{json, Value};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpStream,
+    sync::{Mutex, MutexGuard, OnceLock},
+    time::{Duration, Instant},
+};
+
+const PREFIX: &str = "/gw";
+/// Requests carry whole conversations, images included.
+const MAX_BODY: usize = 64 * 1024 * 1024;
+/// Which group serves which model: refetched after this long.
+const CATALOG_TTL: Duration = Duration::from_secs(600);
+/// A streamed reply may pause this long between chunks (long thinking).
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Default)]
+struct State {
+    /// Local key → the session it was issued to ("" until the engine names
+    /// a new conversation, see `bind`).
+    keys: HashMap<String, String>,
+    /// Session → the group it routes to.
+    groups: HashMap<String, String>,
+    custom: HashMap<String, Value>,
+    owners: HashMap<String, std::sync::Weak<crate::hub::Hub>>,
+    /// Session → the turn its requests are charged to (`X-JuCode-Turn`, see
+    /// crate::usage): the running one, else the last until the next opens.
+    turns: HashMap<String, String>,
+    /// The gateway's groups (`/v1/open/groups`), and when they were read.
+    catalog: Option<(Instant, Vec<Value>)>,
+}
+
+fn state() -> MutexGuard<'static, State> {
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    STATE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+static PORT: OnceLock<u16> = OnceLock::new();
+
+/// The daemon listens on `port`; engines reach the gateway there.
+pub fn set_port(port: u16) {
+    let _ = PORT.set(port);
+}
+
+/// Base URL an engine is given (append `/v1/…`).
+pub fn base_url() -> Result<String, String> {
+    let port = PORT.get().ok_or("the daemon is not listening")?;
+    Ok(format!("http://127.0.0.1:{port}{PREFIX}"))
+}
+
+/// A new local key for `session` ("" while the engine has not named it).
+pub fn issue(session: &str) -> Result<String, String> {
+    let mut bytes = [0u8; 24];
+    getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
+    let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let key = format!("jgw-{key}");
+    state().keys.insert(key.clone(), session.to_string());
+    Ok(key)
+}
+
+/// The engine named its conversation: requests with `key` are `session`'s.
+pub fn bind(key: &str, session: &str) {
+    if let Some(owner) = state().keys.get_mut(key) {
+        *owner = session.to_string();
+    }
+}
+
+/// The engine holding `key` is gone.
+pub fn revoke(key: &str) {
+    let mut state = state();
+    state.keys.remove(key);
+    state.custom.remove(key);
+    state.owners.remove(key);
+}
+
+/// Routes a JuCode session's API-key inference through here, so it is
+/// metered (see `Meter`). The core asks per client for a local base and key;
+/// each provider/key pair gets its own local key, revoked with the core.
+/// Requests go on to exactly the URL the core would have called (`exact_url`).
+pub fn proxy_core(core: &mut jucode_agent_core::AgentCore, hub: &std::sync::Arc<crate::hub::Hub>) {
+    type Route = (String, String, String);
+    struct Routes(std::sync::Mutex<HashMap<Route, String>>);
+    impl Drop for Routes {
+        fn drop(&mut self) {
+            for key in self.0.get_mut().unwrap_or_else(|p| p.into_inner()).values() {
+                revoke(key);
+            }
+        }
+    }
+    let routes = Routes(std::sync::Mutex::new(HashMap::new()));
+    let session = core.session_id().to_string();
+    let owner = std::sync::Arc::downgrade(hub);
+    core.set_request_proxy(move |provider, protocol, api, token| {
+        if provider == "jucode" || !matches!(protocol, "anthropic" | "responses" | "chat") {
+            return Ok((api.to_string(), token.to_string()));
+        }
+        let route = (provider.to_string(), api.to_string(), token.to_string());
+        let mut keys = routes.0.lock().unwrap_or_else(|p| p.into_inner());
+        let key = match keys.get(&route) {
+            Some(key) => key.clone(),
+            None => {
+                let key = issue(&session)?;
+                set_custom(
+                    &key,
+                    "jucode",
+                    json!({ "id": provider, "base_url": api, "key": token, "exact": true }),
+                    owner.clone(),
+                );
+                keys.insert(route, key.clone());
+                key
+            }
+        };
+        Ok((format!("{}/v1", base_url()?), key))
+    });
+}
+
+/// Requests with `key` go to `provider` (`base_url`, `key`, `format`) instead
+/// of the JuCode gateway, metered for `owner`'s usage ledger.
+pub fn set_custom(
+    key: &str,
+    tool: &str,
+    mut provider: Value,
+    owner: std::sync::Weak<crate::hub::Hub>,
+) {
+    provider["tool"] = json!(tool);
+    let mut state = state();
+    state.custom.insert(key.to_string(), provider);
+    state.owners.insert(key.to_string(), owner);
+}
+
+/// The upstream URL for a JuCode session's request: the core was given
+/// `<local>/v1` as its base, so `target` is `/v1` + what its client appended
+/// to that base, and the same suffix goes on the real base. Anthropic
+/// Messages is the one protocol whose path depends on the base itself
+/// (`messages_url`), so it is rebuilt from the real base.
+fn exact_url(api: &str, target: &str) -> String {
+    let rest = target.strip_prefix("/v1").unwrap_or(target);
+    let path = rest.split('?').next().unwrap_or_default();
+    if path == "/messages" || path.starts_with("/messages/") {
+        let messages = llm_provider_kit::anthropic::messages_url(api);
+        let base = messages.strip_suffix("/messages").unwrap_or(&messages);
+        return format!("{base}{rest}");
+    }
+    format!("{}{rest}", api.trim_end_matches('/'))
+}
+
+pub fn custom_for_session(session: &str) -> Option<Value> {
+    let state = state();
+    state.keys.iter().find_map(|(key, owner)| {
+        (owner == session)
+            .then(|| state.custom.get(key).cloned())
+            .flatten()
+    })
+}
+
+/// `session` routes to `group` (None or empty: no choice).
+pub fn set_group(session: &str, group: Option<&str>) {
+    let mut state = state();
+    match group.map(str::trim).filter(|g| !g.is_empty()) {
+        Some(group) => state.groups.insert(session.to_string(), group.to_string()),
+        None => state.groups.remove(session),
+    };
+}
+
+/// `session`'s requests belong to `turn` (None: its engine stopped).
+pub fn set_turn(session: &str, turn: Option<&str>) {
+    let mut state = state();
+    match turn {
+        Some(turn) => state.turns.insert(session.to_string(), turn.to_string()),
+        None => state.turns.remove(session),
+    };
+}
+
+/// Whether a request path is the gateway's.
+pub fn is_gateway(path: &str) -> bool {
+    path == PREFIX || path.starts_with("/gw/")
+}
+
+/// Where requests go and with which token, read per request.
+pub struct Upstream {
+    pub api: String,
+    pub token: String,
+}
+
+/// Answers one gateway request on `stream` (`head` is its request head,
+/// peeked, still unread).
+pub fn serve(stream: TcpStream, head: &str) -> Result<(), String> {
+    serve_with(
+        stream,
+        head,
+        live_upstream,
+        live_catalog,
+        read_default_groups,
+    )
+}
+
+fn live_upstream() -> Result<Upstream, String> {
+    let (api, token) = jucode_agent_core::jucode_gateway_token()?;
+    Ok(Upstream { api, token })
+}
+
+/// `jucode_groups` in `~/.jucode/config.json`: the JuCode engine's per-model
+/// group choice, the default here too.
+fn read_default_groups() -> BTreeMap<String, String> {
+    let path = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".jucode")
+                .join("config.json")
+        });
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|config| serde_json::from_value(config["jucode_groups"].clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Group id → models, cached for `CATALOG_TTL`. None when unreadable: no
+/// group is then sent, and the gateway routes on its own.
+fn live_catalog(upstream: &Upstream) -> Option<HashMap<String, HashSet<String>>> {
+    let groups = live_groups(upstream)?;
+    Some(
+        groups
+            .iter()
+            .filter_map(|group| {
+                let id = group["id"].as_str()?.to_string();
+                let models = group["models"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
+                Some((id, models))
+            })
+            .collect(),
+    )
+}
+
+/// The gateway's groups, cached for `CATALOG_TTL`.
+fn live_groups(upstream: &Upstream) -> Option<Vec<Value>> {
+    if let Some((at, groups)) = &state().catalog {
+        if at.elapsed() < CATALOG_TTL {
+            return Some(groups.clone());
+        }
+    }
+    let url = format!("{}/v1/open/groups", upstream.api.trim_end_matches('/'));
+    let value: Value = agent()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {}", upstream.token))
+        .timeout(Duration::from_secs(15))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    let groups = value["groups"].as_array()?.clone();
+    state().catalog = Some((Instant::now(), groups.clone()));
+    Some(groups)
+}
+
+/// What a client that cannot read this machine's JuCode login (the remote
+/// page) needs to offer the gateway: the models the user chose to show
+/// (`jucode_models` in config.json) and the gateway's groups. Empty lists
+/// when not signed in or the gateway cannot be reached.
+pub fn catalog_json() -> Value {
+    // The window the engine budgets with: through the pinned group, and a
+    // hand-set override (capped at the gateway's largest) over the gateway's.
+    let models: Vec<Value> = jucode_agent_core::jucode_visible_models()
+        .into_iter()
+        .map(|model| {
+            let mut entry = json!({
+                "name": model.name,
+                "display_name": model.display_name,
+                "context_window": model.context_window,
+            });
+            if model.hidden {
+                entry["hidden"] = json!(true);
+            }
+            entry
+        })
+        .collect();
+    let groups = live_upstream()
+        .ok()
+        .and_then(|upstream| live_groups(&upstream))
+        .unwrap_or_default();
+    json!({ "type": "gateway_catalog", "models": models, "groups": groups })
+}
+
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(30))
+            .timeout_read(READ_TIMEOUT)
+            .redirects(0)
+            // Direct, like the JuCode engine's own requests: ureq would read
+            // ALL_PROXY first and has no SOCKS support built in.
+            .build()
+    })
+}
+
+/// The group a request for `model` goes to: the session's, else the model's
+/// default — each only if it serves the model (a pin it does not serve would
+/// fail the request, e.g. Claude Code's small background model).
+fn pick_group(
+    chosen: Option<&str>,
+    default: Option<&str>,
+    model: &str,
+    catalog: Option<&HashMap<String, HashSet<String>>>,
+) -> Option<String> {
+    let catalog = catalog?;
+    [chosen, default]
+        .into_iter()
+        .flatten()
+        .find(|group| {
+            catalog
+                .get(*group)
+                .is_some_and(|models| models.contains(model))
+        })
+        .map(str::to_string)
+}
+
+struct Request {
+    method: String,
+    /// Path and query after `/gw`.
+    target: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// Request headers not passed on: hop-by-hop, the client's credential and
+/// framing (the daemon sets its own), and encodings (the reply is relayed as
+/// is, so it must come uncompressed).
+fn dropped_request_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "authorization"
+            | "x-api-key"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "te"
+            | "upgrade"
+            | "expect"
+            | "accept-encoding"
+            | "x-jucode-group"
+            | "x-jucode-turn"
+    )
+}
+
+/// Reply headers not passed back: hop-by-hop and framing (the daemon closes
+/// the connection after the body).
+fn dropped_reply_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "content-encoding"
+            | "upgrade"
+    )
+}
+
+struct MeteredRequest {
+    hub: std::sync::Arc<crate::hub::Hub>,
+    session: String,
+    turn: String,
+}
+impl Drop for MeteredRequest {
+    fn drop(&mut self) {
+        self.hub.usage.gateway_finished(&self.session);
+    }
+}
+
+fn serve_with(
+    stream: TcpStream,
+    head: &str,
+    upstream: impl Fn() -> Result<Upstream, String>,
+    catalog: impl Fn(&Upstream) -> Option<HashMap<String, HashSet<String>>>,
+    defaults: impl Fn() -> BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut out = stream.try_clone().map_err(|error| error.to_string())?;
+    let _ = out.set_nodelay(true);
+    // Who is asking is in the head: refuse before reading a body.
+    let (method, target, headers) = parse_head(head);
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    if !loopback_host(header("host").unwrap_or_default()) {
+        return reply_error(
+            &mut out,
+            403,
+            "the local gateway only answers on the loopback address",
+        );
+    }
+    let presented = header("authorization")
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .or_else(|| header("x-api-key"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let session = match state().keys.get(&presented) {
+        Some(session) if !presented.is_empty() => session.clone(),
+        _ => return reply_error(&mut out, 401, "unknown local gateway key"),
+    };
+    if !target.starts_with("/v1/") {
+        return reply_error(&mut out, 404, "the local gateway serves /v1/ only");
+    }
+    let request = match read_body(stream, &headers) {
+        Ok(body) => Request {
+            method,
+            target,
+            headers,
+            body,
+        },
+        Err((status, message)) => return reply_error(&mut out, status, &message),
+    };
+    let custom = state().custom.get(&presented).cloned();
+    let inference = request.method.eq_ignore_ascii_case("POST")
+        && matches!(
+            request.target.split('?').next(),
+            Some(
+                "/v1/messages" | "/v1/responses" | "/v1/responses/compact" | "/v1/chat/completions"
+            )
+        );
+    let metered = custom
+        .as_ref()
+        .filter(|_| inference)
+        .and_then(|_| {
+            state()
+                .owners
+                .get(&presented)
+                .and_then(std::sync::Weak::upgrade)
+        })
+        .map(|hub| {
+            let turn = hub.usage.gateway_started(&session);
+            MeteredRequest {
+                hub,
+                session: session.clone(),
+                turn,
+            }
+        });
+    let upstream = match custom.as_ref() {
+        Some(provider) => Ok(Upstream {
+            api: provider["base_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            token: provider["key"].as_str().unwrap_or_default().to_string(),
+        }),
+        None => upstream(),
+    };
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        // "not logged in to JuCode …": the desktop reads it as a sign-in error.
+        Err(message) => return reply_error(&mut out, 401, &message),
+    };
+    let model = serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|body| body["model"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let chosen = if custom.is_none() {
+        state().groups.get(&session).cloned()
+    } else {
+        None
+    };
+    let default = if model.is_empty() || custom.is_some() {
+        None
+    } else {
+        defaults().get(&model).cloned()
+    };
+    // Nothing chosen: no catalog lookup on the way.
+    let group = if model.is_empty() || (chosen.is_none() && default.is_none()) {
+        None
+    } else {
+        pick_group(
+            chosen.as_deref(),
+            default.as_deref(),
+            &model,
+            catalog(&upstream).as_ref(),
+        )
+    };
+
+    let url = match &custom {
+        Some(provider) if provider["exact"] == true => exact_url(&upstream.api, &request.target),
+        // A tool provider's URL may name the version (`…/v1`) or not.
+        Some(_) if upstream.api.ends_with("/v1") => format!(
+            "{}{}",
+            upstream.api,
+            request
+                .target
+                .strip_prefix("/v1")
+                .unwrap_or(&request.target)
+        ),
+        _ => format!("{}{}", upstream.api.trim_end_matches('/'), request.target),
+    };
+    let mut call = agent()
+        .request(&request.method, &url)
+        .set("Accept-Encoding", "identity");
+    // As the core's own client authenticates (see llm_provider_kit's
+    // transport): x-api-key only on Anthropic's own host.
+    let api_key_header = match &custom {
+        Some(provider) if provider["exact"] == true => {
+            llm_provider_kit::anthropic::is_official_url(&url)
+        }
+        Some(provider) => provider["format"] == "anthropic",
+        None => false,
+    };
+    if api_key_header {
+        call = call.set("x-api-key", &upstream.token);
+    } else {
+        call = call.set("Authorization", &format!("Bearer {}", upstream.token));
+    }
+    for (name, value) in &request.headers {
+        if !dropped_request_header(name) {
+            call = call.set(name, value);
+        }
+    }
+    if let Some(group) = &group {
+        call = call.set("X-JuCode-Group", group);
+    }
+    if let Some(turn) = state()
+        .turns
+        .get(&session)
+        .cloned()
+        .filter(|_| custom.is_none())
+    {
+        call = call.set("X-JuCode-Turn", &turn);
+    }
+    let result = if request.body.is_empty() && request.method.eq_ignore_ascii_case("GET") {
+        call.call()
+    } else {
+        call.send_bytes(&request.body)
+    };
+    let response = match result {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+        Err(ureq::Error::Transport(error)) => {
+            return reply_error(
+                &mut out,
+                502,
+                &format!(
+                    "cannot reach {}: {error}",
+                    if custom.is_some() {
+                        "the custom provider"
+                    } else {
+                        "the JuCode gateway"
+                    }
+                ),
+            );
+        }
+    };
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        response.status(),
+        response.status_text()
+    );
+    for name in response.headers_names() {
+        if dropped_reply_header(&name) {
+            continue;
+        }
+        for value in response.all(&name) {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    // A custom Anthropic-format API that refuses Claude Code's mid-conversation
+    // system messages: told as Claude Code's gateway contract names it (same
+    // status), so it resends without them for the rest of the conversation.
+    if custom
+        .as_ref()
+        .is_some_and(|p| p["format"] == "anthropic" && matches!(response.status(), 400 | 422))
+    {
+        let mut body = Vec::new();
+        let _ = response.into_reader().take(1 << 20).read_to_end(&mut body);
+        if let Some(class) = capability_rejected(&request.body, &body) {
+            body = json!({"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": format!("capability_rejected: {class}"),
+            }})
+            .to_string()
+            .into_bytes();
+        }
+        return out
+            .write_all(head.as_bytes())
+            .and_then(|()| out.write_all(&body))
+            .map_err(|error| error.to_string());
+    }
+    out.write_all(head.as_bytes())
+        .map_err(|error| error.to_string())?;
+    // Relayed as it arrives (server-sent events); a client that hangs up
+    // ends the copy, and dropping the reader closes the upstream request.
+    let success = (200..300).contains(&response.status());
+    let streaming = response
+        .header("content-type")
+        .unwrap_or("")
+        .contains("text/event-stream");
+    let mut meter = Meter::default();
+    let mut body = response.into_reader();
+    let mut buffer = [0u8; 16 * 1024];
+    let mut read_error = None;
+    loop {
+        let read = match body.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                read_error = Some(format!("upstream read failed: {error}"));
+                break;
+            }
+        };
+        if metered.is_some() && success {
+            meter.feed(&buffer[..read], streaming);
+        }
+        if out
+            .write_all(&buffer[..read])
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            break;
+        }
+    }
+    if let Some(provider) = custom.filter(|_| success) {
+        meter.finish(streaming);
+        if let Some(metered) = &metered {
+            metered.hub.usage.record_gateway(
+                &session,
+                &metered.turn,
+                &provider,
+                &model,
+                meter.usage,
+                &metered
+                    .hub
+                    .store
+                    .sessions()
+                    .into_iter()
+                    .find(|r| r.id == session)
+                    .map(|r| r.cwd.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    match read_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The capability class (Claude Code's `capability_rejected: <class>`) an
+/// upstream's 400 refuses, when it is one the client can recover from. Only
+/// `mid_conv_system`: the request has a `{role: "system"}` message and the
+/// error names that message's path or a system role.
+fn capability_rejected(request: &[u8], reply: &[u8]) -> Option<&'static str> {
+    let body: Value = serde_json::from_slice(request).ok()?;
+    let system: Vec<usize> = body["messages"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "system")
+        .map(|(i, _)| i)
+        .collect();
+    if system.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(reply).to_ascii_lowercase();
+    // `messages.1` / `messages[1]`, not `messages.12`.
+    let names = |path: &str| {
+        text.match_indices(path)
+            .any(|(at, _)| !text[at + path.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    };
+    let at_path = system
+        .iter()
+        .any(|i| names(&format!("messages.{i}")) || names(&format!("messages[{i}]")));
+    (at_path || (text.contains("role") && text.contains("system"))).then_some("mid_conv_system")
+}
+
+/// Bounded incremental SSE/JSON usage reader; bytes forwarded remain untouched.
+#[derive(Default)]
+struct Meter {
+    pending: Vec<u8>,
+    usage: Value,
+}
+impl Meter {
+    fn feed(&mut self, bytes: &[u8], streaming: bool) {
+        for byte in bytes {
+            if self.pending.len() < MAX_BODY {
+                self.pending.push(*byte);
+            }
+            if streaming && *byte == b'\n' {
+                let line = std::mem::take(&mut self.pending);
+                if let Some(data) = line.strip_prefix(b"data:") {
+                    self.parse(data);
+                }
+            }
+        }
+    }
+    fn finish(&mut self, streaming: bool) {
+        let pending = std::mem::take(&mut self.pending);
+        if streaming {
+            if let Some(data) = pending.strip_prefix(b"data:") {
+                self.parse(data);
+            }
+        } else {
+            self.parse(&pending);
+        }
+    }
+    fn parse(&mut self, bytes: &[u8]) {
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return;
+        };
+        let usage = value
+            .get("usage")
+            .or_else(|| value.get("message")?.get("usage"))
+            .or_else(|| value.get("response")?.get("usage"));
+        let Some(usage) = usage else { return };
+        if !usage.is_object() {
+            return;
+        }
+        if !self.usage.is_object() {
+            self.usage = json!({});
+        }
+        // Counts are cumulative (Anthropic's message_delta repeats or
+        // updates message_start's): the largest is the total, and a later
+        // event that zeroes or drops a count does not lose it.
+        for (key, value) in usage.as_object().unwrap() {
+            let seen = self.usage[key].as_u64();
+            match value.as_u64() {
+                Some(count) if seen.is_some_and(|seen| seen >= count) => {}
+                _ if value.is_null() => {}
+                _ => self.usage[key] = value.clone(),
+            }
+        }
+    }
+}
+
+fn loopback_host(host: &str) -> bool {
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => host,
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+/// The peeked request head: method, target after `/gw`, headers.
+fn parse_head(head: &str) -> (String, String, Vec<(String, String)>) {
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next().unwrap_or_default().split(' ');
+    let method = first.next().unwrap_or_default().to_string();
+    let target = first.next().unwrap_or_default();
+    let target = target.strip_prefix(PREFIX).unwrap_or(target).to_string();
+    let headers = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+        .collect();
+    (method, target, headers)
+}
+
+/// Reads past the peeked head, then the body (by Content-Length or chunked).
+/// Errors carry the status to answer with.
+fn read_body(stream: TcpStream, headers: &[(String, String)]) -> Result<Vec<u8>, (u16, String)> {
+    let mut reader = BufReader::new(stream);
+    // Consume the head (peeked, so still in the socket).
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err((400, "incomplete request".into())),
+            Ok(_) if line == "\r\n" || line == "\n" => break,
+            Ok(_) => {}
+            Err(error) => return Err((400, error.to_string())),
+        }
+    }
+    let find = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    if find("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+        return read_chunked(&mut reader);
+    }
+    let length: usize = find("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if length > MAX_BODY {
+        return Err((413, "request body too large".into()));
+    }
+    let mut body = vec![0u8; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| (400, error.to_string()))?;
+    Ok(body)
+}
+
+fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, (u16, String)> {
+    let mut body = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| (400, error.to_string()))?;
+        let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or_default(), 16)
+            .map_err(|_| (400, "bad chunk size".to_string()))?;
+        if size == 0 {
+            // Trailers, then the blank line.
+            loop {
+                line.clear();
+                if reader
+                    .read_line(&mut line)
+                    .map_err(|error| (400, error.to_string()))?
+                    == 0
+                    || line.trim().is_empty()
+                {
+                    return Ok(body);
+                }
+            }
+        }
+        if body.len() + size > MAX_BODY {
+            return Err((413, "request body too large".into()));
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader
+            .read_exact(&mut body[start..])
+            .map_err(|error| (400, error.to_string()))?;
+        line.clear();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| (400, error.to_string()))?;
+    }
+}
+
+fn reply_error(out: &mut TcpStream, status: u16, message: &str) -> Result<(), String> {
+    let reason = match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        _ => "Bad Gateway",
+    };
+    let body =
+        json!({ "error": { "type": "local_gateway_error", "message": message } }).to_string();
+    let reply = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    out.write_all(reply.as_bytes())
+        .map_err(|error| error.to_string())?;
+    // Closing with the request still unread would reset the connection and
+    // lose this reply: finish writing, then drop what already arrived (a
+    // little, briefly — a refused body is never read in full).
+    let _ = out.shutdown(std::net::Shutdown::Write);
+    let _ = out.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut sink = [0u8; 16 * 1024];
+    let mut drained = 0;
+    while drained < 1024 * 1024 {
+        match out.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => drained += read,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn a_refused_mid_conversation_system_message_is_named_for_claude_code() {
+        let request =
+            br#"{"messages":[{"role":"user","content":"hi"},{"role":"system","content":"env"}]}"#;
+        let refused = br#"{"type":"error","error":{"message":"Invalid input at messages.1.role"}}"#;
+        assert_eq!(
+            capability_rejected(request, refused),
+            Some("mid_conv_system")
+        );
+        let worded = br#"{"error":{"message":"Unexpected role 'system' in messages"}}"#;
+        assert_eq!(
+            capability_rejected(request, worded),
+            Some("mid_conv_system")
+        );
+        // Another message's path, or no system message: left as it is.
+        let other = br#"{"error":{"message":"Invalid input at messages.12.content"}}"#;
+        assert_eq!(capability_rejected(request, other), None);
+        let plain = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(capability_rejected(plain, refused), None);
+    }
+
+    #[test]
+    fn hosts_must_be_loopback() {
+        assert!(loopback_host("127.0.0.1:7788"));
+        assert!(loopback_host("localhost:7788"));
+        assert!(loopback_host("[::1]:7788"));
+        assert!(!loopback_host("evil.example:7788"));
+        assert!(!loopback_host("127.0.0.1.evil.example"));
+        assert!(!loopback_host(""));
+    }
+
+    #[test]
+    fn a_group_is_sent_only_where_it_serves_the_model() {
+        let catalog: HashMap<String, HashSet<String>> = HashMap::from([
+            (
+                "g-claude".into(),
+                HashSet::from(["claude-opus-5-5".to_string()]),
+            ),
+            (
+                "g-all".into(),
+                HashSet::from([
+                    "claude-opus-5-5".to_string(),
+                    "claude-haiku-4-5".to_string(),
+                ]),
+            ),
+        ]);
+        let pick = |chosen, default, model| pick_group(chosen, default, model, Some(&catalog));
+        assert_eq!(
+            pick(Some("g-claude"), None, "claude-opus-5-5").as_deref(),
+            Some("g-claude")
+        );
+        // The session's group lacks the background model: the default, then none.
+        assert_eq!(
+            pick(Some("g-claude"), Some("g-all"), "claude-haiku-4-5").as_deref(),
+            Some("g-all")
+        );
+        assert_eq!(pick(Some("g-claude"), None, "claude-haiku-4-5"), None);
+        assert_eq!(pick(None, None, "claude-opus-5-5"), None);
+        // Unknown catalog: never a group that might not serve the model.
+        assert_eq!(
+            pick_group(Some("g-claude"), None, "claude-opus-5-5", None),
+            None
+        );
+    }
+
+    #[test]
+    fn keys_bind_to_the_session_once_named_and_revoke() {
+        let key = issue("").unwrap();
+        assert!(key.starts_with("jgw-") && key.len() == 52);
+        bind(&key, "s-named");
+        assert_eq!(state().keys.get(&key).map(String::as_str), Some("s-named"));
+        revoke(&key);
+        assert!(!state().keys.contains_key(&key));
+    }
+
+    #[test]
+    fn usage_is_read_across_chunks_without_summing_cumulative_deltas() {
+        let mut meter = Meter::default();
+        let stream = b"event: message_start\r\ndata: {\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":20,\"output_tokens\":1}}}\r\n\r\ndata: {\"usage\":{\"output_tokens\":8}}\n\ndata: {\"usage\":{\"output_tokens\":13}}\n\n";
+        for part in stream.chunks(3) {
+            meter.feed(part, true);
+        }
+        meter.finish(true);
+        assert_eq!(meter.usage["input_tokens"], 12);
+        assert_eq!(meter.usage["cache_read_input_tokens"], 20);
+        assert_eq!(meter.usage["output_tokens"], 13);
+        let mut meter = Meter::default();
+        meter.feed(br#"data: {"type":"response.completed","response":{"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":60},"output_tokens":15}}}"#, true);
+        meter.finish(true);
+        assert_eq!(meter.usage["input_tokens"], 100);
+        assert_eq!(meter.usage["input_tokens_details"]["cached_tokens"], 60);
+        let mut meter = Meter::default();
+        meter.feed(
+            br#"{"usage":{"prompt_tokens":30,"completion_tokens":5}}"#,
+            false,
+        );
+        meter.finish(false);
+        assert_eq!(meter.usage["prompt_tokens"], 30);
+    }
+
+    #[test]
+    fn custom_routes_inject_only_the_upstream_key_and_do_not_send_jucode_tags() {
+        let key = issue("s-custom-proxy").unwrap();
+        let (api, upstream) = fake_upstream();
+        set_custom(
+            &key,
+            "claude",
+            json!({"id":"private","base_url":format!("{api}/v1"),"key":"own-secret","format":"anthropic"}),
+            std::sync::Weak::new(),
+        );
+        set_turn("s-custom-proxy", Some("private-turn"));
+        set_group("s-custom-proxy", Some("g1"));
+        let body = r#"{"model":"claude-custom","stream":true}"#;
+        let request = format!("POST /gw/v1/messages HTTP/1.1\r\nHost: localhost:7788\r\nAuthorization: Bearer {key}\r\nX-JuCode-Group: bad\r\nX-JuCode-Turn: bad\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let reply = through_gateway(&request, "http://127.0.0.1:9".into(), Some("g1"));
+        let received = upstream.join().unwrap().to_ascii_lowercase();
+        assert!(
+            reply.contains("data: one\n\ndata: two\n\n"),
+            "{reply}\nupstream received: {received}"
+        );
+        assert!(received.starts_with("post /v1/messages "), "{received}");
+        assert!(received.contains("x-api-key: own-secret"));
+        assert!(!received.contains("authorization:"));
+        assert!(!received.contains(&key));
+        assert!(!received.contains("real-token"));
+        assert!(!received.contains("x-jucode-"));
+        revoke(&key);
+        assert!(custom_for_session("s-custom-proxy").is_none());
+    }
+
+    #[test]
+    fn a_jucode_session_s_request_goes_to_exactly_the_url_its_client_would_call() {
+        use llm_provider_kit::{transport::endpoint, Protocol};
+        let local = "http://127.0.0.1:7788/gw/v1";
+        let bases = [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com.example.net",
+            "https://api.deepseek.com/anthropic",
+            "https://api.deepseek.com/anthropic/",
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/",
+            "https://api.moonshot.cn/v1",
+            "https://host/proxy",
+            "https://host/proxy/",
+            "http://127.0.0.1:11434",
+        ];
+        let protocols = [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChatCompletions,
+        ];
+        for base in bases {
+            for protocol in protocols {
+                let direct = endpoint(protocol, base);
+                let proxied = endpoint(protocol, local);
+                let target = proxied.strip_prefix("http://127.0.0.1:7788/gw").unwrap();
+                assert_eq!(exact_url(base, target), direct, "{base} {protocol:?}");
+            }
+        }
+        // Query strings (Claude Code's `?beta=true`) stay as they were.
+        assert_eq!(
+            exact_url(
+                "https://api.deepseek.com/anthropic",
+                "/v1/messages?beta=true"
+            ),
+            "https://api.deepseek.com/anthropic/v1/messages?beta=true"
+        );
+    }
+
+    #[test]
+    fn a_jucode_session_s_request_authenticates_as_its_client_would() {
+        for (base, path, header) in [
+            (
+                "/anthropic",
+                "/anthropic/v1/messages",
+                "authorization: bearer own-secret",
+            ),
+            (
+                "/v1",
+                "/v1/chat/completions",
+                "authorization: bearer own-secret",
+            ),
+        ] {
+            let key = issue("s-exact").unwrap();
+            let (api, upstream) = fake_upstream();
+            set_custom(
+                &key,
+                "jucode",
+                json!({"id":"p","base_url":format!("{api}{base}"),"key":"own-secret","exact":true}),
+                std::sync::Weak::new(),
+            );
+            let target = if path.ends_with("/messages") {
+                "/v1/messages"
+            } else {
+                "/v1/chat/completions"
+            };
+            let request = format!("POST /gw{target} HTTP/1.1\r\nHost: 127.0.0.1:7788\r\nAuthorization: Bearer {key}\r\nContent-Length: 2\r\n\r\n{{}}");
+            through_gateway(&request, "http://127.0.0.1:9".into(), None);
+            let received = upstream.join().unwrap().to_ascii_lowercase();
+            assert!(received.starts_with(&format!("post {path} ")), "{received}");
+            assert!(received.contains(header), "{received}");
+            assert!(!received.contains("x-api-key"), "{received}");
+            revoke(&key);
+        }
+    }
+
+    #[test]
+    fn a_later_event_that_zeroes_a_count_does_not_lose_it() {
+        let mut meter = Meter::default();
+        meter.feed(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"cache_read_input_tokens\":7,\"output_tokens\":1}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":null,\"output_tokens\":25}}\n\n", true);
+        meter.finish(true);
+        assert_eq!(meter.usage["input_tokens"], 40);
+        assert_eq!(meter.usage["cache_read_input_tokens"], 7);
+        assert_eq!(meter.usage["output_tokens"], 25);
+    }
+
+    /// A fake JuCode gateway: answers one request with a streamed body and
+    /// reports what it received.
+    fn fake_upstream() -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut received = String::new();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap();
+                }
+                received.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            // A local dev-server scanner can probe temporary test ports.
+            if !received.starts_with("POST ") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            received.push_str(&String::from_utf8_lossy(&body));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            for chunk in ["data: one\n\n", "data: two\n\n"] {
+                stream
+                    .write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").unwrap();
+            break received;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Sends `request` through the gateway against `api`; returns the reply.
+    fn through_gateway(request: &str, api: String, group: Option<&str>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let group = group.map(str::to_string);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let head = crate::http::peek_head(&stream).unwrap();
+            let catalog = HashMap::from([("g1".to_string(), HashSet::from(["m1".to_string()]))]);
+            serve_with(
+                stream,
+                &head,
+                || {
+                    Ok(Upstream {
+                        api: api.clone(),
+                        token: "real-token".into(),
+                    })
+                },
+                |_| Some(catalog.clone()),
+                || {
+                    group
+                        .iter()
+                        .map(|g| ("m1".to_string(), g.clone()))
+                        .collect()
+                },
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        server.join().unwrap();
+        reply
+    }
+
+    #[test]
+    fn requests_go_up_with_the_real_token_and_group_and_stream_back() {
+        let key = issue("s-stream").unwrap();
+        let (api, upstream) = fake_upstream();
+        let body = r#"{"model":"m1","stream":true}"#;
+        let request = format!(
+            "POST /gw/v1/responses HTTP/1.1\r\nHost: 127.0.0.1:7788\r\nAuthorization: Bearer {key}\r\nAccept-Encoding: br\r\nX-Custom: kept\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let reply = through_gateway(&request, api, Some("g1"));
+        let received = upstream.join().unwrap().to_ascii_lowercase();
+        assert!(received.starts_with("post /v1/responses "), "{received}");
+        assert!(received.contains("authorization: bearer real-token"));
+        assert!(!received.contains(&key), "the local key stays local");
+        assert!(received.contains("x-jucode-group: g1"));
+        assert!(received.contains("x-custom: kept"));
+        assert!(received.contains("accept-encoding: identity"));
+        assert!(received.ends_with(body), "{received}");
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert!(!reply.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(reply.ends_with("data: one\n\ndata: two\n\n"), "{reply}");
+        revoke(&key);
+    }
+
+    #[test]
+    fn unknown_keys_and_foreign_hosts_are_refused() {
+        let request = "POST /gw/v1/responses HTTP/1.1\r\nHost: 127.0.0.1:7788\r\nAuthorization: Bearer nope\r\nContent-Length: 0\r\n\r\n";
+        let reply = through_gateway(request, "http://127.0.0.1:9".into(), None);
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+        let key = issue("s-host").unwrap();
+        let request = format!("POST /gw/v1/responses HTTP/1.1\r\nHost: evil.example:7788\r\nAuthorization: Bearer {key}\r\nContent-Length: 0\r\n\r\n");
+        let reply = through_gateway(&request, "http://127.0.0.1:9".into(), None);
+        assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+        revoke(&key);
+    }
+
+    #[test]
+    fn a_stranger_is_refused_before_its_body_is_read() {
+        // Claims 60 MB but sends none: answered at once, not after reading it.
+        let request = "POST /gw/v1/responses HTTP/1.1\r\nHost: 127.0.0.1:7788\r\nAuthorization: Bearer nope\r\nContent-Length: 60000000\r\n\r\n";
+        let reply = through_gateway(request, "http://127.0.0.1:9".into(), None);
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+    }
+
+    #[test]
+    fn no_group_chosen_means_no_catalog_lookup() {
+        let key = issue("s-nogroup").unwrap();
+        let (api, upstream) = fake_upstream();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let head = crate::http::peek_head(&stream).unwrap();
+            serve_with(
+                stream,
+                &head,
+                || {
+                    Ok(Upstream {
+                        api: api.clone(),
+                        token: "t".into(),
+                    })
+                },
+                |_| panic!("the catalog was read with no group chosen"),
+                BTreeMap::new,
+            )
+            .unwrap();
+        });
+        let body = r#"{"model":"m1"}"#;
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(format!("POST /gw/v1/responses HTTP/1.1\r\nHost: localhost:1\r\nx-api-key: {key}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        server.join().unwrap();
+        assert!(!upstream
+            .join()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("x-jucode-group"));
+        assert!(reply.starts_with("HTTP/1.1 200"));
+        revoke(&key);
+    }
+
+    #[test]
+    fn chunked_request_bodies_are_read_whole() {
+        let mut input = "4\r\nabcd\r\n3;x=1\r\nefg\r\n0\r\n\r\n".as_bytes();
+        assert_eq!(read_chunked(&mut input).unwrap(), b"abcdefg");
+    }
+}

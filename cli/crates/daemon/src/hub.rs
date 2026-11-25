@@ -1,0 +1,1822 @@
+//! Shared daemon state: hosted sessions, connected clients and who watches
+//! what, plus the scheduler. A session is attended while at least one
+//! client watches it.
+
+use crate::{
+    engines,
+    relay::Relay,
+    schedules::{self, Schedule},
+    session,
+    store::{now, Closure, Device, SessionRecord, Store, CLOSED_KEEP_MS},
+    titles::{self, Turns},
+    usage::{SessionInfo, Usage},
+};
+use serde_json::{json, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{Sender, SyncSender, TrySendError},
+        Arc, Mutex, MutexGuard, Weak,
+    },
+    thread,
+};
+
+/// How long a pairing code shown on the desktop stays valid.
+const PAIRING_TTL_MS: u64 = 5 * 60 * 1000;
+/// Pairing codes avoid characters that are easy to misread (0/O, 1/I).
+const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// A hosted session with nothing going on (see `Hub::idle_sessions`) has its
+/// engine closed this long after its last activity; the client opens it
+/// again, resuming, when the user next sends to it.
+pub const IDLE_CLOSE_MS: u64 = 30 * 60 * 1000;
+/// Engines kept open at most: past this, idle sessions are closed, least
+/// recently active first, before their `IDLE_CLOSE_MS` is up.
+pub const MAX_LIVE_ENGINES: usize = 16;
+/// A session idle this briefly is not closed for the cap: it was just
+/// opened or just used, and closing it would only start it again.
+const CAP_MIN_IDLE_MS: u64 = 2 * 60 * 1000;
+/// Frames a client may have waiting: a client that falls this far behind
+/// (a stalled connection) is dropped rather than queued for without end.
+const OUTBOX_LIMIT: usize = 10_000;
+/// How long a pending daemon update waits for held work (a TUI, background
+/// tasks) to end before it restarts anyway; running turns it always waits for.
+const RESTART_HOLD_MS: u64 = 10 * 60 * 1000;
+/// How often `sweep` looks for runs to time out and sessions to close.
+const SWEEP_EVERY_MS: u64 = 60 * 1000;
+
+pub struct Hub {
+    pub store: Store,
+    pub uploads: crate::uploads::Uploads,
+    /// Terminals (session TUIs, clients' shells) and the clients viewing
+    /// them.
+    pub terminals: crate::terminal::Terminals,
+    /// Dev servers the sessions' commands started.
+    pub dev_servers: crate::devservers::DevServers,
+    /// Keeps the computer from idle sleep while any feature needs it.
+    pub awake: crate::awake::Awake,
+    pub version: &'static str,
+    pub relay: Relay,
+    sessions: Mutex<HashMap<String, Hosted>>,
+    /// Sessions whose engine is running a turn or has queued messages.
+    busy: Mutex<HashSet<String>>,
+    /// Sessions with background work the turn left going (background
+    /// commands, agents, workflows): not a turn, so not `busy`. True when
+    /// some of it comes back to the conversation (agents, workflows).
+    background: Mutex<HashMap<String, bool>>,
+    /// Sessions whose latest turn ended in an error, until the next starts.
+    failed: Mutex<HashSet<String>>,
+    /// A newer daemon waits to replace this one (`restart_when_idle`).
+    restart_pending: AtomicBool,
+    /// Messages the daemon sent (`send_to_session`) that a session thread
+    /// has not processed yet: the session stays busy, since the engine
+    /// still reports "ready" until it has read the message.
+    claims: Mutex<HashMap<String, usize>>,
+    /// The scheduled tasks (see `schedules`).
+    pub(crate) schedules: Mutex<Vec<Schedule>>,
+    /// When `sweep` last ran (ms).
+    last_sweep: AtomicU64,
+    next_id: AtomicU64,
+    next_generation: AtomicU64,
+    clients: Mutex<HashMap<u64, Client>>,
+    /// Why the daemon closed a session, until its engine thread ends and
+    /// `session_ended` tells the clients (`session_closed`'s `reason`).
+    close_reasons: Mutex<HashMap<String, &'static str>>,
+    /// Sessions closed for idleness, with the options their engine ran with:
+    /// a message to one opens it again (`wake`), as it ran.
+    asleep: Mutex<HashMap<String, engines::Options>>,
+    /// Pairing code → expiry (ms). Single use.
+    pairings: Mutex<HashMap<String, u64>>,
+    next_client: AtomicU64,
+    /// Sessions created here that have not had a user message yet: the
+    /// first one becomes their title.
+    untitled: Mutex<HashSet<String>>,
+    /// Images sent with a message, by session and the message's text, until
+    /// the engine echoes it: no engine's `user_message` carries them.
+    sent_images: Mutex<HashMap<String, Vec<(String, Value)>>>,
+    /// Each session's conversation so far, for its model-written title.
+    turns: Mutex<HashMap<String, Turns>>,
+    /// Sessions whose title is being written now.
+    titling: Mutex<HashSet<String>>,
+    /// Sessions other sessions started, by id (see `subsessions`).
+    pub(crate) children: Mutex<HashMap<String, crate::subsessions::Child>>,
+    /// This hub, for the threads it starts.
+    me: Weak<Hub>,
+    /// Each turn's token usage (see `usage`).
+    pub usage: Usage,
+}
+
+struct Client {
+    outbox: SyncSender<String>,
+    /// The paired device this connection authenticated as; None for a local
+    /// client holding the daemon token.
+    device: Option<String>,
+}
+
+struct Hosted {
+    ops: Sender<Value>,
+    cwd: PathBuf,
+    watchers: HashSet<u64>,
+    /// Which engine thread backs this entry (see `session_ended`).
+    generation: u64,
+    /// When something last happened in the session (ms): an op from a
+    /// client, a turn starting or ending, background work ending.
+    last_active: u64,
+    /// Work outside a turn keeps the engine open: background tasks or
+    /// subagents, an approval waiting, the conversation in its TUI.
+    held: bool,
+}
+
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+impl Hub {
+    /// `relay` is the relay base URL; None turns the relay off whatever the
+    /// setting says (`--no-relay`).
+    pub fn new(store: Store, version: &'static str, relay: Option<String>) -> Arc<Self> {
+        let schedules = Mutex::new(schedules::load(store.dir()));
+        // `~/.jucode`: uploads live beside the daemon's state, not in it.
+        let jucode_dir = store.dir().parent().unwrap_or(store.dir()).to_path_buf();
+        let uploads = crate::uploads::Uploads::load(&jucode_dir);
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            schedules,
+            last_sweep: AtomicU64::new(0),
+            turns: Mutex::new(HashMap::new()),
+            titling: Mutex::new(HashSet::new()),
+            children: Mutex::new(HashMap::new()),
+            relay: Relay::new(relay, &store),
+            usage: Usage::new(&store),
+            uploads,
+            terminals: Default::default(),
+            dev_servers: Default::default(),
+            awake: Default::default(),
+            store,
+            version,
+            sessions: Mutex::new(HashMap::new()),
+            busy: Mutex::new(HashSet::new()),
+            background: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashSet::new()),
+            restart_pending: AtomicBool::new(false),
+            claims: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            next_generation: AtomicU64::new(0),
+            clients: Mutex::new(HashMap::new()),
+            close_reasons: Mutex::new(HashMap::new()),
+            asleep: Mutex::new(HashMap::new()),
+            pairings: Mutex::new(HashMap::new()),
+            next_client: AtomicU64::new(1),
+            untitled: Mutex::new(HashSet::new()),
+            sent_images: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn add_client(&self, outbox: SyncSender<String>, device: Option<String>) -> u64 {
+        let id = self.next_client.fetch_add(1, Ordering::SeqCst);
+        lock(&self.clients).insert(id, Client { outbox, device });
+        id
+    }
+
+    /// The paired device a connection authenticated as (None: local).
+    pub fn device_of(&self, client: u64) -> Option<String> {
+        lock(&self.clients).get(&client)?.device.clone()
+    }
+
+    /// Whether the connection is a local client (not a paired device).
+    pub fn is_local(&self, client: u64) -> bool {
+        lock(&self.clients)
+            .get(&client)
+            .is_some_and(|client| client.device.is_none())
+    }
+
+    /// A new single-use pairing code and its expiry (ms).
+    pub fn start_pairing(&self) -> Result<(String, u64), String> {
+        let mut bytes = [0u8; 8];
+        getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
+        let code: String = bytes
+            .iter()
+            .map(|byte| PAIRING_ALPHABET[*byte as usize % PAIRING_ALPHABET.len()] as char)
+            .collect();
+        let expires_at = now() + PAIRING_TTL_MS;
+        let mut pairings = lock(&self.pairings);
+        pairings.retain(|_, expiry| *expiry > now());
+        pairings.insert(code.clone(), expires_at);
+        Ok((code, expires_at))
+    }
+
+    /// Uses up a pairing code; an error when it is wrong or expired.
+    pub fn redeem_pairing(&self, code: &str) -> Result<(), String> {
+        let code = code.trim().to_ascii_uppercase();
+        let valid = lock(&self.pairings)
+            .remove(&code)
+            .is_some_and(|expiry| expiry > now());
+        if valid {
+            Ok(())
+        } else {
+            Err("pairing code is wrong or expired".to_string())
+        }
+    }
+
+    /// Records a newly paired device: `key_hash` and the account fields
+    /// (`authz`, `client`, `user`) come in `device`; id, name and time are
+    /// set here.
+    pub fn add_device(&self, name: &str, device: Device) -> Result<Device, String> {
+        let name = name.trim();
+        let device = Device {
+            id: self.new_id("dev"),
+            name: if name.is_empty() { "device" } else { name }
+                .chars()
+                .take(60)
+                .collect(),
+            paired_at: now(),
+            revoked: false,
+            ..device
+        };
+        self.store
+            .record_device(&device)
+            .map_err(|error| error.to_string())?;
+        Ok(device)
+    }
+
+    /// Revokes a device and drops its open connections.
+    pub fn revoke_device(&self, id: &str) -> Result<(), String> {
+        if !self
+            .store
+            .devices()
+            .iter()
+            .any(|device| device.id == id && !device.revoked)
+        {
+            return Err(format!("unknown device {id}"));
+        }
+        self.store
+            .record_device_revoked(id)
+            .map_err(|error| error.to_string())?;
+        // Dropping the outbox ends that connection's loop.
+        lock(&self.clients).retain(|_, client| client.device.as_deref() != Some(id));
+        Ok(())
+    }
+
+    /// Revokes every paired device; returns how many there were.
+    pub fn revoke_all_devices(&self) -> Result<usize, String> {
+        let active: Vec<String> = self
+            .store
+            .devices()
+            .into_iter()
+            .filter(|device| !device.revoked)
+            .map(|device| device.id)
+            .collect();
+        for id in &active {
+            self.revoke_device(id)?;
+        }
+        Ok(active.len())
+    }
+
+    pub fn devices_json(&self) -> Value {
+        let list: Vec<Value> = self
+            .store
+            .devices()
+            .iter()
+            .filter(|device| !device.revoked)
+            .map(|device| {
+                json!({
+                    "id": device.id, "name": device.name, "paired_at": device.paired_at,
+                    "client": device.client, "authz": device.authz, "user": device.user,
+                })
+            })
+            .collect();
+        json!({ "type": "devices", "devices": list })
+    }
+
+    /// Whether a local client (the desktop) is connected.
+    pub fn has_local_client(&self) -> bool {
+        lock(&self.clients)
+            .values()
+            .any(|client| client.device.is_none())
+    }
+
+    /// `broadcast` to local clients only.
+    pub fn broadcast_local(&self, frame: &Value) {
+        let text = frame.to_string();
+        lock(&self.clients)
+            .retain(|_, client| client.device.is_some() || Self::queue(client, text.clone()));
+    }
+
+    /// Drops the client, its watches, the terminals it viewed and its
+    /// shells; sessions it was the last watcher of become unattended.
+    pub fn remove_client(&self, client: u64) {
+        lock(&self.clients).remove(&client);
+        self.terminals.detach_client(client);
+        let watched: Vec<String> = lock(&self.sessions)
+            .iter()
+            .filter(|(_, hosted)| hosted.watchers.contains(&client))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for session in watched {
+            self.set_watch(client, &session, false);
+        }
+    }
+
+    /// The channel a connection's frames wait in (`OUTBOX_LIMIT`).
+    pub fn outbox() -> (SyncSender<String>, std::sync::mpsc::Receiver<String>) {
+        std::sync::mpsc::sync_channel(OUTBOX_LIMIT)
+    }
+
+    /// Queues `text` for a client; false when the client is gone or so far
+    /// behind that it is dropped (it reconnects and gets a fresh snapshot).
+    fn queue(client: &Client, text: String) -> bool {
+        match client.outbox.try_send(text) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    pub fn broadcast(&self, frame: &Value) {
+        let text = frame.to_string();
+        lock(&self.clients).retain(|_, client| Self::queue(client, text.clone()));
+    }
+
+    pub fn send_to(&self, client: u64, frame: &Value) {
+        let mut clients = lock(&self.clients);
+        if let Some(queued) = clients.get(&client) {
+            if !Self::queue(queued, frame.to_string()) {
+                clients.remove(&client);
+            }
+        }
+    }
+
+    /// Starts a new session in `cwd`, or in the chats directory for a chat,
+    /// on `engine` (None: jucode) with its start options; `schedule`: it is
+    /// a run of that scheduled task; `project`: the project it belongs to
+    /// ("": none; None: the one whose main directory is `cwd`).
+    pub fn create_engine_session(
+        self: &Arc<Self>,
+        cwd: Option<PathBuf>,
+        schedule: Option<&str>,
+        chat: bool,
+        engine: Option<engines::Kind>,
+        options: engines::Options,
+        project: Option<&str>,
+    ) -> Result<String, String> {
+        let cwd = match cwd {
+            None if chat => {
+                jucode_agent_core::chat::ensure_chats_dir().map_err(|error| error.to_string())?
+            }
+            Some(cwd) => cwd,
+            None => return Err("session_create requires cwd".to_string()),
+        };
+        if !cwd.is_dir() {
+            return Err(format!("not a directory: {}", cwd.display()));
+        }
+        let project = crate::projects::for_new_session(self, &cwd, project)?;
+        let dirs = crate::projects::extra_dirs(self, &cwd, &project);
+        let gateway = options.gateway == Some(true);
+        let agent = options.agent.clone();
+        let mut options = engines::Options {
+            dirs: dirs.clone(),
+            ..options
+        };
+        if let Some(kind) = engine {
+            engines::pin_tool_provider(&self.store, kind, &mut options);
+        }
+        let tool_provider = options.tool_provider.clone();
+        // Where a fork comes from, kept with it (a Claude fork that never got
+        // its first turn is made again from it, see `open_engine_session`).
+        let forked = options.fork_from.clone().map(
+            |from| json!({ "session": from, "turns": options.fork_turns, "at": options.resume_at }),
+        );
+        let (id, ops, generation) = match engine {
+            None => {
+                // A fork: a copy of the conversation's first turns, resumed.
+                let resume = match &options.fork_from {
+                    Some(from) => Some(
+                        jucode_agent_core::fork_session(
+                            options.fork_cwd.as_deref().unwrap_or(&cwd),
+                            &cwd,
+                            from,
+                            options.fork_turns.map(|turns| turns as usize),
+                        )
+                        .map_err(|error| format!("cannot fork {from}: {error}"))?,
+                    ),
+                    None => None,
+                };
+                session::spawn(Arc::clone(self), cwd.clone(), resume, dirs)?
+            }
+            Some(engines::Kind::Acp) if options.fork_from.is_some() => {
+                return Err("an ACP agent's conversation cannot be forked".to_string());
+            }
+            Some(kind) => {
+                // Claude Code takes its conversation id from us; others name it.
+                let id = match kind {
+                    engines::Kind::Claude | engines::Kind::Acp => Some(engines::new_uuid()?),
+                    engines::Kind::Codex => None,
+                };
+                engines::spawn(Arc::clone(self), kind, id, cwd.clone(), options, vec![])?
+            }
+        };
+        self.store
+            .record_engine_session(
+                &id,
+                &cwd,
+                schedule,
+                engine.map(engines::Kind::name),
+                gateway,
+                agent.as_deref(),
+                Some(&project),
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(provider) = tool_provider {
+            self.store
+                .record_session_meta(&id, &json!({ "tool_provider": provider }))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(source) = forked {
+            self.store
+                .record_session_meta(&id, &json!({ "forked_from": source }))
+                .map_err(|error| error.to_string())?;
+        }
+        lock(&self.untitled).insert(id.clone());
+        self.host(id.clone(), ops, cwd, generation);
+        Ok(id)
+    }
+
+    /// Hosts a session recorded earlier (after a restart or a close). A
+    /// session that is already hosted is left as it is.
+    /// `cwd` also opens a session the daemon never hosted (one saved by
+    /// the TUI or `jucode serve` in that directory).
+    pub fn open_session(self: &Arc<Self>, id: &str, cwd: Option<PathBuf>) -> Result<(), String> {
+        self.open_engine_session(id, cwd, None, engines::Options::default())
+    }
+
+    /// `open_session` with start options; `engine` names the engine of a
+    /// session the daemon never hosted (a Claude Code conversation saved in
+    /// `cwd`).
+    pub fn open_engine_session(
+        self: &Arc<Self>,
+        id: &str,
+        cwd: Option<PathBuf>,
+        engine: Option<engines::Kind>,
+        options: engines::Options,
+    ) -> Result<(), String> {
+        if lock(&self.sessions).contains_key(id) {
+            return Ok(());
+        }
+        // Closed for idleness: a client that does not say how (a phone)
+        // opens it as it last ran. The entry goes once it
+        // is open (a failed open leaves it asleep).
+        let kept = lock(&self.asleep).get(id).cloned();
+        let options = match kept {
+            Some(kept) if options == engines::Options::default() => kept,
+            _ => options,
+        };
+        let known = self
+            .store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == id);
+        let record = match (known, cwd) {
+            (Some(record), _) => record,
+            (None, Some(cwd)) => {
+                let saved = match engine {
+                    None => jucode_agent_core::saved_sessions(&cwd)
+                        .map_err(|error| error.to_string())?
+                        .iter()
+                        .any(|summary| summary.id == id),
+                    Some(engines::Kind::Claude) => {
+                        engines::claude::saved(&engines::claude::config_for(&options), &cwd)
+                            .iter()
+                            .any(|(saved, _, _)| saved == id)
+                    }
+                    Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
+                        .iter()
+                        .any(|(saved, _, _)| saved == id),
+                    // An ACP agent's conversations are known only from the
+                    // sessions the daemon hosted.
+                    Some(engines::Kind::Acp) => false,
+                };
+                if !saved {
+                    return Err(format!("no session {id} in {}", cwd.display()));
+                }
+                SessionRecord {
+                    id: id.to_string(),
+                    cwd,
+                    schedule: None,
+                    created_at: now(),
+                    closed: true,
+                    title: None,
+                    title_auto: false,
+                    archived: false,
+                    hidden: false,
+                    engine: engine.map(|kind| kind.name().to_string()),
+                    gateway: false,
+                    group: None,
+                    project: None,
+                    agent: None,
+                    agent_session: None,
+                    tool_provider: None,
+                    forked_from: None,
+                    worktree: None,
+                    parent: None,
+                }
+            }
+            (None, None) => return Err(format!("unknown session {id}")),
+        };
+        let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
+        let dirs = crate::projects::extra_dirs(
+            self,
+            &record.cwd,
+            &crate::projects::of_record(self, &record),
+        );
+        let mut gateway = false;
+        let mut tool_provider = None;
+        let agent = record.agent.clone();
+        let (ops, generation) = match kind {
+            None => {
+                let (_, ops, generation) = session::spawn(
+                    Arc::clone(self),
+                    record.cwd.clone(),
+                    Some(id.to_string()),
+                    dirs,
+                )?;
+                (ops, generation)
+            }
+            Some(kind) => {
+                // Where the CLI saves its conversations (a program of the
+                // user's may set that itself).
+                let claude_config = (kind == engines::Kind::Claude)
+                    .then(|| engines::claude::config_with(&options, &record.cwd, id));
+                // A conversation with no turn yet was never saved: start it
+                // again under the same id instead of resuming it.
+                // Codex resumes through its protocol, which also sends the
+                // history back.
+                let saved = match kind {
+                    engines::Kind::Claude => claude_config
+                        .as_deref()
+                        .is_some_and(|config| engines::claude::is_saved(config, &record.cwd, id)),
+                    engines::Kind::Codex => true,
+                    engines::Kind::Acp => false,
+                };
+                let transcript = claude_config
+                    .as_deref()
+                    .map(|config| {
+                        engines::claude::transcript(config, &record.cwd, id, self.uploads.dir())
+                    })
+                    .unwrap_or_default();
+                // A client that does not say (a phone) keeps how it last ran,
+                // on the provider it last ran on off the gateway (recorded
+                // from the first; one recorded before is the tool's own).
+                let mut options = engines::Options {
+                    resume: saved.then(|| id.to_string()),
+                    dirs,
+                    claude_config,
+                    gateway: Some(options.gateway.unwrap_or(record.gateway)),
+                    tool_provider: options.tool_provider.or_else(|| {
+                        record
+                            .tool_provider
+                            .clone()
+                            .or_else(|| (!record.gateway).then(String::new))
+                    }),
+                    ..options
+                };
+                // A Claude fork closed before its first turn was never
+                // saved: fork it again rather than start it empty.
+                if let (engines::Kind::Claude, false, Some(source)) =
+                    (kind, saved, &record.forked_from)
+                {
+                    options.fork_from = source["session"].as_str().map(str::to_string);
+                    options.resume_at = source["at"].as_str().map(str::to_string);
+                }
+                engines::pin_tool_provider(&self.store, kind, &mut options);
+                tool_provider = options.tool_provider.clone();
+                // An ACP agent names its conversation itself: the session
+                // keeps its id and reopens the agent's (a built-in agent
+                // from its record, whatever the client names; a registered
+                // one only from the desktop, which knows its command).
+                let options = match kind {
+                    engines::Kind::Acp => {
+                        if agent.is_none() && options.command.is_none() {
+                            return Err("this agent's session can only be reopened on the desktop"
+                                .to_string());
+                        }
+                        engines::Options {
+                            resume: record.agent_session.clone(),
+                            agent: agent.clone(),
+                            ..options
+                        }
+                    }
+                    _ => options,
+                };
+                gateway = options.gateway == Some(true);
+                // A new start keeps the recorded id; a resume opens it.
+                let fresh = (kind == engines::Kind::Acp || options.resume.is_none())
+                    .then(|| id.to_string());
+                let (_, ops, generation) = engines::spawn(
+                    Arc::clone(self),
+                    kind,
+                    fresh,
+                    record.cwd.clone(),
+                    options,
+                    transcript,
+                )?;
+                (ops, generation)
+            }
+        };
+        if record.closed {
+            self.store
+                .record_engine_session(
+                    id,
+                    &record.cwd,
+                    record.schedule.as_deref(),
+                    record.engine.as_deref(),
+                    gateway,
+                    agent.as_deref(),
+                    record.project.as_deref(),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(provider) = tool_provider.filter(|p| record.tool_provider.as_ref() != Some(p)) {
+            self.store
+                .record_session_meta(id, &json!({ "tool_provider": provider }))
+                .map_err(|error| error.to_string())?;
+        }
+        self.host(id.to_string(), ops, record.cwd, generation);
+        lock(&self.asleep).remove(id);
+        Ok(())
+    }
+
+    pub(crate) fn host(&self, id: String, ops: Sender<Value>, cwd: PathBuf, generation: u64) {
+        lock(&self.sessions).insert(
+            id,
+            Hosted {
+                ops,
+                cwd,
+                watchers: HashSet::new(),
+                generation,
+                last_active: now(),
+                held: false,
+            },
+        );
+    }
+
+    /// A number unique to one engine thread, tying it to its `Hosted` entry.
+    pub fn next_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn close_session(&self, id: &str) -> Result<(), String> {
+        let hosted = lock(&self.sessions)
+            .remove(id)
+            .ok_or_else(|| format!("session {id} is not open"))?;
+        self.shut(id, hosted)
+    }
+
+    fn shut(&self, id: &str, hosted: Hosted) -> Result<(), String> {
+        // An idle close keeps the engine's options for the next open.
+        let keep = lock(&self.close_reasons).get(id) == Some(&"idle");
+        let _ = hosted.ops.send(json!({ "op": "shutdown", "keep": keep }));
+        self.store
+            .record_session_closed(id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Something happened in a hosted session: its idle time starts again.
+    fn touch(&self, id: &str) {
+        if let Some(hosted) = lock(&self.sessions).get_mut(id) {
+            hosted.last_active = now();
+        }
+    }
+
+    /// Called by a session thread every tick: whether work outside a turn
+    /// keeps its engine open (see `Hosted::held`). Work ending counts as
+    /// activity, so the idle time runs from then.
+    pub fn set_held(&self, id: &str, held: bool) {
+        if let Some(hosted) = lock(&self.sessions).get_mut(id) {
+            if hosted.held != held {
+                hosted.held = held;
+                hosted.last_active = now();
+            }
+        }
+    }
+
+    /// Closes the engines of sessions with nothing going on: those idle for
+    /// `IDLE_CLOSE_MS`, then, while more than `MAX_LIVE_ENGINES` are open,
+    /// the least recently active ones idle for `CAP_MIN_IDLE_MS`. A session
+    /// is idle when it runs no turn, has no message waiting and holds no
+    /// work (`Hosted::held`). Clients get `session_closed` with reason
+    /// `idle`. Returns the closed sessions.
+    pub(crate) fn close_idle(&self, at: u64) -> Vec<String> {
+        let busy = lock(&self.busy).clone();
+        let claimed: HashSet<String> = lock(&self.claims)
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut closing = Vec::new();
+        {
+            // Checked and removed under one lock: an op that reaches the
+            // session first has made it active (`forward`), and one that
+            // comes after finds it closed.
+            let mut sessions = lock(&self.sessions);
+            let mut idle: Vec<(String, u64)> = sessions
+                .iter()
+                .filter(|(id, hosted)| {
+                    !hosted.held && !busy.contains(*id) && !claimed.contains(*id)
+                })
+                .map(|(id, hosted)| (id.clone(), at.saturating_sub(hosted.last_active)))
+                .collect();
+            // Longest idle first.
+            idle.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+            let mut live = sessions.len();
+            for (id, idle_for) in idle {
+                let over = live > MAX_LIVE_ENGINES && idle_for >= CAP_MIN_IDLE_MS;
+                if idle_for < IDLE_CLOSE_MS && !over {
+                    continue;
+                }
+                if let Some(hosted) = sessions.remove(&id) {
+                    live -= 1;
+                    // Before the lock goes: a message right after finds it
+                    // asleep (`wake`), never just gone.
+                    lock(&self.asleep).insert(id.clone(), engines::Options::default());
+                    closing.push((id, hosted));
+                }
+            }
+        }
+        let mut closed = Vec::new();
+        for (id, hosted) in closing {
+            lock(&self.close_reasons).insert(id.clone(), "idle");
+            if self.shut(&id, hosted).is_ok() {
+                closed.push(id);
+            }
+        }
+        closed
+    }
+
+    /// The options an engine closed for idleness ran with (sent by its
+    /// thread as it stops), for its next open.
+    pub(crate) fn keep_options(&self, id: &str, options: engines::Options) {
+        if let Some(kept) = lock(&self.asleep).get_mut(id) {
+            *kept = options;
+        }
+    }
+
+    /// Before a message goes to `session`: one closed for idleness is
+    /// opened again, as it ran, and `client` (which watched it) watches it
+    /// again. Clients that know `session_closed`'s `reason` open it
+    /// themselves first; this keeps those that do not (older apps) working.
+    pub fn wake(self: &Arc<Self>, client: u64, session: &str) -> Result<(), String> {
+        if lock(&self.sessions).contains_key(session) || !lock(&self.asleep).contains_key(session) {
+            return Ok(());
+        }
+        self.open_session(session, None)?;
+        self.set_watch(client, session, true);
+        // Clients that put it to sleep watch it again.
+        self.broadcast(&json!({ "type": "session_reopened", "session": session }));
+        Ok(())
+    }
+
+    /// Called by a session thread when its engine stops on its own (`/quit`
+    /// or a failed open), so the session no longer counts as hosted.
+    ///
+    /// `generation` is the ending thread's: when the session was closed and
+    /// reopened while that thread was still finishing, the entry now belongs
+    /// to the new engine, which must stay hosted.
+    pub fn session_ended(&self, id: &str, generation: u64) {
+        {
+            let mut sessions = lock(&self.sessions);
+            match sessions.get(id) {
+                Some(hosted) if hosted.generation == generation => {
+                    sessions.remove(id);
+                    let _ = self.store.record_session_closed(id);
+                }
+                // Reopened while this engine was stopping: the new one is
+                // live, and why the old one closed says nothing about it.
+                Some(_) => {
+                    lock(&self.close_reasons).remove(id);
+                    return;
+                }
+                None => {}
+            }
+        }
+        lock(&self.busy).remove(id);
+        lock(&self.background).remove(id);
+        lock(&self.claims).remove(id);
+        // Images waiting for an echo the closed engine will not send.
+        lock(&self.sent_images).remove(id);
+        self.usage.close(id);
+        self.usage.forget(id);
+        self.run_session_ended(id);
+        crate::subsessions::ended(self, id);
+        let mut closed = json!({ "type": "session_closed", "session": id });
+        if let Some(reason) = lock(&self.close_reasons).remove(id) {
+            closed["reason"] = json!(reason);
+        }
+        self.broadcast(&closed);
+    }
+
+    /// Sends `op` to every open JuCode session (other engines have no MCP
+    /// servers of the daemon's).
+    pub fn forward_to_jucode_sessions(&self, op: &Value) {
+        let jucode: HashSet<String> = self
+            .store
+            .sessions()
+            .into_iter()
+            .filter(|record| record.engine.is_none())
+            .map(|record| record.id)
+            .collect();
+        for (id, hosted) in lock(&self.sessions).iter() {
+            if jucode.contains(id) {
+                let _ = hosted.ops.send(op.clone());
+            }
+        }
+    }
+
+    pub fn forward(&self, session: &str, op: Value) -> Result<(), String> {
+        let mut sessions = lock(&self.sessions);
+        let hosted = sessions
+            .get_mut(session)
+            .ok_or_else(|| format!("session {session} is not open"))?;
+        hosted.last_active = now();
+        hosted
+            .ops
+            .send(op)
+            .map_err(|_| format!("session {session} has stopped"))
+    }
+
+    pub fn set_watch(&self, client: u64, session: &str, watch: bool) {
+        let mut sessions = lock(&self.sessions);
+        let Some(hosted) = sessions.get_mut(session) else {
+            return;
+        };
+        let before = !hosted.watchers.is_empty();
+        if watch {
+            hosted.last_active = now();
+            hosted.watchers.insert(client);
+        } else {
+            hosted.watchers.remove(&client);
+        }
+        let after = !hosted.watchers.is_empty();
+        if watch {
+            let _ = hosted
+                .ops
+                .send(json!({ "op": "snapshot", "client": client }));
+        }
+        if before != after {
+            let _ = hosted
+                .ops
+                .send(json!({ "op": "set_attended", "attended": after }));
+        }
+    }
+
+    /// Called by a session thread with its engine's state every tick. A
+    /// The desktop brought a newer daemon (an app update): this one exits
+    /// once no session is running, and the desktop starts the new one, which
+    /// reopens the sessions. Running turns are never cut off.
+    pub fn restart_when_idle(&self) {
+        if self.restart_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(hub) = self.me.upgrade() else {
+            return;
+        };
+        let asked = now();
+        thread::spawn(move || loop {
+            // Nothing running, and nothing held (a TUI, background work) or
+            // held too long: exiting ends everything the daemon started.
+            let held = lock(&hub.sessions).values().any(|hosted| hosted.held)
+                && now().saturating_sub(asked) < RESTART_HOLD_MS;
+            if lock(&hub.busy).is_empty() && !held {
+                hub.broadcast(&json!({ "type": "daemon_restarting" }));
+                thread::sleep(std::time::Duration::from_millis(300));
+                // As on a signal: nothing this daemon started outlives it.
+                jucode_agent_core::terminate_tool_processes();
+                std::process::exit(0);
+            }
+            thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
+
+    /// session with an unprocessed delivery stays busy.
+    pub fn set_busy(&self, session: &str, busy: bool) {
+        let busy = busy
+            || lock(&self.claims)
+                .get(session)
+                .is_some_and(|count| *count > 0);
+        let changed = if busy {
+            lock(&self.busy).insert(session.to_string())
+        } else {
+            lock(&self.busy).remove(session)
+        };
+        if changed {
+            self.touch(session);
+            // Every client follows which sessions run, watched or not (the
+            // desktop counts the replies its other workspaces finished).
+            self.broadcast(&self.sessions_json());
+        }
+    }
+
+    /// A session is running a turn or has messages waiting.
+    pub fn is_busy(&self, session: &str) -> bool {
+        lock(&self.busy).contains(session)
+    }
+
+    /// Called by a session thread every tick: whether background work the
+    /// turn left going runs (`any`), and whether some of it comes back to
+    /// the conversation (`awaited`). Clients follow `any` in the session
+    /// list; a scheduled run waits on `awaited`.
+    pub fn set_background(&self, session: &str, any: bool, awaited: bool) {
+        let before = if any {
+            lock(&self.background).insert(session.to_string(), awaited)
+        } else {
+            lock(&self.background).remove(session)
+        };
+        if before != any.then_some(awaited) {
+            if before.is_none() || !any {
+                self.broadcast(&self.sessions_json());
+            }
+            self.run_activity(session);
+        }
+    }
+
+    /// A session has background work going (`set_background`).
+    pub fn is_background(&self, session: &str) -> bool {
+        lock(&self.background).contains_key(session)
+    }
+
+    /// A session has background work going that comes back to it.
+    pub fn is_awaited(&self, session: &str) -> bool {
+        lock(&self.background).get(session) == Some(&true)
+    }
+
+    /// This hub, for a thread to hold.
+    pub(crate) fn arc(&self) -> Option<Arc<Hub>> {
+        self.me.upgrade()
+    }
+
+    /// A session's engine is open here.
+    pub(crate) fn is_hosted(&self, session: &str) -> bool {
+        lock(&self.sessions).contains_key(session)
+    }
+
+    /// Sends `content` to a session as the user's next message; it is busy
+    /// until the engine has read it (see `claims`).
+    pub fn send_to_session(&self, session: &str, content: &str) -> Result<(), String> {
+        *lock(&self.claims).entry(session.to_string()).or_default() += 1;
+        lock(&self.busy).insert(session.to_string());
+        self.forward(
+            session,
+            json!({ "op": "user_message", "content": content, "claimed": true }),
+        )
+        .inspect_err(|_| self.release_claim(session))
+    }
+
+    /// This hub, for a thread that outlives the caller's borrow.
+    pub fn handle(&self) -> Option<Arc<Hub>> {
+        self.me.upgrade()
+    }
+
+    /// The session thread has handed a delivered message to its engine.
+    pub fn release_claim(&self, session: &str) {
+        let mut claims = lock(&self.claims);
+        if let Some(count) = claims.get_mut(session) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                claims.remove(session);
+            }
+        }
+    }
+
+    /// A fresh id with a readable prefix (`m-…`, `t-…`).
+    pub fn new_id(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}-{}-{}",
+            now(),
+            self.next_id.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
+    /// One scheduler pass, every second.
+    pub fn tick(self: &Arc<Self>) {
+        self.fire_due_schedules();
+        self.sweep();
+        self.scan_dev_servers();
+    }
+
+    /// Once a minute: scheduled runs past their time are stopped, and idle
+    /// sessions have their engines closed.
+    fn sweep(&self) {
+        let at = now();
+        let last = self.last_sweep.load(Ordering::Relaxed);
+        if at.saturating_sub(last) < SWEEP_EVERY_MS
+            || self
+                .last_sweep
+                .compare_exchange(last, at, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        self.time_out_runs(at);
+        self.settle_runs();
+        if let Some(hub) = self.me.upgrade() {
+            hub.check_budgets();
+        }
+        self.close_idle(at);
+    }
+
+    /// Looks for dev servers when a scan is due, off the scheduler thread
+    /// (listing sockets takes a moment), and tells the clients of changes.
+    fn scan_dev_servers(self: &Arc<Self>) {
+        if !self.dev_servers.due(now()) {
+            return;
+        }
+        let sessions: Vec<crate::devservers::SessionDir> = lock(&self.sessions)
+            .iter()
+            .map(|(id, hosted)| crate::devservers::SessionDir {
+                id: id.clone(),
+                cwd: hosted.cwd.clone(),
+                last_active: hosted.last_active,
+            })
+            .collect();
+        let hub = Arc::clone(self);
+        thread::spawn(move || {
+            if let Some(servers) = hub.dev_servers.scan(&sessions) {
+                hub.broadcast(&crate::devservers::servers_json(&servers));
+            }
+        });
+    }
+
+    /// Open actions, and the ones closed lately (see `questions_json`).
+    pub fn actions_json(&self) -> Value {
+        let list: Vec<Value> = self
+            .store
+            .open_actions()
+            .iter()
+            .map(|action| action.to_json())
+            .collect();
+        let closed: Vec<Value> = self
+            .store
+            .closed_actions(now().saturating_sub(CLOSED_KEEP_MS))
+            .iter()
+            .map(|(action, closure)| with_closure(action.to_json(), closure))
+            .collect();
+        json!({ "type": "actions", "actions": list, "closed": closed })
+    }
+
+    /// Closes an open action without deciding it.
+    pub fn close_action(&self, id: &str, by: &str, reason: &str) -> Result<(), String> {
+        if !self
+            .store
+            .close_action(id, by, reason.trim())
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!("{id} is not open"));
+        }
+        self.broadcast(&self.actions_json());
+        Ok(())
+    }
+
+    /// Reopens a closed action; its session comes back out of the archive.
+    pub fn reopen_action(&self, id: &str) -> Result<(), String> {
+        let session = self
+            .store
+            .closed_actions(0)
+            .into_iter()
+            .find(|(action, _)| action.id == id)
+            .map(|(action, _)| action.session_id);
+        if !self
+            .store
+            .reopen_action(id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!("{id} is not closed"));
+        }
+        self.broadcast(&self.actions_json());
+        let archived = self
+            .store
+            .sessions()
+            .into_iter()
+            .any(|record| Some(&record.id) == session.as_ref() && record.archived);
+        if let (true, Some(session)) = (archived, session) {
+            if let Ok(true) = self
+                .store
+                .record_session_meta(&session, &json!({ "archived": false }))
+            {
+                self.broadcast(&self.sessions_json());
+            }
+        }
+        Ok(())
+    }
+
+    /// Every recorded session with whether it is hosted right now.
+    /// Every event a session publishes: its title follows the conversation
+    /// (see `titles`).
+    pub fn observe(&self, session: &str, event: &Value) {
+        self.dev_servers.observe(event, now());
+        self.usage.observe(session, event, || {
+            let record = self
+                .store
+                .sessions()
+                .into_iter()
+                .find(|record| record.id == session)?;
+            Some(SessionInfo {
+                engine: record.engine.unwrap_or_else(|| "jucode".to_string()),
+                gateway: record.gateway,
+                cwd: record.cwd.to_string_lossy().into_owned(),
+            })
+        });
+        if event["type"] == "user_message" {
+            self.note_user_message(session, event["content"].as_str().unwrap_or_default());
+        }
+        // A name the session has in Claude Code (given there, or the one we
+        // gave it) is the user's.
+        if event["type"] == "session_title" {
+            self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
+        }
+        if event["type"] == "session_title_generated" {
+            if let Some(title) = titles::clean(event["title"].as_str().unwrap_or_default()) {
+                self.set_auto_title(session, &title);
+            }
+        }
+        // `over`: a turn ended.
+        let (due, started, over, failed) = {
+            let mut turns = lock(&self.turns);
+            let turns = turns.entry(session.to_string()).or_default();
+            let running = turns.running();
+            let due = turns.observe(event);
+            (
+                due,
+                !running && turns.running(),
+                running && !turns.running(),
+                turns.take_failed(),
+            )
+        };
+        // Every client follows which sessions failed, watched or not (the
+        // desktop marks them on its other workspaces).
+        if started || over {
+            let changed = {
+                let mut set = lock(&self.failed);
+                if over && failed.is_some() {
+                    set.insert(session.to_string())
+                } else {
+                    set.remove(session)
+                }
+            };
+            if changed {
+                self.broadcast(&self.sessions_json());
+            }
+        }
+        if due {
+            self.retitle(session);
+        }
+        self.observe_run(session, event, over, failed.as_deref());
+        crate::subsessions::observe(self, session, event, over, failed.as_deref());
+    }
+
+    /// Asks the title model for a title in the background, unless a client
+    /// named the session by hand. Only JuCode's own sessions go to the title
+    /// model; Claude Code names its own, and other engines (Codex, ACP)
+    /// keep the title from their first message, so none of their
+    /// conversation reaches JuCode's provider.
+    fn retitle(&self, session: &str) {
+        let Some(record) = self.auto_titled(session) else {
+            return;
+        };
+        if !matches!(
+            engines::Kind::parse(record.engine.as_deref().unwrap_or_default()),
+            Ok(None | Some(engines::Kind::Claude))
+        ) {
+            return;
+        }
+        // Claude Code names it; the answer comes back as an event.
+        if record.engine.as_deref() == Some("claude") {
+            let Some(description) = lock(&self.turns).get(session).map(Turns::description) else {
+                return;
+            };
+            if let Err(error) = self.forward(
+                session,
+                json!({ "op": "generate_title", "description": description }),
+            ) {
+                jucode_agent_core::log_warn!("daemon", "conversation title failed", error = error);
+            }
+            return;
+        }
+        let Some(hub) = self.me.upgrade() else {
+            return;
+        };
+        if !lock(&self.titling).insert(session.to_string()) {
+            return;
+        }
+        let project = record
+            .cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(prompt) = lock(&self.turns)
+            .get(session)
+            .map(|turns| turns.prompt(&project, record.title.as_deref()))
+        else {
+            lock(&self.titling).remove(session);
+            return;
+        };
+        let id = session.to_string();
+        thread::spawn(move || {
+            let reply = jucode_agent_core::title_completion(titles::SYSTEM, &prompt);
+            lock(&hub.titling).remove(&id);
+            let title = match reply {
+                Ok(reply) => titles::clean(&reply),
+                Err(error) => {
+                    jucode_agent_core::log_warn!(
+                        "daemon",
+                        "conversation title failed",
+                        error = error
+                    );
+                    None
+                }
+            };
+            if let Some(title) = title {
+                hub.set_auto_title(&id, &title);
+            }
+        });
+    }
+
+    /// A title the daemon came up with, unless the session was renamed by
+    /// hand meanwhile or already has it.
+    fn set_auto_title(&self, session: &str, title: &str) {
+        let Some(record) = self.auto_titled(session) else {
+            return;
+        };
+        if record.title.as_deref() != Some(title)
+            && self
+                .store
+                .record_session_meta(session, &json!({ "title": title, "title_auto": true }))
+                .is_ok()
+        {
+            self.broadcast(&self.sessions_json());
+        }
+    }
+
+    fn adopt_engine_title(&self, session: &str, title: &str) {
+        let title = title.trim();
+        let current = self
+            .store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == session)
+            .and_then(|record| record.title);
+        if title.is_empty() || current.as_deref() == Some(title) {
+            return;
+        }
+        if let Ok(true) = self
+            .store
+            .record_session_meta(session, &json!({ "title": title }))
+        {
+            self.broadcast(&self.sessions_json());
+        }
+    }
+
+    /// The session's record when its title is ours to write (none yet, or
+    /// one the daemon wrote).
+    fn auto_titled(&self, session: &str) -> Option<SessionRecord> {
+        self.store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == session)
+            .filter(|record| record.title.is_none() || record.title_auto)
+    }
+
+    /// A `user_message` op with images: its echo will show them.
+    pub fn note_sent_images(&self, session: &str, op: &Value) {
+        if op["op"] == "user_message" && op["images"].as_array().is_some_and(|i| !i.is_empty()) {
+            let text = op["content"].as_str().unwrap_or_default().to_string();
+            lock(&self.sent_images)
+                .entry(session.to_string())
+                .or_default()
+                .push((text, op["images"].clone()));
+        }
+    }
+
+    /// The images of the message a `user_message` event echoes, so every
+    /// client (the remote page too) shows them.
+    pub fn attach_sent_images(&self, session: &str, event: &mut Value) {
+        if event["type"] != "user_message" || !event["images"].is_null() {
+            return;
+        }
+        let text = event["content"].as_str().unwrap_or_default();
+        let mut sent = lock(&self.sent_images);
+        let Some(list) = sent.get_mut(session) else {
+            return;
+        };
+        if let Some(at) = list.iter().position(|(t, _)| t == text) {
+            event["images"] = list.remove(at).1;
+        }
+    }
+
+    /// A session accepted a user message: a new session is titled after
+    /// its first one (first line, 40 characters); clients show the daemon's titles.
+    pub fn note_user_message(&self, session: &str, content: &str) {
+        if !lock(&self.untitled).remove(session) {
+            return;
+        }
+        let Some(title) = title_from(content) else {
+            return;
+        };
+        let untouched = self
+            .store
+            .sessions()
+            .iter()
+            .any(|record| record.id == session && record.title.is_none());
+        if untouched
+            && self
+                .store
+                .record_session_meta(session, &json!({ "title": title, "title_auto": true }))
+                .is_ok()
+        {
+            self.broadcast(&self.sessions_json());
+        }
+    }
+
+    pub fn sessions_json(&self) -> Value {
+        let records = self.store.sessions();
+        let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
+        let projects = crate::projects::projects(self);
+        let sessions = lock(&self.sessions);
+        let busy = lock(&self.busy);
+        let background = lock(&self.background);
+        let failed = lock(&self.failed);
+        let list: Vec<Value> = records
+            .into_iter()
+            .filter(|record| !record.hidden)
+            .map(|record| {
+                let hosted = sessions.get(&record.id);
+                let cwd = hosted.map_or_else(|| record.cwd.clone(), |h| h.cwd.clone());
+                let summary = saved.get(&record.id);
+                json!({
+                    "session": record.id,
+                    "chat": jucode_agent_core::chat::is_chat_dir(&cwd),
+                    "cwd": cwd.display().to_string(),
+                    "created_at": record.created_at,
+                    "updated_at": summary.map_or(record.created_at, |s| s.updated_at * 1000),
+                    "title": shown_title(&record, summary.map(|s| s.label.as_str())),
+                    "archived": record.archived,
+                    "group": record.group,
+                    "project": Some(crate::projects::member(&projects, &record)).filter(|p| !p.is_empty()),
+                    "gateway": record.gateway,
+                    "engine": record.engine.as_deref().unwrap_or("jucode"),
+                    "agent": record.agent,
+                    "schedule": record.schedule,
+                    "forked_from": record.forked_from,
+                    "worktree": record.worktree,
+                    "parent": record.parent,
+                    "open": hosted.is_some(),
+                    "busy": busy.contains(&record.id),
+                    "background": background.contains_key(&record.id),
+                    "failed": failed.contains(&record.id),
+                    "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
+                })
+            })
+            .collect();
+        json!({ "type": "sessions", "sessions": list })
+    }
+
+    /// Every session saved in `cwd`, newest first, whoever ran it (the
+    /// daemon, the TUI or `jucode serve`), with the daemon's title and
+    /// archive state for the ones it knows.
+    pub fn session_history(&self, cwd: &std::path::Path) -> Result<Value, String> {
+        let saved = jucode_agent_core::saved_sessions(cwd).map_err(|error| error.to_string())?;
+        let records: HashMap<String, SessionRecord> = self
+            .store
+            .sessions()
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        let sessions = lock(&self.sessions);
+        let item = |id: String, label: String, updated_at: u64, entries: Value, engine: &str| {
+            let record = records.get(&id);
+            json!({
+                "title": match record {
+                    Some(record) => shown_title(record, Some(&label)),
+                    None => title_from(&label),
+                },
+                "updated_at": updated_at,
+                "entries": entries,
+                "archived": record.is_some_and(|r| r.archived),
+                "schedule": record.and_then(|r| r.schedule.clone()),
+                "open": sessions.contains_key(&id),
+                "engine": engine,
+                "session": id,
+            })
+        };
+        let mut list: Vec<Value> = saved
+            .into_iter()
+            .map(|s| {
+                item(
+                    s.id,
+                    s.label,
+                    s.updated_at * 1000,
+                    json!(s.entries),
+                    "jucode",
+                )
+            })
+            .chain(
+                engines::claude::saved(&engines::claude::config_dir(), cwd)
+                    .into_iter()
+                    .map(|(id, title, updated_at)| {
+                        item(id, title, updated_at, Value::Null, "claude")
+                    }),
+            )
+            .chain(
+                engines::codex::saved(cwd)
+                    .into_iter()
+                    .map(|(id, title, updated_at)| {
+                        item(id, title, updated_at, Value::Null, "codex")
+                    }),
+            )
+            .collect();
+        list.retain(|item| {
+            !records
+                .get(item["session"].as_str().unwrap_or_default())
+                .is_some_and(|record| record.hidden)
+        });
+        list.sort_by_key(|item| std::cmp::Reverse(item["updated_at"].as_u64().unwrap_or(0)));
+        Ok(json!({ "type": "session_history", "cwd": cwd, "sessions": list }))
+    }
+}
+
+/// Saved-session summaries of the given directories, by session id.
+fn saved_by_id<'a>(
+    dirs: impl Iterator<Item = &'a std::path::Path>,
+) -> HashMap<String, jucode_agent_core::SessionSummary> {
+    let dirs: HashSet<&std::path::Path> = dirs.collect();
+    dirs.into_iter()
+        .flat_map(|dir| jucode_agent_core::saved_sessions(dir).unwrap_or_default())
+        .map(|summary| (summary.id.clone(), summary))
+        .collect()
+}
+
+/// A closed item's JSON with who closed it, why and when.
+fn with_closure(mut item: Value, closure: &Closure) -> Value {
+    item["closed_by"] = json!(closure.by);
+    item["closed_reason"] = json!(closure.reason);
+    item["closed_at"] = json!(closure.at);
+    item
+}
+
+/// A session's title as clients see it: its own, else its first prompt; never
+/// an id or a delivery header (which older daemons wrote as the title).
+fn shown_title(record: &SessionRecord, label: Option<&str>) -> Option<String> {
+    record
+        .title
+        .clone()
+        .filter(|title| {
+            !(record.title_auto
+                && DELIVERY_HEADERS
+                    .iter()
+                    .any(|header| title.starts_with(header)))
+        })
+        .or_else(|| label.and_then(title_from))
+}
+
+/// How messages the long-lived agents (gone since 2026-10) received started:
+/// a line naming where they came from. Their archived sessions still have
+/// them, and older daemons wrote them as titles.
+const DELIVERY_HEADERS: [&str; 5] = [
+    "[message from ",
+    "[timer ",
+    "[scheduled task ",
+    "[answer to your question ",
+    "[task ",
+];
+
+/// `text` without a delivery header line: what was actually asked.
+pub(crate) fn without_delivery_header(text: &str) -> &str {
+    let text = text.trim_start();
+    if DELIVERY_HEADERS
+        .iter()
+        .any(|header| text.starts_with(header))
+    {
+        return text.split_once('\n').map_or("", |(_, rest)| rest);
+    }
+    text
+}
+
+/// A title from what was asked: its first line, at most 40 characters.
+pub(crate) fn title_from(text: &str) -> Option<String> {
+    let title: String = without_delivery_header(text)
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    let title = title
+        .trim()
+        .trim_end_matches([':', '：'])
+        .trim()
+        .to_string();
+    (!title.is_empty()).then_some(title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::now;
+    use std::{fs, sync::mpsc};
+
+    #[test]
+    fn titles_come_from_what_was_asked_never_a_delivery_header() {
+        let scheduled = "[scheduled task sch-1 · m-1]\n定时任务「每日巡检」：\n检查部署";
+        assert_eq!(
+            title_from(scheduled).as_deref(),
+            Some("定时任务「每日巡检」")
+        );
+        assert_eq!(
+            without_delivery_header(scheduled),
+            "定时任务「每日巡检」：\n检查部署"
+        );
+        assert_eq!(
+            title_from("  修复登录跳转\n细节").as_deref(),
+            Some("修复登录跳转")
+        );
+        assert_eq!(title_from("[timer t-1 fired · m-2]\n"), None);
+
+        // An older daemon's header title gives way to the first prompt.
+        let record = SessionRecord {
+            id: "s1".into(),
+            cwd: "/tmp".into(),
+            schedule: None,
+            created_at: 0,
+            closed: false,
+            title: Some("[scheduled task sch-1 · m-".into()),
+            title_auto: true,
+            archived: false,
+            hidden: false,
+            engine: None,
+            gateway: false,
+            group: None,
+            project: None,
+            agent: None,
+            agent_session: None,
+            tool_provider: None,
+            forked_from: None,
+            worktree: None,
+            parent: None,
+        };
+        assert_eq!(
+            shown_title(&record, Some(scheduled)).as_deref(),
+            Some("定时任务「每日巡检」")
+        );
+        assert_eq!(shown_title(&record, Some("")), None);
+        let named = SessionRecord {
+            title: Some("我的标题".into()),
+            title_auto: false,
+            ..record
+        };
+        assert_eq!(shown_title(&named, None).as_deref(), Some("我的标题"));
+    }
+
+    #[test]
+    fn other_engines_sessions_never_reach_the_title_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-hub-titles-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(Store::open(dir.join("daemon")).unwrap(), "test", None);
+        for (id, engine) in [("codex-1", "codex"), ("acp-1", "acp")] {
+            hub.store
+                .record_engine_session(id, &dir, None, Some(engine), false, None, None)
+                .unwrap();
+            let mut turns = Turns::default();
+            turns.observe(&json!({ "type": "user_message", "content": "fix the login" }));
+            lock(&hub.turns).insert(id.to_string(), turns);
+            hub.retitle(id);
+            assert!(!lock(&hub.titling).contains(id), "{engine}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_finishing_engine_leaves_its_successor_hosted() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-hub-generation-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(Store::open(dir.join("daemon")).unwrap(), "test", None);
+        let (old_ops, _old_rx) = mpsc::channel();
+        let old = hub.next_generation();
+        hub.host("s1".to_string(), old_ops, dir.clone(), old);
+        // Closed and reopened while the old engine thread is still finishing.
+        lock(&hub.sessions).remove("s1");
+        let (new_ops, _new_rx) = mpsc::channel();
+        let new = hub.next_generation();
+        hub.host("s1".to_string(), new_ops, dir.clone(), new);
+
+        hub.session_ended("s1", old);
+        assert!(lock(&hub.sessions).contains_key("s1"));
+        hub.session_ended("s1", new);
+        assert!(!lock(&hub.sessions).contains_key("s1"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn idle_hub(label: &str) -> (Arc<Hub>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-idle-{label}-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(Store::open(dir.join("daemon")).unwrap(), "test", None);
+        (hub, dir)
+    }
+
+    /// Hosts `id` as last active `idle_ms` before `at`; the receiver sees its ops.
+    fn host_idle(hub: &Hub, id: &str, at: u64, idle_ms: u64) -> mpsc::Receiver<Value> {
+        let (ops, rx) = mpsc::channel();
+        hub.host(id.into(), ops, "/tmp".into(), hub.next_generation());
+        lock(&hub.sessions).get_mut(id).unwrap().last_active = at - idle_ms;
+        rx
+    }
+
+    #[test]
+    fn idle_sessions_close_after_the_idle_time_and_say_why() {
+        let (hub, dir) = idle_hub("time");
+        let at = now();
+        let old = host_idle(&hub, "old", at, IDLE_CLOSE_MS);
+        let _recent = host_idle(&hub, "recent", at, IDLE_CLOSE_MS - 1);
+        let (outbox, frames) = Hub::outbox();
+        hub.add_client(outbox, None);
+
+        assert_eq!(hub.close_idle(at), ["old"]);
+        assert_eq!(old.try_recv().unwrap()["op"], "shutdown");
+        assert!(lock(&hub.sessions).contains_key("recent"));
+
+        lock(&hub.turns).insert("old".into(), Turns::default());
+        // The engine thread ends: clients learn it was closed for idleness.
+        let generation = 0;
+        hub.session_ended("old", generation);
+        assert!(
+            lock(&hub.turns).contains_key("old"),
+            "titles and last replies outlive the engine"
+        );
+        let closed: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        assert_eq!(closed["type"], "session_closed");
+        assert_eq!(closed["reason"], "idle");
+        assert!(lock(&hub.close_reasons).is_empty());
+        assert!(
+            lock(&hub.asleep).contains_key("old"),
+            "a message may open it again"
+        );
+        // An open that fails leaves it asleep.
+        assert!(hub.open_session("old", None).is_err());
+        assert!(lock(&hub.asleep).contains_key("old"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_client_learns_when_a_session_starts_and_stops_running() {
+        let (hub, dir) = idle_hub("busy-list");
+        hub.store
+            .record_session("s", std::path::Path::new("/tmp"))
+            .unwrap();
+        let _s = host_idle(&hub, "s", now(), 0);
+        let (outbox, frames) = Hub::outbox();
+        hub.add_client(outbox, None);
+        let running = |frames: &mpsc::Receiver<String>| {
+            let list: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+            assert_eq!(list["type"], "sessions");
+            list["sessions"][0]["busy"].as_bool().unwrap()
+        };
+
+        hub.set_busy("s", true);
+        assert!(running(&frames));
+        hub.set_busy("s", true);
+        assert!(frames.try_recv().is_err(), "only a change is sent");
+        hub.set_busy("s", false);
+        assert!(!running(&frames));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_client_learns_when_a_turn_fails_until_the_next_starts() {
+        let (hub, dir) = idle_hub("failed-list");
+        hub.store
+            .record_session("s", std::path::Path::new("/tmp"))
+            .unwrap();
+        let (outbox, frames) = Hub::outbox();
+        hub.add_client(outbox, None);
+        let failed = |frames: &mpsc::Receiver<String>| {
+            let list: Value = frames
+                .try_iter()
+                .map(|f| serde_json::from_str::<Value>(&f).unwrap())
+                .filter(|f| f["type"] == "sessions")
+                .last()
+                .unwrap();
+            list["sessions"][0]["failed"].as_bool().unwrap()
+        };
+        let ready = json!({ "type": "status", "message": "ready" });
+
+        hub.observe("s", &json!({ "type": "user_message", "content": "go" }));
+        hub.observe("s", &json!({ "type": "error", "message": "rate limited" }));
+        hub.observe("s", &ready);
+        assert!(failed(&frames));
+        hub.observe("s", &json!({ "type": "user_message", "content": "again" }));
+        assert!(!failed(&frames));
+        hub.observe("s", &ready);
+        assert!(
+            frames.try_iter().all(|f| !f.contains("\"sessions\"")),
+            "a good turn changes nothing"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reopened_session_does_not_inherit_the_idle_reason() {
+        let (hub, dir) = idle_hub("reopen");
+        let at = now();
+        let _old = host_idle(&hub, "s", at, IDLE_CLOSE_MS);
+        let old_generation = lock(&hub.sessions)["s"].generation;
+        hub.close_idle(at);
+        // Opened again before the old engine thread finished.
+        let _new = host_idle(&hub, "s", at, 0);
+        hub.session_ended("s", old_generation);
+        assert!(lock(&hub.sessions).contains_key("s"));
+        assert!(lock(&hub.close_reasons).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn work_in_progress_keeps_a_session_open() {
+        let (hub, dir) = idle_hub("work");
+        let at = now();
+        let long = IDLE_CLOSE_MS * 4;
+        let _busy = host_idle(&hub, "busy", at, long);
+        let _claimed = host_idle(&hub, "claimed", at, long);
+        let _held = host_idle(&hub, "held", at, long);
+        lock(&hub.busy).insert("busy".into());
+        lock(&hub.claims).insert("claimed".into(), 1);
+        lock(&hub.sessions).get_mut("held").unwrap().held = true;
+
+        assert!(hub.close_idle(at).is_empty());
+        assert_eq!(lock(&hub.sessions).len(), 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn past_the_cap_the_least_recently_active_idle_sessions_close() {
+        let (hub, dir) = idle_hub("cap");
+        let at = now();
+        let mut rx = Vec::new();
+        // Over the cap by three: two idle long enough, the rest just used.
+        for i in 0..MAX_LIVE_ENGINES + 3 {
+            let idle = match i {
+                0 => CAP_MIN_IDLE_MS * 3,
+                1 => CAP_MIN_IDLE_MS * 2,
+                _ => CAP_MIN_IDLE_MS - 1,
+            };
+            rx.push(host_idle(&hub, &format!("s{i}"), at, idle));
+        }
+        let mut closed = hub.close_idle(at);
+        closed.sort();
+        assert_eq!(
+            closed,
+            ["s0", "s1"],
+            "only sessions idle past CAP_MIN_IDLE_MS"
+        );
+        assert_eq!(lock(&hub.sessions).len(), MAX_LIVE_ENGINES + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_op_or_a_turn_restarts_the_idle_time() {
+        let (hub, dir) = idle_hub("touch");
+        let at = now();
+        let _sent = host_idle(&hub, "sent", at, IDLE_CLOSE_MS * 2);
+        let _turned = host_idle(&hub, "turned", at, IDLE_CLOSE_MS * 2);
+        let _released = host_idle(&hub, "released", at, IDLE_CLOSE_MS * 2);
+        hub.forward("sent", json!({ "op": "user_message", "content": "hi" }))
+            .unwrap();
+        hub.set_busy("turned", true);
+        hub.set_busy("turned", false);
+        lock(&hub.sessions).get_mut("released").unwrap().held = true;
+        hub.set_held("released", false);
+
+        assert!(hub.close_idle(now()).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_client_that_falls_too_far_behind_is_dropped() {
+        let (hub, dir) = idle_hub("outbox");
+        let (outbox, _frames) = Hub::outbox();
+        let client = hub.add_client(outbox, None);
+        for _ in 0..OUTBOX_LIMIT {
+            hub.broadcast(&json!({ "type": "x" }));
+        }
+        assert!(lock(&hub.clients).contains_key(&client));
+        hub.broadcast(&json!({ "type": "x" }));
+        assert!(!lock(&hub.clients).contains_key(&client));
+        let _ = fs::remove_dir_all(dir);
+    }
+}

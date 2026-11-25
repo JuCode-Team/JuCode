@@ -1,0 +1,5760 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    fs::File,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
+const MAX_IMAGE_READ_BYTES: u64 = 1024 * 1024;
+const LARGE_TEXT_READ_SOFT_BYTES: u64 = 256 * 1024;
+const LARGE_RIPGREP_OUTPUT_SOFT_LINES: usize = 200;
+const LARGE_RIPGREP_OUTPUT_SOFT_BYTES: usize = 128 * 1024;
+const COMMAND_OUTPUT_MAX_LINES: usize = 3_000;
+const COMMAND_OUTPUT_MAX_BYTES: usize = 128 * 1024;
+const COMMAND_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+const HASHLINE_ALPHABET: &[u8; 16] = b"ZPMQVRWSNKTXJBYH";
+const READ_MODEL_CONTENT_OMIT_THRESHOLD: usize = 1024;
+const READ_MODEL_HASHLINES_LIMIT: usize = 8 * 1024;
+const DIFF_MODEL_OUTPUT_INLINE_LIMIT: usize = 8 * 1024;
+const MODEL_OUTPUT_INLINE_LIMIT: usize = 16 * 1024;
+const MODEL_OUTPUT_FIELD_LIMIT: usize = 4 * 1024;
+
+pub struct ToolExecutionResult {
+    pub output: String,
+    pub model_output: String,
+    pub is_error: bool,
+}
+
+pub enum ToolExecutionEvent {
+    Update(String),
+}
+
+pub fn definitions() -> Vec<Value> {
+    with_function_tool_defaults([
+        json!({
+            "type": "function",
+            "name": "read",
+            "description": "Read a text file, image, or binary file metadata. Text supports 1-indexed offset and line limit. Prefer offset/limit for large files; broad reads return a soft warning instead of being blocked. Safe to call in parallel with other read-only tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative or absolute file path." },
+                    "offset": { "type": "number", "description": "1-indexed line to start reading from. Defaults to 1." },
+                    "limit": { "type": "number", "description": "Optional maximum lines to read. Defaults to no line limit." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "str_replace",
+            "description": "Apply one or more exact targeted text replacements to a UTF-8 file. The file must be read first, and each oldText must match exactly once in the current file. Combine multiple edits for the same file in one call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative or absolute file path." },
+                    "edits": {
+                        "type": "array",
+                        "description": "Targeted replacements matched against the original file.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "oldText": { "type": "string", "description": "Exact unique text to replace." },
+                                "newText": { "type": "string", "description": "Replacement text." }
+                            },
+                            "required": ["oldText", "newText"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["path", "edits"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "hashline_edit",
+            "description": "Patch one UTF-8 file using LINE#HASH anchors from the most recent read output. Supports replace, append, and prepend line edits. Prefer this after read() when exact oldText is awkward.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative or absolute file path." },
+                    "edits": {
+                        "type": "array",
+                        "description": "Hashline edits over this file. Anchors are copied from read().hashlines.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": { "type": "string", "enum": ["replace", "append", "prepend"], "description": "replace a line/range, append after pos, or prepend before pos." },
+                                "pos": { "type": "string", "description": "LINE#HASH anchor. Required for replace; optional for append/prepend." },
+                                "end": { "type": "string", "description": "Inclusive LINE#HASH range end for replace." },
+                                "lines": {
+                                    "description": "Literal replacement/insertion lines. No LINE#HASH prefixes and no diff +/- prefixes.",
+                                    "oneOf": [
+                                        { "type": "array", "items": { "type": "string" } },
+                                        { "type": "string" }
+                                    ]
+                                }
+                            },
+                            "required": ["op", "lines"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["path", "edits"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "write",
+            "description": "Write full UTF-8 file content. Creates new files without a prior read; existing files must be read first before overwriting. Prefer for greenfield files or full-file rewrites.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative or absolute file path." },
+                    "content": { "type": "string", "description": "Full file content to write." }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "apply_patch",
+            "description": "Apply a unified git diff patch to the current workspace. Use this for multi-file edits when exact replacement tools are awkward. If a patch fails, inspect the error and retry with a corrected minimal patch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string", "description": "Unified diff text accepted by git apply." }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "bash",
+            "description": "Run a shell command in the workspace. Returns exit code, stdout, stderr, timeout state, truncation state, or a session_id for long-running commands. Prefer commands that narrow output with paths, filters, or limits. Group dependent shell checks into one command when that reduces round trips; issue independent bash/read/ripgrep calls in the same assistant response when possible.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command to run." },
+                    "workdir": { "type": "string", "description": "Working directory for the command. Relative paths are resolved from the current workspace. Defaults to current workspace." },
+                    "timeout": { "type": "number", "description": "Timeout in seconds. Defaults to 60." },
+                    "yield_time_ms": { "type": "number", "description": "Return early after this many milliseconds if the command is still running. Use for dev servers, watchers, and long tasks." }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "exec_command",
+            "description": "Codex-compatible shell execution alias. Runs a shell command and returns output or a session_id for ongoing interaction. Use it like bash; prefer this name when following Codex-style command plans. Prefer specific paths, globs, head/tail, or tool-native limits for large outputs; broad output returns a soft warning. Independent exec_command calls may be emitted together in one assistant response.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": { "type": "string", "description": "Shell command to execute." },
+                    "workdir": { "type": "string", "description": "Working directory for the command. Relative paths are resolved from the current workspace. Defaults to current workspace." },
+                    "timeout": { "type": "number", "description": "Timeout in seconds. Defaults to 60." },
+                    "yield_time_ms": { "type": "number", "description": "Return early after this many milliseconds if the command is still running." },
+                    "max_output_tokens": { "type": "number", "description": "Optional compatibility hint. JuCode may still project very large outputs through its global output budget." },
+                    "tty": { "type": "boolean", "description": "Compatibility hint accepted for Codex-style calls; JuCode command execution does not require it." },
+                    "login": { "type": "boolean", "description": "Compatibility hint accepted for Codex-style calls; JuCode uses its configured shell invocation." }
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "write_stdin",
+            "description": "Send input to a running bash/exec_command session or poll it. Use the session_id returned by bash or exec_command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "number", "description": "Running bash session id." },
+                    "text": { "type": "string", "description": "Text to write to stdin. Omit or pass empty text to only poll." },
+                    "chars": { "type": "string", "description": "Codex-compatible alias for text." },
+                    "yield_time_ms": { "type": "number", "description": "Milliseconds to wait for more output. Defaults to 1000." }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "ls",
+            "description": "List directory contents sorted alphabetically. Directories have a trailing slash. Safe to call in parallel with other read-only exploration tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Directory to list. Defaults to current workspace." },
+                    "limit": { "type": "number", "description": "Optional maximum entries to return. Defaults to no entry limit." }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "ripgrep",
+            "description": "Search file contents with ripgrep (rg). Respects .gitignore by default and returns matching lines with paths and line numbers. Prefer a narrow path/glob or limit for broad patterns; large result sets return a soft warning. Use multiple ripgrep calls in one response for independent search hypotheses.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Search pattern." },
+                    "path": { "type": "string", "description": "File or directory to search. Defaults to current workspace." },
+                    "glob": { "type": "string", "description": "Optional glob filter, e.g. *.rs or **/*.ts." },
+                    "ignoreCase": { "type": "boolean", "description": "Case-insensitive search. Defaults to false." },
+                    "literal": { "type": "boolean", "description": "Treat pattern as a literal string. Defaults to false." },
+                    "contextLines": { "type": "number", "description": "Lines before and after each match. Defaults to 0." },
+                    "limit": { "type": "number", "description": "Optional maximum output lines. Defaults to no output line limit." }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "outline",
+            "description": "Return a lightweight symbol outline for a source file without reading the full body. Safe to call in parallel with other read-only tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Source file path." },
+                    "limit": { "type": "number", "description": "Maximum symbols to return. Defaults to 200." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "checkpoint",
+            "description": "Create, list, or restore lightweight file checkpoints under .jucode/checkpoints. This is for local rollback, not git.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["create", "list", "restore"], "description": "Checkpoint action." },
+                    "name": { "type": "string", "description": "Checkpoint name for create." },
+                    "id": { "type": "string", "description": "Checkpoint id for restore." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Files to snapshot for create." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+        crate::web_fetch::definition(),
+        crate::web::search_definition(),
+        crate::images::definition(),
+    ]
+    .into_iter()
+    .chain(
+        crate::user_tools::specs()
+            .into_iter()
+            .map(|(name, description, parameters)| {
+                json!({ "type": "function", "name": name, "description": description, "parameters": parameters })
+            }),
+    )
+    .collect())
+}
+
+/// Static tool names for the system prompt's "Available tools" line. Mirrors
+/// the fixed entries in `definitions()` in the same order, with edit tools
+/// filtered to the enabled set; the subagent tools are only listed when they
+/// would actually be offered. Dynamic tools added per turn in
+/// `OpenAiClient::tool_definitions` (MCP, goal/plan) are not part
+/// of this list.
+pub fn prompt_tool_names(
+    edit_tools: &[String],
+    subagents: bool,
+    web_search: bool,
+    images: bool,
+) -> Vec<&'static str> {
+    let mut names = vec!["read"];
+    for name in crate::config::EDIT_TOOL_NAMES {
+        if edit_tools.iter().any(|tool| tool == name) {
+            names.push(name);
+        }
+    }
+    names.extend([
+        "bash",
+        "exec_command",
+        "write_stdin",
+        "ls",
+        "ripgrep",
+        "outline",
+        "checkpoint",
+        "web_fetch",
+    ]);
+    if web_search {
+        names.push("web_search");
+    }
+    if images {
+        names.push(crate::images::TOOL_NAME);
+    }
+    names.extend(crate::user_tools::LOCAL);
+    if subagents {
+        names.extend([
+            "spawn_agent",
+            "wait_agent",
+            "list_agents",
+            "send_message",
+            "close_agent",
+        ]);
+    }
+    names
+}
+
+fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
+    for definition in &mut definitions {
+        if definition.get("type").and_then(Value::as_str) == Some("function") {
+            if let Some(map) = definition.as_object_mut() {
+                map.entry("strict").or_insert(json!(false));
+            }
+        }
+    }
+    definitions
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One tracker per test thread, standing in for an engine's.
+    static TEST_STATE: ToolState = ToolState::default();
+}
+
+#[cfg(test)]
+fn test_state() -> ToolState {
+    TEST_STATE.with(ToolState::clone)
+}
+
+#[cfg(test)]
+fn run_tool(name: &str, arguments: &str, cwd: &Path) -> String {
+    run_tool_with_events(name, arguments, cwd, &[], &test_state(), |_| Ok(())).output
+}
+
+/// `extra_read_roots` lists directories outside the workspace that read-only
+/// file tools may also read (the directories of discovered skills). Mutating
+/// tools stay confined to the workspace.
+pub fn run_tool_with_events(
+    name: &str,
+    arguments: &str,
+    cwd: &Path,
+    extra_read_roots: &[PathBuf],
+    state: &ToolState,
+    mut emit: impl FnMut(ToolExecutionEvent) -> Result<(), String>,
+) -> ToolExecutionResult {
+    let parsed = serde_json::from_str::<Value>(arguments);
+    let args = match parsed {
+        Ok(args) => args,
+        Err(error) => {
+            return tool_result(
+                name,
+                json!({ "error": format!("invalid JSON arguments: {error}") }),
+                cwd,
+            )
+        }
+    };
+
+    // The sandbox's extra directories are readable by the file tools too.
+    let sandbox = state.sandbox();
+    let mut read_roots = extra_read_roots.to_vec();
+    if let Some(sandbox) = &sandbox {
+        read_roots.extend(sandbox.readable_dirs.iter().cloned());
+        read_roots.extend(sandbox.writable_dirs.iter().cloned());
+    }
+    let extra_read_roots = read_roots.as_slice();
+    let result = match name {
+        "read" => read_file(&args, cwd, extra_read_roots, state),
+        "str_replace" | "edit" => str_replace_file(&args, cwd, state),
+        "hashline_edit" => hashline_edit_file(&args, cwd, state),
+        "write" => write_file(&args, cwd, state),
+        "bash" | "execute" | "exec_command" | "shell_command" => {
+            let value = bash(&args, cwd, sandbox.as_ref(), &mut emit);
+            if let Some(session_id) = value.get("session_id").and_then(Value::as_u64) {
+                state.own_shell(session_id);
+            }
+            value
+        }
+        "write_stdin" => match optional_u64(&args, "session_id") {
+            Ok(Some(session_id)) if !state.owns_shell(session_id) => {
+                json!({ "session_id": session_id, "error": format!("no running shell session {session_id}: a bash command that finishes returns its full output in its own result; write_stdin is only for a session_id that a still-running bash command returned") })
+            }
+            _ => write_stdin(&args),
+        },
+        "apply_patch" => apply_patch(&args, cwd, sandbox.as_ref(), &mut emit),
+        "ls" => list_dir(&args, cwd, extra_read_roots),
+        "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
+        "outline" => outline_file(&args, cwd, extra_read_roots),
+        "checkpoint" => checkpoint_tool(&args, cwd, state),
+        "web_fetch" => crate::web::run_fetch(&args, state.web().as_ref()),
+        "web_search" => crate::web::run_search(&args, state.web().as_ref()),
+        crate::images::TOOL_NAME => {
+            crate::images::run(&args, cwd, extra_read_roots, state, &mut emit)
+        }
+        _ => match crate::user_tools::run(name, &args, cwd).or_else(|| {
+            let host = state
+                .host()
+                .filter(|_| crate::user_tools::SESSION_TOOLS.contains(&name))?;
+            Some(host(name, &args))
+        }) {
+            Some(Ok(output)) => output,
+            Some(Err(error)) => json!({ "error": error }),
+            None => json!({ "error": format!("unknown tool: {name}") }),
+        },
+    };
+    tool_result(name, result, cwd)
+}
+
+fn tool_result(name: &str, value: Value, cwd: &Path) -> ToolExecutionResult {
+    let output = value.to_string();
+    let model_output = project_model_output(name, &output, cwd);
+    // Log the tool name and a brief error only; arguments and file contents
+    // must never reach the log.
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        let brief = error.chars().take(200).collect::<String>();
+        crate::log_warn!("tools", "tool error", tool = name, error = brief);
+    }
+    ToolExecutionResult {
+        is_error: value.get("error").is_some()
+            || value
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0)
+            || value
+                .get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        output,
+        model_output,
+    }
+}
+
+fn add_soft_hint(value: &mut Value, warning: &str, suggestion: &str) {
+    if let Value::Object(map) = value {
+        map.entry("warning".to_string())
+            .or_insert_with(|| json!(warning));
+        map.entry("suggestion".to_string())
+            .or_insert_with(|| json!(suggestion));
+    }
+}
+
+fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], state: &ToolState) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return json!({ "error": "missing path" });
+    };
+
+    let path = match readable_path(cwd, path, extra_read_roots) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
+    let offset = match optional_usize(args, "offset") {
+        Ok(offset) => offset.unwrap_or(1).max(1),
+        Err(error) => return json!({ "error": error }),
+    };
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.map(|limit| limit.max(1)),
+        Err(error) => return json!({ "error": error }),
+    };
+
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+    if let Some(mime) = image_mime(&path) {
+        if metadata.len() > MAX_IMAGE_READ_BYTES {
+            return json!({
+                "path": path.display().to_string(),
+                "kind": "image",
+                "mime": mime,
+                "bytes": metadata.len(),
+                "truncated": true,
+                "error": "image is too large to inline; inspect it with an external viewer or a narrower tool"
+            });
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return json!({ "path": path.display().to_string(), "error": error.to_string() })
+            }
+        };
+        state.mark_read(&path);
+        return json!({
+            "path": path.display().to_string(),
+            "kind": "image",
+            "mime": mime,
+            "bytes": bytes.len(),
+            "base64": BASE64_STANDARD.encode(bytes),
+        });
+    }
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+    let Some((text, encoding)) = decode_text_bytes(&bytes) else {
+        return json!({
+            "path": path.display().to_string(),
+            "kind": "binary",
+            "bytes": bytes.len(),
+            "error": "file is not supported text encoding"
+        });
+    };
+
+    let mut content = String::new();
+    let mut hashlines = String::new();
+    let mut lines_read = 0usize;
+    let mut truncated = false;
+    let mut line_number = 0usize;
+
+    for line in text.split_inclusive('\n') {
+        line_number += 1;
+        if line_number < offset {
+            continue;
+        }
+        if limit.is_some_and(|limit| lines_read >= limit) {
+            truncated = true;
+            break;
+        }
+
+        content.push_str(line);
+        let display_line = line.strip_suffix('\n').unwrap_or(line);
+        hashlines.push_str(&format_hashline(line_number, display_line));
+        if line.ends_with('\n') {
+            hashlines.push('\n');
+        }
+        lines_read += 1;
+    }
+    state.mark_read(&path);
+
+    let mut value = json!({
+        "path": path.display().to_string(),
+        "kind": "text",
+        "encoding": encoding,
+        "offset": offset,
+        "lines_read": lines_read,
+        "truncated": truncated,
+        "content": content,
+        "hashlines": hashlines,
+    });
+    if limit.is_none() && metadata.len() > LARGE_TEXT_READ_SOFT_BYTES {
+        add_soft_hint(
+            &mut value,
+            "large file read without a line limit",
+            "Use read with offset/limit, outline, or ripgrep to narrow the next read unless the full file is required.",
+        );
+    }
+    value
+}
+
+fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return json!({ "error": "missing path" });
+    };
+    let Some(edits) = args.get("edits").and_then(Value::as_array) else {
+        return json!({ "error": "missing edits" });
+    };
+    if edits.is_empty() {
+        return json!({ "error": "edits must not be empty" });
+    }
+
+    let path = match write_target(cwd, path, state) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
+    if let Some(error) = unread_or_stale_error(
+        state,
+        &path,
+        "edit requires reading this file first so oldText matches bytes on disk",
+    ) {
+        return error;
+    }
+    let original = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+
+    let mut replacements = Vec::new();
+    for edit in edits {
+        let Some(old_text) = edit.get("oldText").and_then(Value::as_str) else {
+            return json!({ "path": path.display().to_string(), "error": "each edit requires oldText" });
+        };
+        let Some(new_text) = edit.get("newText").and_then(Value::as_str) else {
+            return json!({ "path": path.display().to_string(), "error": "each edit requires newText" });
+        };
+        if old_text.is_empty() {
+            return json!({ "path": path.display().to_string(), "error": "oldText must not be empty" });
+        }
+
+        let matches = original.match_indices(old_text).collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return json!({
+                "path": path.display().to_string(),
+                "error": format!("oldText must match exactly once; found {}", matches.len()),
+                "oldText": old_text,
+            });
+        }
+        let start = matches[0].0;
+        replacements.push((start, start + old_text.len(), new_text.to_string()));
+    }
+
+    replacements.sort_by_key(|(start, _, _)| *start);
+    for pair in replacements.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return json!({ "path": path.display().to_string(), "error": "edits must not overlap" });
+        }
+    }
+
+    let mut output = String::with_capacity(original.len());
+    let mut cursor = 0usize;
+    for (start, end, new_text) in &replacements {
+        output.push_str(&original[cursor..*start]);
+        output.push_str(new_text);
+        cursor = *end;
+    }
+    output.push_str(&original[cursor..]);
+
+    let _ = create_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
+    match fs::write(&path, &output) {
+        Ok(()) => {
+            state.mark_read(&path);
+            let diff = unified_diff_for_file(cwd, &path, &original, &output);
+            json!({
+                "path": path.display().to_string(),
+                "edits": replacements.len(),
+                "written_bytes": output.len(),
+                "diff": diff.unwrap_or_default(),
+            })
+        }
+        Err(error) => json!({ "path": path.display().to_string(), "error": error.to_string() }),
+    }
+}
+
+#[derive(Clone)]
+struct HashlineAnchor {
+    line: usize,
+    hash: String,
+}
+
+struct HashlineEdit {
+    op: String,
+    pos: Option<HashlineAnchor>,
+    end: Option<HashlineAnchor>,
+    lines: Vec<String>,
+}
+
+struct HashlineSpan {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return json!({ "error": "missing path" });
+    };
+    let Some(raw_edits) = args.get("edits").and_then(Value::as_array) else {
+        return json!({ "error": "missing edits" });
+    };
+    if raw_edits.is_empty() {
+        return json!({ "error": "edits must not be empty" });
+    }
+
+    let path = match write_target(cwd, path, state) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
+    if let Some(error) = unread_or_stale_error(
+        state,
+        &path,
+        "hashline_edit requires reading this file first and copying LINE#HASH anchors from read().hashlines",
+    ) {
+        return error;
+    }
+
+    let original = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+
+    let output = match apply_hashline_edits_preview(&original, raw_edits) {
+        Ok(output) => output,
+        Err(error) => return json!({ "path": path.display().to_string(), "error": error }),
+    };
+
+    let _ = create_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
+    match fs::write(&path, &output) {
+        Ok(()) => {
+            state.mark_read(&path);
+            let diff = unified_diff_for_file(cwd, &path, &original, &output);
+            let changed = changed_line_range(&original, &output);
+            let anchors =
+                changed.and_then(|(first, last)| post_edit_anchor_block(&output, first, last));
+            json!({
+                "path": path.display().to_string(),
+                "edits": raw_edits.len(),
+                "written_bytes": output.len(),
+                "diff": diff.unwrap_or_default(),
+                "anchors": anchors.unwrap_or_default(),
+            })
+        }
+        Err(error) => json!({ "path": path.display().to_string(), "error": error.to_string() }),
+    }
+}
+
+fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return json!({ "error": "missing path" });
+    };
+    let Some(content) = args.get("content").and_then(Value::as_str) else {
+        return json!({ "error": "missing content" });
+    };
+
+    let path = match write_target(cwd, path, state) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
+    let exists = path.exists();
+    if exists {
+        if let Some(error) = unread_or_stale_error(
+            state,
+            &path,
+            "write requires reading an existing file first before overwriting it; new files can be written without a prior read",
+        ) {
+            return error;
+        }
+    }
+    let original = if exists {
+        fs::read_to_string(&path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() });
+        }
+    }
+
+    let _ = create_checkpoint(cwd, "auto-write", std::slice::from_ref(&path));
+    match fs::write(&path, content) {
+        Ok(()) => {
+            state.mark_read(&path);
+            let diff = unified_diff_for_file(cwd, &path, &original, content);
+            json!({
+                "path": path.display().to_string(),
+                "written_bytes": content.len(),
+                "diff": diff.unwrap_or_default(),
+            })
+        }
+        Err(error) => json!({ "path": path.display().to_string(), "error": error.to_string() }),
+    }
+}
+
+/// Applies hashline edits to `original` without touching the filesystem.
+/// Shared by `hashline_edit` itself and hunk planning for selective approval
+/// (which previews each edit in isolation).
+pub(crate) fn apply_hashline_edits_preview(
+    original: &str,
+    raw_edits: &[Value],
+) -> Result<String, String> {
+    let edits = parse_hashline_edits(raw_edits)?;
+    let line_index = LineIndex::new(original);
+    validate_hashline_anchors(&edits, &line_index)?;
+    let spans = resolve_hashline_spans(&edits, original, &line_index)?;
+    let mut output = original.to_string();
+    for span in spans.iter().rev() {
+        output.replace_range(span.start..span.end, &span.replacement);
+    }
+    Ok(output)
+}
+
+fn parse_hashline_edits(raw_edits: &[Value]) -> Result<Vec<HashlineEdit>, String> {
+    let mut edits = Vec::new();
+    for edit in raw_edits {
+        let op = edit
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "each hashline edit requires op".to_string())?;
+        if !matches!(op, "replace" | "append" | "prepend") {
+            return Err(format!(
+                "[E_BAD_OP] Unknown edit op \"{op}\". Expected replace, append, or prepend."
+            ));
+        }
+
+        let pos = edit
+            .get("pos")
+            .and_then(Value::as_str)
+            .map(parse_hashline_anchor)
+            .transpose()?;
+        let end = edit
+            .get("end")
+            .and_then(Value::as_str)
+            .map(parse_hashline_anchor)
+            .transpose()?;
+        let lines = parse_hashline_lines(edit.get("lines"))?;
+
+        if op == "replace" && pos.is_none() {
+            return Err("[E_BAD_OP] Replace requires a pos anchor.".to_string());
+        }
+        if op != "replace" && end.is_some() {
+            return Err(format!("[E_BAD_OP] {op} does not support an end anchor."));
+        }
+        if op != "replace" && lines.is_empty() {
+            return Err(format!("[E_BAD_OP] {op} requires at least one line."));
+        }
+
+        edits.push(HashlineEdit {
+            op: op.to_string(),
+            pos,
+            end,
+            lines,
+        });
+    }
+    Ok(edits)
+}
+
+fn parse_hashline_lines(value: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Err("each hashline edit requires lines".to_string());
+    };
+    let lines = if let Some(text) = value.as_str() {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        normalized
+            .strip_suffix('\n')
+            .unwrap_or(&normalized)
+            .split('\n')
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else if let Some(values) = value.as_array() {
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "lines array must contain only strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err("lines must be a string or an array of strings".to_string());
+    };
+    for line in &lines {
+        if is_hashline_display_prefix(line) || is_diff_payload_prefix(line) {
+            return Err(format!(
+                "[E_INVALID_PATCH] lines must contain literal file content, not LINE#HASH or diff prefixes. Offending line: {line:?}"
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+fn parse_hashline_anchor(ref_text: &str) -> Result<HashlineAnchor, String> {
+    let core = ref_text
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '>' || ch == '+' || ch == '-')
+        .trim_end();
+    let Some(hash_pos) = core.find('#') else {
+        return Err(format!(
+            "[E_BAD_REF] Invalid line reference {ref_text:?}. Expected LINE#HASH."
+        ));
+    };
+    let line = core[..hash_pos].trim().parse::<usize>().map_err(|_| {
+        format!("[E_BAD_REF] Invalid line reference {ref_text:?}. Expected numeric LINE#HASH.")
+    })?;
+    if line == 0 {
+        return Err(format!(
+            "[E_BAD_REF] Line number must be >= 1 in {ref_text:?}."
+        ));
+    }
+    let hash_part = core[hash_pos + 1..]
+        .split_once(':')
+        .map(|(hash, _)| hash)
+        .unwrap_or(&core[hash_pos + 1..])
+        .trim();
+    if hash_part.len() != 2
+        || !hash_part
+            .as_bytes()
+            .iter()
+            .all(|byte| HASHLINE_ALPHABET.contains(byte))
+    {
+        return Err(format!(
+            "[E_BAD_REF] Invalid line reference {ref_text:?}: hash must be exactly 2 characters from {}.",
+            String::from_utf8_lossy(HASHLINE_ALPHABET)
+        ));
+    }
+    Ok(HashlineAnchor {
+        line,
+        hash: hash_part.to_string(),
+    })
+}
+
+struct LineIndex {
+    lines: Vec<String>,
+    starts: Vec<usize>,
+    has_terminal_newline: bool,
+}
+
+impl LineIndex {
+    fn new(content: &str) -> Self {
+        let lines = content.split('\n').map(str::to_string).collect::<Vec<_>>();
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut offset = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            starts.push(offset);
+            offset += line.len();
+            if index < lines.len() - 1 {
+                offset += 1;
+            }
+        }
+        Self {
+            lines,
+            starts,
+            has_terminal_newline: content.ends_with('\n'),
+        }
+    }
+}
+
+fn validate_hashline_anchors(edits: &[HashlineEdit], line_index: &LineIndex) -> Result<(), String> {
+    let mut mismatches = Vec::new();
+    for edit in edits {
+        for anchor in [&edit.pos, &edit.end].into_iter().flatten() {
+            if anchor.line == 0 || anchor.line > line_index.lines.len() {
+                return Err(format!(
+                    "[E_RANGE_OOB] Line {} does not exist (file has {} lines).",
+                    anchor.line,
+                    line_index.lines.len()
+                ));
+            }
+            let actual = compute_line_hash(anchor.line, &line_index.lines[anchor.line - 1]);
+            if actual != anchor.hash {
+                mismatches.push((anchor.line, anchor.hash.clone(), actual));
+            }
+        }
+    }
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(format_hashline_mismatch(&mismatches, &line_index.lines))
+}
+
+fn resolve_hashline_spans(
+    edits: &[HashlineEdit],
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<Vec<HashlineSpan>, String> {
+    let mut spans = Vec::new();
+    for edit in edits {
+        let span = match edit.op.as_str() {
+            "replace" => resolve_hashline_replace(edit, content, line_index)?,
+            "append" => resolve_hashline_append(edit, content, line_index)?,
+            "prepend" => resolve_hashline_prepend(edit, content, line_index)?,
+            _ => return Err(format!("[E_BAD_OP] Unknown edit op {}.", edit.op)),
+        };
+        spans.push(span);
+    }
+    spans.sort_by_key(|span| (span.start, span.end));
+    for pair in spans.windows(2) {
+        if pair[0].end > pair[1].start {
+            return Err("[E_EDIT_CONFLICT] hashline edits must not overlap.".to_string());
+        }
+        if pair[0].start == pair[1].start && pair[0].end == pair[1].end {
+            return Err(
+                "[E_EDIT_CONFLICT] hashline edits target the same insertion boundary.".to_string(),
+            );
+        }
+    }
+    Ok(spans)
+}
+
+fn resolve_hashline_replace(
+    edit: &HashlineEdit,
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<HashlineSpan, String> {
+    let pos = edit.pos.as_ref().expect("replace pos validated");
+    let end = edit.end.as_ref().unwrap_or(pos);
+    if pos.line > end.line {
+        return Err(format!(
+            "[E_BAD_OP] Range start line {} must be <= end line {}.",
+            pos.line, end.line
+        ));
+    }
+    let replacement = edit.lines.join("\n");
+    let (start, end_offset) = if edit.lines.is_empty() {
+        if pos.line == 1 && end.line == line_index.lines.len() {
+            (0, content.len())
+        } else if end.line < line_index.lines.len() {
+            (line_index.starts[pos.line - 1], line_index.starts[end.line])
+        } else {
+            // Deleting through the final line of a file without a trailing
+            // newline: consume the preceding newline instead of a trailing one.
+            (
+                line_index.starts[pos.line - 1].saturating_sub(1),
+                content.len(),
+            )
+        }
+    } else {
+        (
+            line_index.starts[pos.line - 1],
+            line_index.starts[end.line - 1] + line_index.lines[end.line - 1].len(),
+        )
+    };
+    Ok(HashlineSpan {
+        start,
+        end: end_offset,
+        replacement,
+    })
+}
+
+fn resolve_hashline_append(
+    edit: &HashlineEdit,
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<HashlineSpan, String> {
+    let inserted = edit.lines.join("\n");
+    if content.is_empty() {
+        return Ok(HashlineSpan {
+            start: 0,
+            end: 0,
+            replacement: inserted,
+        });
+    }
+    if let Some(pos) = &edit.pos {
+        let sentinel_append = line_index.has_terminal_newline && pos.line == line_index.lines.len();
+        let offset = if sentinel_append {
+            content.len()
+        } else {
+            line_index.starts[pos.line - 1] + line_index.lines[pos.line - 1].len()
+        };
+        Ok(HashlineSpan {
+            start: offset,
+            end: offset,
+            replacement: if sentinel_append {
+                format!("{inserted}\n")
+            } else {
+                format!("\n{inserted}")
+            },
+        })
+    } else {
+        Ok(HashlineSpan {
+            start: content.len(),
+            end: content.len(),
+            replacement: if line_index.has_terminal_newline {
+                format!("{inserted}\n")
+            } else {
+                format!("\n{inserted}")
+            },
+        })
+    }
+}
+
+fn resolve_hashline_prepend(
+    edit: &HashlineEdit,
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<HashlineSpan, String> {
+    let inserted = edit.lines.join("\n");
+    let start = edit
+        .pos
+        .as_ref()
+        .map(|pos| line_index.starts[pos.line - 1])
+        .unwrap_or(0);
+    Ok(HashlineSpan {
+        start,
+        end: start,
+        replacement: if content.is_empty() {
+            inserted
+        } else {
+            format!("{inserted}\n")
+        },
+    })
+}
+
+fn format_hashline_mismatch(mismatches: &[(usize, String, String)], lines: &[String]) -> String {
+    let mut retry_lines = HashSet::new();
+    for (line, _, _) in mismatches {
+        let start = line.saturating_sub(2).max(1);
+        let end = (*line + 2).min(lines.len());
+        for retry in start..=end {
+            retry_lines.insert(retry);
+        }
+    }
+    let mut sorted = retry_lines.into_iter().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut out = vec![format!(
+        "[E_STALE_ANCHOR] {} stale anchor{}. Retry with the >>> LINE#HASH lines below.",
+        mismatches.len(),
+        if mismatches.len() == 1 { "" } else { "s" }
+    )];
+    for line in sorted {
+        let content = &lines[line - 1];
+        out.push(format!(
+            ">>> {}#{}:{}",
+            line,
+            compute_line_hash(line, content),
+            content
+        ));
+    }
+    out.join("\n")
+}
+
+fn is_hashline_display_prefix(line: &str) -> bool {
+    let trimmed = line
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '>' || ch == '+')
+        .trim_start();
+    let Some((line_part, rest)) = trimmed.split_once('#') else {
+        return false;
+    };
+    if !line_part.trim().chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let Some((hash, _)) = rest.split_once(':') else {
+        return false;
+    };
+    hash.trim().len() == 2
+        && hash
+            .trim()
+            .as_bytes()
+            .iter()
+            .all(|byte| HASHLINE_ALPHABET.contains(byte))
+}
+
+fn is_diff_payload_prefix(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('-') else {
+        return false;
+    };
+    let trimmed = rest.trim_start();
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digit_count > 0 && trimmed[digit_count..].starts_with("    ")
+}
+
+fn format_hashline(line_number: usize, line: &str) -> String {
+    format!(
+        "{line_number}#{}:{line}",
+        compute_line_hash(line_number, line)
+    )
+}
+
+pub(crate) fn compute_line_hash(line_number: usize, line: &str) -> String {
+    let normalized = line.trim_end_matches('\r').trim_end();
+    let seed = if normalized.chars().any(|ch| ch.is_alphanumeric()) {
+        0
+    } else {
+        line_number as u32
+    };
+    let value = xxh32(normalized.as_bytes(), seed) & 0xff;
+    let high = ((value >> 4) & 0x0f) as usize;
+    let low = (value & 0x0f) as usize;
+    let mut hash = String::with_capacity(2);
+    hash.push(HASHLINE_ALPHABET[high] as char);
+    hash.push(HASHLINE_ALPHABET[low] as char);
+    hash
+}
+
+fn xxh32(input: &[u8], seed: u32) -> u32 {
+    const PRIME32_1: u32 = 0x9E3779B1;
+    const PRIME32_2: u32 = 0x85EBCA77;
+    const PRIME32_3: u32 = 0xC2B2AE3D;
+    const PRIME32_4: u32 = 0x27D4EB2F;
+    const PRIME32_5: u32 = 0x165667B1;
+
+    let mut index = 0usize;
+    let mut hash;
+    if input.len() >= 16 {
+        let mut v1 = seed.wrapping_add(PRIME32_1).wrapping_add(PRIME32_2);
+        let mut v2 = seed.wrapping_add(PRIME32_2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(PRIME32_1);
+        while index <= input.len() - 16 {
+            v1 = xxh32_round(v1, read_u32_le(input, index));
+            index += 4;
+            v2 = xxh32_round(v2, read_u32_le(input, index));
+            index += 4;
+            v3 = xxh32_round(v3, read_u32_le(input, index));
+            index += 4;
+            v4 = xxh32_round(v4, read_u32_le(input, index));
+            index += 4;
+        }
+        hash = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+    } else {
+        hash = seed.wrapping_add(PRIME32_5);
+    }
+
+    hash = hash.wrapping_add(input.len() as u32);
+    while index + 4 <= input.len() {
+        hash = hash
+            .wrapping_add(read_u32_le(input, index).wrapping_mul(PRIME32_3))
+            .rotate_left(17)
+            .wrapping_mul(PRIME32_4);
+        index += 4;
+    }
+    while index < input.len() {
+        hash = hash
+            .wrapping_add(u32::from(input[index]).wrapping_mul(PRIME32_5))
+            .rotate_left(11)
+            .wrapping_mul(PRIME32_1);
+        index += 1;
+    }
+
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(PRIME32_2);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(PRIME32_3);
+    hash ^= hash >> 16;
+    hash
+}
+
+fn xxh32_round(acc: u32, lane: u32) -> u32 {
+    const PRIME32_1: u32 = 0x9E3779B1;
+    const PRIME32_2: u32 = 0x85EBCA77;
+    acc.wrapping_add(lane.wrapping_mul(PRIME32_2))
+        .rotate_left(13)
+        .wrapping_mul(PRIME32_1)
+}
+
+fn read_u32_le(input: &[u8], index: usize) -> u32 {
+    u32::from_le_bytes([
+        input[index],
+        input[index + 1],
+        input[index + 2],
+        input[index + 3],
+    ])
+}
+
+fn changed_line_range(original: &str, updated: &str) -> Option<(usize, usize)> {
+    if original == updated {
+        return None;
+    }
+    let original_bytes = original.as_bytes();
+    let updated_bytes = updated.as_bytes();
+    let min_len = original_bytes.len().min(updated_bytes.len());
+    let mut first_diff = 0usize;
+    while first_diff < min_len && original_bytes[first_diff] == updated_bytes[first_diff] {
+        first_diff += 1;
+    }
+
+    let mut original_tail = original_bytes.len();
+    let mut updated_tail = updated_bytes.len();
+    while original_tail > first_diff
+        && updated_tail > first_diff
+        && original_bytes[original_tail - 1] == updated_bytes[updated_tail - 1]
+    {
+        original_tail -= 1;
+        updated_tail -= 1;
+    }
+
+    let first = byte_index_to_line(updated, first_diff);
+    let last = if updated_tail <= first_diff {
+        first
+    } else {
+        byte_index_to_line(updated, updated_tail.saturating_sub(1))
+    };
+    Some((first, last.max(first)))
+}
+
+fn byte_index_to_line(text: &str, byte_index: usize) -> usize {
+    let end = byte_index.min(text.len());
+    text[..end].bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+fn post_edit_anchor_block(content: &str, first: usize, last: usize) -> Option<String> {
+    let lines = content.split('\n').map(str::to_string).collect::<Vec<_>>();
+    let visible_line_count = if content.ends_with('\n') {
+        lines.len().saturating_sub(1)
+    } else {
+        lines.len()
+    };
+    if visible_line_count == 0 {
+        return None;
+    }
+    let start = first.saturating_sub(2).max(1);
+    let end = (last + 2).min(visible_line_count);
+    if end < start || end - start + 1 > 12 {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.push(format!("--- Anchors {start}-{end} ---"));
+    for line_number in start..=end {
+        out.push(format_hashline(line_number, &lines[line_number - 1]));
+    }
+    Some(out.join("\n"))
+}
+
+/// Runs a shell command. With a sandbox it runs inside it, unless the call
+/// carries `escalate: true` (the approval gate has already let it through).
+fn bash(
+    args: &Value,
+    cwd: &Path,
+    sandbox: Option<&crate::sandbox::SandboxPolicy>,
+    emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
+) -> Value {
+    let Some(command) = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(Value::as_str)
+    else {
+        return json!({ "error": "missing command; use `command` for bash or `cmd` for exec_command" });
+    };
+    let workdir = match command_workdir(args, cwd) {
+        Ok(workdir) => workdir,
+        Err(error) => return json!({ "command": command, "error": error }),
+    };
+    let timeout = match optional_u64(args, "timeout") {
+        Ok(timeout) => Duration::from_secs(timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS).max(1)),
+        Err(error) => return json!({ "command": command, "error": error }),
+    };
+    let yield_time = match optional_u64(args, "yield_time_ms") {
+        Ok(yield_time) => yield_time.map(Duration::from_millis),
+        Err(error) => return json!({ "command": command, "error": error }),
+    };
+
+    let (program, shell_args) = shell_command(command);
+    let escalated = args.get("escalate").and_then(Value::as_bool) == Some(true);
+    let (program, shell_args) = match sandbox.filter(|_| !escalated) {
+        Some(sandbox) => match sandbox.wrap(program, &shell_args, &workdir) {
+            Ok(wrapped) => wrapped,
+            Err(error) => return json!({ "command": command, "error": error }),
+        },
+        None => (
+            program.to_string(),
+            shell_args.iter().map(|arg| arg.to_string()).collect(),
+        ),
+    };
+    let program = program.as_str();
+    let shell_args: Vec<&str> = shell_args.iter().map(String::as_str).collect();
+    let result = if let Some(yield_time) = yield_time {
+        run_command_session(
+            program,
+            &shell_args,
+            command,
+            &workdir,
+            timeout,
+            yield_time,
+            emit,
+        )
+    } else {
+        run_command_events(program, &shell_args, None, &workdir, timeout, emit)
+            .map(|result| command_result_json(command, Ok(result)))
+    };
+    match result {
+        Ok(mut value) => {
+            add_command_soft_hint(&mut value);
+            value
+        }
+        Err(error) => json!({ "command": command, "error": error }),
+    }
+}
+
+fn command_workdir(args: &Value, cwd: &Path) -> Result<PathBuf, String> {
+    let Some(workdir) = args.get("workdir").and_then(Value::as_str) else {
+        return Ok(cwd.to_path_buf());
+    };
+    let path = resolve_path(cwd, workdir);
+    if !path.exists() {
+        return Err(format!("workdir does not exist: {}", path.display()));
+    }
+    if !path.is_dir() {
+        return Err(format!("workdir is not a directory: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn write_stdin(args: &Value) -> Value {
+    let session_id = match optional_u64(args, "session_id") {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => return json!({ "error": "missing session_id" }),
+        Err(error) => return json!({ "error": error }),
+    };
+    let text = args
+        .get("text")
+        .filter(|value| !value.is_null())
+        .or_else(|| args.get("chars"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let yield_time = match optional_u64(args, "yield_time_ms") {
+        Ok(yield_time) => Duration::from_millis(yield_time.unwrap_or(1000)),
+        Err(error) => return json!({ "session_id": session_id, "error": error }),
+    };
+    match poll_or_write_session(session_id, text, yield_time) {
+        Ok(value) => value,
+        Err(error) => json!({ "session_id": session_id, "error": error }),
+    }
+}
+
+fn run_command_session(
+    program: &str,
+    args: &[&str],
+    display_command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    yield_time: Duration,
+    emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
+) -> Result<Value, String> {
+    let stdout_path = temp_output_path("stdout");
+    let stderr_path = temp_output_path("stderr");
+    let stdout_file = File::create(&stdout_path).map_err(|error| error.to_string())?;
+    let stderr_file = File::create(&stderr_path).map_err(|error| error.to_string())?;
+
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start {program}: {error}"))?;
+    track_process_group(child.id());
+
+    let stdin = child.stdin.take();
+    let started = SystemTime::now();
+    if let Err(error) = emit(ToolExecutionEvent::Update(format!(
+        "started: {}",
+        command_display(program, args)
+    ))) {
+        abort_command(&mut child, &stdout_path, &stderr_path);
+        return Err(error);
+    }
+
+    let wait_until = yield_time.min(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let result = collect_command_result(
+                    status.code(),
+                    status_signal(&status),
+                    false,
+                    &stdout_path,
+                    &stderr_path,
+                );
+                return Ok(command_result_json(display_command, Ok(result)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                abort_command(&mut child, &stdout_path, &stderr_path);
+                return Err(error.to_string());
+            }
+        }
+        if started.elapsed().unwrap_or_default() >= wait_until {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let (stdout, stdout_truncated) = read_output_file(&stdout_path);
+    let (stderr, stderr_truncated) = read_output_file(&stderr_path);
+    shell_sessions()
+        .lock()
+        .map_err(|_| "shell session lock is poisoned".to_string())?
+        .insert(
+            session_id,
+            ShellSession {
+                child,
+                stdin,
+                stdout_path,
+                stderr_path,
+                command: display_command.to_string(),
+                started,
+                timeout,
+            },
+        );
+
+    Ok(json!({
+        "command": display_command,
+        "session_id": session_id,
+        "running": true,
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": stdout_truncated || stderr_truncated,
+        "note": "command is still running; use write_stdin with this session_id to poll or send input"
+    }))
+}
+
+fn poll_or_write_session(
+    session_id: u64,
+    text: &str,
+    yield_time: Duration,
+) -> Result<Value, String> {
+    let started_poll = SystemTime::now();
+    let mut wrote_stdin = false;
+    loop {
+        let mut finished = None;
+        {
+            let mut sessions = shell_sessions()
+                .lock()
+                .map_err(|_| "shell session lock is poisoned".to_string())?;
+            let Some(session) = sessions.get_mut(&session_id) else {
+                return Err("shell session not found".to_string());
+            };
+            if session.started.elapsed().unwrap_or_default() >= session.timeout {
+                kill_child(&mut session.child);
+                finished = Some((true, None, None));
+            } else if let Some(status) = session
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
+                finished = Some((false, status.code(), status_signal(&status)));
+            }
+            if let Some((timed_out, code, signal)) = finished {
+                let session = sessions.remove(&session_id).expect("session exists");
+                let result = collect_command_result(
+                    code,
+                    signal,
+                    timed_out,
+                    &session.stdout_path,
+                    &session.stderr_path,
+                );
+                return Ok(command_result_json(&session.command, Ok(result)));
+            }
+            if !text.is_empty() && !wrote_stdin {
+                if let Some(stdin) = session.stdin.as_mut() {
+                    if let Err(error) = stdin.write_all(text.as_bytes()).and_then(|_| stdin.flush())
+                    {
+                        if let Ok(Some(status)) = session.child.try_wait() {
+                            let signal = status_signal(&status);
+                            let session = sessions.remove(&session_id).expect("session exists");
+                            let result = collect_command_result(
+                                status.code(),
+                                signal,
+                                false,
+                                &session.stdout_path,
+                                &session.stderr_path,
+                            );
+                            return Ok(command_result_json(&session.command, Ok(result)));
+                        }
+                        return Err(error.to_string());
+                    }
+                    wrote_stdin = true;
+                }
+            }
+        }
+
+        if started_poll.elapsed().unwrap_or_default() >= yield_time {
+            let sessions = shell_sessions()
+                .lock()
+                .map_err(|_| "shell session lock is poisoned".to_string())?;
+            let Some(session) = sessions.get(&session_id) else {
+                return Err("shell session not found".to_string());
+            };
+            let (stdout, stdout_truncated) = read_output_file(&session.stdout_path);
+            let (stderr, stderr_truncated) = read_output_file(&session.stderr_path);
+            return Ok(json!({
+                "command": session.command,
+                "session_id": session_id,
+                "running": true,
+                "stdout": stdout,
+                "stderr": stderr,
+                "truncated": stdout_truncated || stderr_truncated,
+            }));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn collect_command_result(
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> CommandResult {
+    let (stdout, stdout_truncated) = read_output_file(stdout_path);
+    let (stderr, stderr_truncated) = read_output_file(stderr_path);
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+    CommandResult {
+        exit_code,
+        signal,
+        stdout,
+        stderr,
+        timed_out,
+        truncated: stdout_truncated || stderr_truncated,
+    }
+}
+
+/// Kill a still-running child and drop its capture files; used on early
+/// returns (user interrupt, wait errors) so no orphan process is left behind.
+fn abort_command(child: &mut Child, stdout_path: &Path, stderr_path: &Path) {
+    kill_child(child);
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+}
+
+fn status_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn kill_child(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let id = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/pid", &id, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return;
+    }
+    #[cfg(not(windows))]
+    {
+        // The child is spawned as a process-group leader (process_group(0)),
+        // so a group signal takes descendants down with it. Fall back to
+        // killing just the child if the group is already gone.
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Process groups of the tool commands this process started (each child is
+/// a group leader). Entries are never removed; `terminate_tool_processes`
+/// signals only leaders that are still unreaped children of this process, so
+/// a stale entry whose pid was reused is skipped.
+static TOOL_GROUPS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+
+/// Puts a process group this process started (a tool command, or a host's
+/// engine process) on the list `terminate_tool_processes` ends.
+pub fn track_process_group(pid: u32) {
+    if let Ok(mut groups) = TOOL_GROUPS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        groups.push(pid);
+    }
+}
+
+/// Ends every tool command this process started that is still running —
+/// foreground commands and background shells (dev servers, watchers) alike —
+/// with their descendants: SIGTERM to each group, SIGKILL to what is left
+/// after half a second. Call when the engine process is about to exit, so
+/// nothing it started outlives it.
+/// Signals the process group `pid` leads (one `track_process_group` knows):
+/// SIGKILL when `kill`, else SIGTERM. Nothing on Windows, where children
+/// are ended one by one.
+pub fn signal_process_group(pid: u32, kill: bool) {
+    #[cfg(unix)]
+    {
+        let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
+        // SAFETY: plain kill(2) on a process group id.
+        unsafe { libc::killpg(pid as libc::pid_t, signal) };
+    }
+    #[cfg(not(unix))]
+    let _ = (pid, kill);
+}
+
+pub fn terminate_tool_processes() {
+    let pids = TOOL_GROUPS
+        .get()
+        .and_then(|groups| groups.lock().ok().map(|mut g| std::mem::take(&mut *g)))
+        .unwrap_or_default();
+    terminate_groups(pids);
+}
+
+fn terminate_groups(pids: Vec<u32>) {
+    #[cfg(not(unix))]
+    let _ = pids;
+    #[cfg(unix)]
+    {
+        // Still our unreaped child: its pid (and group id) cannot have been reused.
+        let running = |pid: u32| {
+            let mut status = 0;
+            // SAFETY: WNOHANG never blocks; the pid is one this process spawned.
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) == 0 }
+        };
+        let mut live: Vec<u32> = pids.into_iter().filter(|&pid| running(pid)).collect();
+        for &pid in &live {
+            // SAFETY: signals the group this process created for that child.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
+        }
+        for _ in 0..10 {
+            live.retain(|&pid| running(pid));
+            if live.is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        for &pid in &live {
+            // SAFETY: as above.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+            unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        }
+    }
+}
+
+struct ShellSession {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    command: String,
+    started: SystemTime,
+    timeout: Duration,
+}
+
+static SHELL_SESSIONS: OnceLock<Mutex<HashMap<u64, ShellSession>>> = OnceLock::new();
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn shell_sessions() -> &'static Mutex<HashMap<u64, ShellSession>> {
+    SHELL_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn project_model_output(name: &str, output: &str, cwd: &Path) -> String {
+    if let Some(projected) = project_image_model_output(name, output) {
+        return projected;
+    }
+    if let Some(projected) = project_read_model_output(name, output, cwd) {
+        return projected;
+    }
+    if let Some(projected) = project_diff_model_output(name, output, cwd) {
+        return projected;
+    }
+    if output.len() <= MODEL_OUTPUT_INLINE_LIMIT {
+        return output.to_string();
+    }
+
+    let full_output_path = write_full_tool_output(name, output, cwd);
+    let mut projected =
+        serde_json::from_str::<Value>(output).unwrap_or_else(|_| json!({ "output": output }));
+    let mut truncated = false;
+    truncate_large_strings(&mut projected, &mut truncated);
+
+    match &mut projected {
+        Value::Object(map) => {
+            map.insert("model_output_truncated".to_string(), json!(true));
+            map.insert(
+                "full_output_path".to_string(),
+                json!(full_output_path.display().to_string()),
+            );
+            map.insert(
+                "note".to_string(),
+                json!("Large tool output was projected for the model. Inspect full_output_path if exact full output is needed."),
+            );
+        }
+        _ => {
+            projected = json!({
+                "tool": name,
+                "model_output_truncated": true,
+                "full_output_path": full_output_path.display().to_string(),
+                "output": truncate_text(output, MODEL_OUTPUT_FIELD_LIMIT),
+            });
+        }
+    }
+
+    let serialized = projected.to_string();
+    if serialized.len() <= MODEL_OUTPUT_INLINE_LIMIT {
+        return serialized;
+    }
+
+    json!({
+        "tool": name,
+        "model_output_truncated": true,
+        "full_output_path": full_output_path.display().to_string(),
+        "output": truncate_text(&serialized, MODEL_OUTPUT_INLINE_LIMIT / 2),
+    })
+    .to_string()
+}
+
+fn project_read_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {
+    if env::var("JUCODE_PROJECT_READ_MODEL_OUTPUT")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "0" | "false" | "FALSE" | "off" | "OFF"))
+    {
+        return None;
+    }
+    project_read_model_output_inner(name, output, cwd)
+}
+
+fn project_read_model_output_inner(name: &str, output: &str, cwd: &Path) -> Option<String> {
+    if name != "read" {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(output).ok()?;
+    let content_len = value
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|text| text.len())
+        .unwrap_or(0);
+    let hashlines_len = value
+        .get("hashlines")
+        .and_then(Value::as_str)
+        .map(|text| text.len())
+        .unwrap_or(0);
+    if content_len == 0 || hashlines_len == 0 {
+        return None;
+    }
+    let omit_content = content_len >= READ_MODEL_CONTENT_OMIT_THRESHOLD;
+    let truncate_hashlines = hashlines_len > READ_MODEL_HASHLINES_LIMIT;
+    if !omit_content && !truncate_hashlines {
+        return None;
+    }
+    let full_output_path = truncate_hashlines.then(|| write_full_tool_output(name, output, cwd));
+    if let Value::Object(map) = &mut value {
+        if omit_content {
+            map.remove("content");
+        }
+        if truncate_hashlines {
+            if let Some(Value::String(hashlines)) = map.get_mut("hashlines") {
+                *hashlines = truncate_text(hashlines, MODEL_OUTPUT_FIELD_LIMIT);
+            }
+        }
+        map.insert("model_output_truncated".to_string(), json!(true));
+        if let Some(path) = full_output_path {
+            map.insert(
+                "full_output_path".to_string(),
+                json!(path.display().to_string()),
+            );
+        }
+        map.insert(
+            "note".to_string(),
+            json!("Large read output was projected for the model. Re-read with offset/limit when exact nearby lines or anchors are needed."),
+        );
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Replaces the inline base64 payload of an image read with a short note. The
+/// actual pixels are delivered to the model as a separate image message via
+/// [`image_content_item`], so keeping the base64 in the function output would
+/// only waste tokens.
+fn project_image_model_output(name: &str, output: &str) -> Option<String> {
+    if name != "read" {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(output).ok()?;
+    if value.get("kind").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let map = value.as_object_mut()?;
+    map.remove("base64")?;
+    map.insert(
+        "note".to_string(),
+        json!("Image content is attached as a separate message; view it directly."),
+    );
+    Some(value.to_string())
+}
+
+/// Builds a user image message from a `read` tool output that contains an inline
+/// base64 image, so the model can actually see the pixels. Returns `None` for
+/// non-image outputs.
+pub fn image_content_item(output: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    if value.get("kind").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let mime = value.get("mime").and_then(Value::as_str)?;
+    let base64 = value.get("base64").and_then(Value::as_str)?;
+    Some(json!({
+        "role": "user",
+        "content": [{
+            "type": "input_image",
+            "image_url": format!("data:{mime};base64,{base64}"),
+        }],
+    }))
+}
+
+/// Reads a local image file and returns an `input_image` content part for a user
+/// message, or an error describing why it cannot be attached.
+pub fn image_attachment_part(path: &Path) -> Result<Value, String> {
+    let Some(mime) = image_mime(path) else {
+        return Err(format!("{}: not a supported image", path.display()));
+    };
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.len() > MAX_IMAGE_READ_BYTES {
+        return Err(format!("{}: image is too large to attach", path.display()));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(json!({
+        "type": "input_image",
+        "image_url": format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes)),
+    }))
+}
+
+/// Cheap validation (no read/encode) of an image attachment path. Returns an
+/// error message if the path is not an attachable image, else `None`.
+pub fn image_attachment_error(path: &Path) -> Option<String> {
+    if image_mime(path).is_none() {
+        return Some(format!("{}: not a supported image", path.display()));
+    }
+    match fs::metadata(path) {
+        Err(error) => Some(format!("{}: {error}", path.display())),
+        Ok(metadata) if metadata.len() > MAX_IMAGE_READ_BYTES => {
+            Some(format!("{}: image is too large to attach", path.display()))
+        }
+        Ok(_) => None,
+    }
+}
+
+fn project_diff_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {
+    if env::var("JUCODE_PROJECT_DIFF_MODEL_OUTPUT")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "0" | "false" | "FALSE" | "off" | "OFF"))
+    {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(output).ok()?;
+    let diff = value.get("diff").and_then(Value::as_str)?.to_string();
+    if diff.len() <= DIFF_MODEL_OUTPUT_INLINE_LIMIT && output.len() <= MODEL_OUTPUT_INLINE_LIMIT {
+        return None;
+    }
+    let full_output_path = write_full_tool_output(name, output, cwd);
+    let summary = summarize_unified_diff(&diff);
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "diff".to_string(),
+            json!(truncate_text(&diff, MODEL_OUTPUT_FIELD_LIMIT)),
+        );
+        map.insert("diff_summary".to_string(), summary);
+        map.insert("model_output_truncated".to_string(), json!(true));
+        map.insert(
+            "full_output_path".to_string(),
+            json!(full_output_path.display().to_string()),
+        );
+        map.insert(
+            "note".to_string(),
+            json!("Large diff was summarized for the model. Inspect full_output_path only if exact omitted hunks are necessary; otherwise use path-specific diff/read commands."),
+        );
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn summarize_unified_diff(diff: &str) -> Value {
+    let mut files = Vec::new();
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    let mut hunks = 0usize;
+    for line in diff.lines() {
+        if let Some(file) = diff_file_from_header(line) {
+            if !files.iter().any(|existing| existing == &file) {
+                files.push(file);
+            }
+        } else if line.starts_with("@@") {
+            hunks += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            additions += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            deletions += 1;
+        }
+    }
+    let total_files = files.len();
+    if files.len() > 20 {
+        files.truncate(20);
+    }
+    json!({
+        "files_changed": total_files,
+        "files_sample": files,
+        "hunks": hunks,
+        "additions": additions,
+        "deletions": deletions,
+        "diff_bytes": diff.len(),
+        "diff_lines": diff.lines().count(),
+    })
+}
+
+fn diff_file_from_header(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        let mut parts = rest.split_whitespace();
+        let _old = parts.next()?;
+        let new = parts.next()?;
+        return Some(strip_diff_prefix(new).to_string());
+    }
+    if let Some(path) = line.strip_prefix("+++ ") {
+        let path = path.trim();
+        if path != "/dev/null" {
+            return Some(strip_diff_prefix(path).to_string());
+        }
+    }
+    None
+}
+
+fn strip_diff_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+fn truncate_large_strings(value: &mut Value, truncated: &mut bool) {
+    match value {
+        Value::String(text) if text.len() > MODEL_OUTPUT_FIELD_LIMIT => {
+            *text = truncate_text(text, MODEL_OUTPUT_FIELD_LIMIT);
+            *truncated = true;
+        }
+        Value::Array(items) => {
+            for item in items {
+                truncate_large_strings(item, truncated);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                truncate_large_strings(value, truncated);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truncate_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let half = limit / 2;
+    let head_end = safe_boundary(text, half);
+    let tail_start = text.len() - safe_boundary_rev(text, half);
+    format!(
+        "{}\n\n[...model projection omitted {} bytes...]\n\n{}",
+        &text[..head_end],
+        text.len()
+            .saturating_sub(head_end + (text.len() - tail_start)),
+        &text[tail_start..]
+    )
+}
+
+fn safe_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn safe_boundary_rev(text: &str, mut width: usize) -> usize {
+    width = width.min(text.len());
+    while width > 0 && !text.is_char_boundary(text.len() - width) {
+        width -= 1;
+    }
+    width
+}
+
+fn write_full_tool_output(name: &str, output: &str, cwd: &Path) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(output.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    let safe_name = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let dir = cwd.join(".jucode").join("truncated-results");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join(format!("{safe_name}-{}.json", &hash[..16]));
+    let _ = fs::write(&path, output);
+    path
+}
+
+fn apply_patch(
+    args: &Value,
+    cwd: &Path,
+    sandbox: Option<&crate::sandbox::SandboxPolicy>,
+    emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
+) -> Value {
+    let Some(patch) = args.get("patch").and_then(Value::as_str) else {
+        return json!({ "error": "missing patch" });
+    };
+    if patch.trim().is_empty() {
+        return json!({ "error": "patch must not be empty" });
+    }
+    // Workspace path policy: reject the whole patch when any target escapes
+    // the workspace, before anything is checked or applied.
+    let targets = patch_target_paths(patch, cwd);
+    for target in &targets {
+        if let Err(error) = ensure_in_workspace(cwd, target)
+            .and_then(|()| sandbox.map_or(Ok(()), |sandbox| sandbox.check_write(cwd, target)))
+        {
+            return json!({ "error": error });
+        }
+    }
+
+    let check = run_command_events(
+        "git",
+        &["apply", "--check", "--whitespace=nowarn", "-"],
+        Some(patch),
+        cwd,
+        Duration::from_secs(30),
+        emit,
+    );
+    if let Ok(check) = &check {
+        if check.exit_code != Some(0) {
+            return command_result_json("git apply --check", Ok(check.clone()));
+        }
+    }
+
+    match check {
+        Ok(_) => {
+            // Snapshot the patch's target files (pre-apply) so /rewind can undo it.
+            let _ = create_checkpoint(cwd, "auto-patch", &targets);
+            let result = run_command_events(
+                "git",
+                &["apply", "--whitespace=nowarn", "-"],
+                Some(patch),
+                cwd,
+                Duration::from_secs(30),
+                emit,
+            );
+            let mut value = command_result_json("git apply", result);
+            value["applied"] = json!(value.get("exit_code").and_then(Value::as_i64) == Some(0));
+            if value["applied"].as_bool().unwrap_or(false) {
+                // Diff only the files this patch touched, not the whole worktree.
+                let mut chunks = Vec::new();
+                for target in &targets {
+                    if let Ok(diff) = git_diff(cwd, Some(target)) {
+                        if !diff.trim().is_empty() {
+                            chunks.push(diff);
+                        }
+                    }
+                }
+                value["diff"] = json!(chunks.join("\n"));
+            }
+            value
+        }
+        Err(error) => json!({ "command": "git apply --check", "error": error }),
+    }
+}
+
+fn list_dir(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(path) => match readable_path(cwd, path, extra_read_roots) {
+            Ok(path) => path,
+            Err(error) => return json!({ "error": error }),
+        },
+        None => cwd.to_path_buf(),
+    };
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.map(|limit| limit.max(1)),
+        Err(error) => return json!({ "error": error }),
+    };
+
+    let entries = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+
+    let mut names = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let mut name = entry.file_name().to_string_lossy().to_string();
+        if entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            name.push('/');
+        }
+        names.push(name);
+    }
+    names.sort();
+    let truncated = limit.is_some_and(|limit| names.len() > limit);
+    if let Some(limit) = limit {
+        names.truncate(limit);
+    }
+
+    json!({
+        "path": path.display().to_string(),
+        "entries": names,
+        "truncated": truncated,
+    })
+}
+
+fn ripgrep(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
+    let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
+        return json!({ "error": "missing pattern" });
+    };
+    let search_path = match args.get("path").and_then(Value::as_str) {
+        Some(path) => match readable_path(cwd, path, extra_read_roots) {
+            Ok(path) => path,
+            Err(error) => return json!({ "error": error }),
+        },
+        None => cwd.to_path_buf(),
+    };
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.map(|limit| limit.max(1)),
+        Err(error) => return json!({ "error": error }),
+    };
+    let context_lines = match optional_usize(args, "contextLines") {
+        Ok(context_lines) => context_lines.unwrap_or(0),
+        Err(error) => return json!({ "error": error }),
+    };
+
+    let mut command_args = vec![
+        "--line-number".to_string(),
+        "--no-heading".to_string(),
+        "--color".to_string(),
+        "never".to_string(),
+    ];
+    if args
+        .get("ignoreCase")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        command_args.push("--ignore-case".to_string());
+    }
+    if args
+        .get("literal")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        command_args.push("--fixed-strings".to_string());
+    }
+    if context_lines > 0 {
+        command_args.push("--context".to_string());
+        command_args.push(context_lines.to_string());
+    }
+    if let Some(glob) = args.get("glob").and_then(Value::as_str) {
+        command_args.push("--glob".to_string());
+        command_args.push(glob.to_string());
+    }
+    // -e keeps patterns that start with `-` from being parsed as flags.
+    command_args.push("-e".to_string());
+    command_args.push(pattern.to_string());
+    command_args.push(search_path.display().to_string());
+
+    let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut value = match run_command("rg", &arg_refs, cwd, Duration::from_secs(30)) {
+        // No rg on this machine (a stock Windows has none): search in-process.
+        Err(error) if error.starts_with("failed to start rg") => {
+            let options = crate::search::Options {
+                ignore_case: args
+                    .get("ignoreCase")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                literal: args
+                    .get("literal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                context: context_lines,
+                glob: args.get("glob").and_then(Value::as_str),
+                timeout: Duration::from_secs(30),
+            };
+            let out = crate::search::search(pattern, &search_path, &options);
+            command_result_json(
+                "rg",
+                Ok(CommandResult {
+                    exit_code: Some(out.exit_code),
+                    signal: None,
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    timed_out: out.timed_out,
+                    truncated: out.truncated,
+                }),
+            )
+        }
+        result => command_result_json("rg", result),
+    };
+    // rg exit code 1 means "no matches", which is a valid result; 2+ is an error.
+    if value.get("exit_code").and_then(Value::as_i64) == Some(1) {
+        value["exit_code"] = json!(0);
+        if value
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            value["stdout"] = json!("no matches found");
+        }
+    }
+    if let (Some(stdout), Some(limit)) = (value.get("stdout").and_then(Value::as_str), limit) {
+        let lines = stdout.lines().take(limit).collect::<Vec<_>>();
+        let truncated = stdout.lines().count() > limit;
+        value["stdout"] = json!(lines.join("\n"));
+        value["truncated"] = json!(value["truncated"].as_bool().unwrap_or(false) || truncated);
+    }
+    value["path"] = json!(search_path.display().to_string());
+    add_ripgrep_soft_hint(&mut value, limit.is_none());
+    value
+}
+
+fn add_ripgrep_soft_hint(value: &mut Value, no_limit: bool) {
+    let stdout = value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        add_soft_hint(
+            value,
+            "ripgrep output was truncated",
+            "Use a narrower path, glob, more specific pattern, or a limit before reading more.",
+        );
+    } else if no_limit
+        && (stdout.lines().count() > LARGE_RIPGREP_OUTPUT_SOFT_LINES
+            || stdout.len() > LARGE_RIPGREP_OUTPUT_SOFT_BYTES)
+    {
+        add_soft_hint(
+            value,
+            "large ripgrep output without a line limit",
+            "Use a narrower path, glob, more specific pattern, or limit to reduce context before inspecting matches.",
+        );
+    }
+}
+
+fn outline_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return json!({ "error": "missing path" });
+    };
+    let path = match readable_path(cwd, path, extra_read_roots) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.unwrap_or(200).max(1),
+        Err(error) => return json!({ "error": error }),
+    };
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+    let mut symbols = Vec::new();
+    let mut truncated = false;
+    for (index, line) in content.lines().enumerate() {
+        if let Some(symbol) = symbol_from_line(line) {
+            if symbols.len() >= limit {
+                truncated = true;
+                break;
+            }
+            symbols.push(json!({ "line": index + 1, "symbol": symbol }));
+        }
+    }
+    json!({
+        "path": path.display().to_string(),
+        "symbols": symbols,
+        "truncated": truncated,
+    })
+}
+
+fn checkpoint_tool(args: &Value, cwd: &Path, state: &ToolState) -> Value {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match action {
+        "create" => {
+            let mut paths = Vec::new();
+            for path in args
+                .get("paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                match workspace_path(cwd, path) {
+                    Ok(path) => paths.push(path),
+                    Err(error) => return json!({ "error": error }),
+                }
+            }
+            if paths.is_empty() {
+                return json!({ "error": "checkpoint create requires paths" });
+            }
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("manual");
+            match create_checkpoint(cwd, name, &paths) {
+                Ok(meta) => meta,
+                Err(error) => json!({ "error": error.to_string() }),
+            }
+        }
+        "list" => match list_checkpoints(cwd) {
+            Ok(items) => json!({ "checkpoints": items }),
+            Err(error) => json!({ "error": error.to_string() }),
+        },
+        "restore" => {
+            let Some(id) = args.get("id").and_then(Value::as_str) else {
+                return json!({ "error": "checkpoint restore requires id" });
+            };
+            match restore_checkpoint(cwd, id, state) {
+                Ok(value) => value,
+                Err(error) => json!({ "error": error.to_string() }),
+            }
+        }
+        _ => json!({ "error": "checkpoint action must be create, list, or restore" }),
+    }
+}
+
+pub(crate) fn image_mime(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn decode_text_bytes(bytes: &[u8]) -> Option<(String, &'static str)> {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return decode_utf16(&bytes[2..], true).map(|text| (text, "utf-16le"));
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        return decode_utf16(&bytes[2..], false).map(|text| (text, "utf-16be"));
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    String::from_utf8(bytes.to_vec())
+        .ok()
+        .map(|text| (text, "utf-8"))
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes(*chunk)
+            } else {
+                u16::from_be_bytes(*chunk)
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
+}
+
+fn symbol_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let prefixes = [
+        "fn ",
+        "pub fn ",
+        "struct ",
+        "pub struct ",
+        "enum ",
+        "pub enum ",
+        "trait ",
+        "pub trait ",
+        "impl ",
+        "func ",
+        "type ",
+        "class ",
+        "export function ",
+        "function ",
+        "export class ",
+    ];
+    prefixes
+        .iter()
+        .find(|prefix| trimmed.starts_with(**prefix))
+        .map(|_| trimmed.trim_end().to_string())
+}
+
+fn normalize_path_key(path: &Path) -> String {
+    let value = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
+fn file_fingerprint(path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// The error for an edit to a file this agent has not read, or whose content
+/// changed since it last read it; None when the edit may proceed.
+fn unread_or_stale_error(state: &ToolState, path: &Path, not_read: &str) -> Option<Value> {
+    let error = match state.read_check(path) {
+        ReadCheck::Fresh => return None,
+        ReadCheck::NotRead => not_read,
+        ReadCheck::Stale => "file changed on disk since you last read it (another agent, the user, or a command modified it); read it again and redo the edit against the current content",
+    };
+    Some(json!({ "path": path.display().to_string(), "error": error }))
+}
+
+/// Per-engine tool state. One per engine (shared with its subagents), so
+/// several engines in one process never see each other's background shell
+/// sessions started by `bash`: `write_stdin` may only reach the engine's own.
+///
+/// `reads` is per agent (`for_subagent` starts a fresh one): the content
+/// fingerprint of each file as this agent last read or wrote it. Editing an
+/// existing file requires having read it, and fails once anyone else (another
+/// agent, the user, a command) has changed it since — so parallel agents in
+/// one tree cannot silently overwrite each other.
+#[derive(Clone, Default)]
+pub struct ToolState {
+    inner: Arc<Mutex<ToolStateInner>>,
+    reads: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+enum ReadCheck {
+    Fresh,
+    NotRead,
+    Stale,
+}
+
+#[derive(Default)]
+struct ToolStateInner {
+    shells: HashSet<u64>,
+    /// When set, shell commands run in this OS sandbox and file writes are
+    /// checked against it.
+    sandbox: Option<crate::sandbox::SandboxPolicy>,
+    /// Gateway settings for the web tools; None fetches locally and leaves
+    /// web_search unavailable.
+    web: Option<crate::web::WebTools>,
+    /// Endpoint and model for generate_image, or why it is unavailable;
+    /// None until the engine configures it.
+    images: Option<Result<crate::images::ImageTools, String>>,
+    /// Messages for the session from work that outlived its tool call (an
+    /// interrupted generate_image saving its result), drained into Info events.
+    notices: Vec<String>,
+    /// Runs the session tools (`user_tools::SESSION_TOOLS`); only the daemon
+    /// sets it, and they are offered only then.
+    host: Option<HostTools>,
+    /// The app tools (`user_tools::NAMES`) the user turned off.
+    app_tools_off: Vec<&'static str>,
+}
+
+/// The daemon's handler for the session tools: (tool name, arguments) →
+/// output or error. It may block until the answer is in (`wait_session`).
+pub type HostTools = Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
+
+impl Drop for ToolStateInner {
+    /// The engine owning these background shells is gone (a daemon session
+    /// closed, say): end them rather than leave them running unattended.
+    fn drop(&mut self) {
+        if self.shells.is_empty() {
+            return;
+        }
+        let Ok(mut sessions) = shell_sessions().lock() else {
+            return;
+        };
+        for id in self.shells.drain() {
+            if let Some(mut session) = sessions.remove(&id) {
+                kill_child(&mut session.child);
+                let _ = fs::remove_file(&session.stdout_path);
+                let _ = fs::remove_file(&session.stderr_path);
+            }
+        }
+    }
+}
+
+impl ToolState {
+    pub fn set_sandbox(&self, sandbox: Option<crate::sandbox::SandboxPolicy>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sandbox = sandbox;
+        }
+    }
+
+    pub fn sandbox(&self) -> Option<crate::sandbox::SandboxPolicy> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.sandbox.clone())
+    }
+
+    pub fn set_web(&self, web: Option<crate::web::WebTools>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.web = web;
+        }
+    }
+
+    pub fn web(&self) -> Option<crate::web::WebTools> {
+        self.inner.lock().ok().and_then(|inner| inner.web.clone())
+    }
+
+    /// web_search runs through the gateway, so it needs a JuCode session.
+    pub fn web_search_enabled(&self) -> bool {
+        self.web().is_some_and(|web| web.signed_in)
+    }
+
+    pub(crate) fn set_images(&self, images: Result<crate::images::ImageTools, String>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.images = Some(images);
+        }
+    }
+
+    /// generate_image's settings, or the reason it is not offered.
+    pub(crate) fn images(&self) -> Result<crate::images::ImageTools, String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.images.clone())
+            .unwrap_or_else(|| Err(crate::images::UNAVAILABLE.to_string()))
+    }
+
+    pub fn set_host(&self, host: HostTools) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.host = Some(host);
+        }
+    }
+
+    pub(crate) fn host(&self) -> Option<HostTools> {
+        self.inner.lock().ok().and_then(|inner| inner.host.clone())
+    }
+
+    pub fn set_app_tools_off(&self, off: Vec<&'static str>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.app_tools_off = off;
+        }
+    }
+
+    /// Whether the user turned app tool `name` off.
+    pub(crate) fn app_tool_off(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.app_tools_off.contains(&name))
+    }
+
+    pub(crate) fn push_notice(&self, notice: String) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.notices.push(notice);
+        }
+    }
+
+    pub(crate) fn take_notices(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|mut inner| std::mem::take(&mut inner.notices))
+            .unwrap_or_default()
+    }
+
+    /// The same engine state with an empty read record, for a subagent: it
+    /// must read files itself before editing them.
+    pub(crate) fn for_subagent(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            reads: Arc::default(),
+        }
+    }
+
+    fn mark_read(&self, path: &Path) {
+        let key = normalize_path_key(path);
+        let fingerprint = file_fingerprint(path);
+        if let Ok(mut reads) = self.reads.lock() {
+            match fingerprint {
+                Some(fingerprint) => reads.insert(key, fingerprint),
+                None => reads.remove(&key),
+            };
+        }
+    }
+
+    fn read_check(&self, path: &Path) -> ReadCheck {
+        let recorded = self
+            .reads
+            .lock()
+            .ok()
+            .and_then(|reads| reads.get(&normalize_path_key(path)).copied());
+        match recorded {
+            None => ReadCheck::NotRead,
+            Some(recorded) if file_fingerprint(path) == Some(recorded) => ReadCheck::Fresh,
+            Some(_) => ReadCheck::Stale,
+        }
+    }
+
+    fn own_shell(&self, session_id: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.shells.insert(session_id);
+        }
+    }
+
+    /// A background shell of this engine's is still running (one past its
+    /// timeout is not: the next poll ends it).
+    pub fn has_running_shell(&self) -> bool {
+        let owned: Vec<u64> = match self.inner.lock() {
+            Ok(inner) => inner.shells.iter().copied().collect(),
+            Err(_) => return false,
+        };
+        if owned.is_empty() {
+            return false;
+        }
+        let Ok(mut sessions) = shell_sessions().lock() else {
+            return false;
+        };
+        owned.iter().any(|id| {
+            sessions.get_mut(id).is_some_and(|session| {
+                session.started.elapsed().unwrap_or_default() < session.timeout
+                    && matches!(session.child.try_wait(), Ok(None))
+            })
+        })
+    }
+
+    fn owns_shell(&self, session_id: u64) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.shells.contains(&session_id))
+            .unwrap_or(false)
+    }
+}
+
+/// Files referenced by a unified diff's `---`/`+++` headers, for pre-apply
+/// snapshotting. `/dev/null` (creations/deletions) is skipped on its own line
+/// but the counterpart path is kept, so created and deleted files are captured.
+fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("+++ "))
+        else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest == "/dev/null" {
+            continue;
+        }
+        let rel = rest
+            .strip_prefix("a/")
+            .or_else(|| rest.strip_prefix("b/"))
+            .unwrap_or(rest);
+        let abs = resolve_path(cwd, rel);
+        if !paths.contains(&abs) {
+            paths.push(abs);
+        }
+    }
+    paths
+}
+
+pub(crate) fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Value> {
+    let id = format!("cp-{}", now_nanos());
+    let mut files = Vec::new();
+    let mut bytes = 0usize;
+    for path in paths {
+        let abs = resolve_existing_or_future(cwd, path);
+        if !is_inside(cwd, &abs) {
+            continue;
+        }
+        let rel = diff_label(cwd, &abs);
+        let content = match fs::read_to_string(&abs) {
+            Ok(content) => {
+                bytes += content.len();
+                Value::String(content)
+            }
+            // Existing but unreadable (e.g. non-UTF-8): mark it so restore
+            // skips it instead of misreading null as "did not exist yet".
+            Err(_) if abs.exists() => json!({ "unreadable": true }),
+            Err(_) => Value::Null,
+        };
+        files.push(json!({ "path": rel, "content": content }));
+    }
+    let checkpoint = json!({
+        "id": id,
+        "name": name,
+        "created_at": now_secs(),
+        "files": files,
+        "bytes": bytes,
+    });
+    let dir = checkpoint_dir(cwd);
+    fs::create_dir_all(&dir)?;
+    // Keep .jucode out of the user's git history.
+    let ignore = cwd.join(".jucode").join(".gitignore");
+    if !ignore.exists() {
+        let _ = fs::write(&ignore, "*\n");
+    }
+    fs::write(
+        dir.join(format!("{id}.json")),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&checkpoint).map_err(io::Error::other)?
+        ),
+    )?;
+    prune_checkpoints(&dir);
+    Ok(json!({
+        "id": id,
+        "name": name,
+        "files": checkpoint["files"].as_array().map(Vec::len).unwrap_or(0),
+        "bytes": bytes,
+    }))
+}
+
+/// Bound checkpoint disk use: keep the newest checkpoints within both a count
+/// and a total-size budget, deleting the oldest beyond either limit.
+const MAX_CHECKPOINTS: usize = 200;
+const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn prune_checkpoints(dir: &Path) {
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(u128, PathBuf, u64)> = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let nanos = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("cp-"))
+            .and_then(|n| n.parse::<u128>().ok())
+            .unwrap_or(0);
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        files.push((nanos, path, size));
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.0)); // newest first
+    let mut kept = 0usize;
+    let mut bytes = 0u64;
+    for (_, path, size) in files {
+        kept += 1;
+        bytes = bytes.saturating_add(size);
+        if kept > MAX_CHECKPOINTS || bytes > MAX_CHECKPOINT_BYTES {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
+    let dir = checkpoint_dir(cwd);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        items.push(json!({
+            "id": value.get("id").cloned().unwrap_or_default(),
+            "name": value.get("name").cloned().unwrap_or_default(),
+            "created_at": value.get("created_at").cloned().unwrap_or_default(),
+            "files": value.get("files").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+            "bytes": value.get("bytes").cloned().unwrap_or_default(),
+        }));
+    }
+    items.sort_by_key(|item| item.get("created_at").and_then(Value::as_u64).unwrap_or(0));
+    items.reverse();
+    Ok(items)
+}
+
+pub(crate) fn restore_checkpoint(cwd: &Path, id: &str, state: &ToolState) -> io::Result<Value> {
+    let path = checkpoint_dir(cwd).join(format!("{id}.json"));
+    let value =
+        serde_json::from_str::<Value>(&fs::read_to_string(path)?).map_err(io::Error::other)?;
+    let mut restored = Vec::new();
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+    for file in value
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(rel) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let abs = resolve_path(cwd, rel);
+        if !is_inside(cwd, &abs) {
+            continue;
+        }
+        let content = file.get("content").unwrap_or(&Value::Null);
+        if let Some(content) = content.as_str() {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&abs, content)?;
+            state.mark_read(&abs);
+            restored.push(rel.to_string());
+        } else if content.is_null() {
+            if abs.exists() {
+                fs::remove_file(&abs)?;
+                removed.push(rel.to_string());
+            }
+        } else {
+            // Unreadable at checkpoint time: never delete, just report it.
+            skipped.push(rel.to_string());
+        }
+    }
+    let mut result = json!({ "id": id, "restored": restored, "removed": removed });
+    if !skipped.is_empty() {
+        result["skipped"] = json!(skipped);
+        result["warning"] =
+            json!("some files could not be captured at checkpoint time and were left untouched");
+    }
+    Ok(result)
+}
+
+/// Reconstruct the working tree as of `t` (a turn's creation time): for every
+/// file touched at or after `t`, restore the content captured by the earliest
+/// such checkpoint (its pre-edit state), and delete files that did not yet
+/// exist then. Checkpoints are ordered by their nanosecond id for precision.
+pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, state: &ToolState) -> io::Result<Value> {
+    let dir = checkpoint_dir(cwd);
+    if !dir.exists() {
+        return Ok(json!({ "restored": [], "removed": [] }));
+    }
+    let mut snaps: Vec<(u128, Value)> = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let created = value.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+        if created < t {
+            continue;
+        }
+        let nanos = value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.strip_prefix("cp-"))
+            .and_then(|n| n.parse::<u128>().ok())
+            .unwrap_or(0);
+        if let Some(files) = value.get("files").cloned() {
+            snaps.push((nanos, files));
+        }
+    }
+    snaps.sort_by_key(|(nanos, _)| *nanos);
+
+    let mut earliest: HashMap<String, Value> = HashMap::new();
+    for (_, files) in &snaps {
+        for file in files.as_array().into_iter().flatten() {
+            let Some(rel) = file.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            earliest
+                .entry(rel.to_string())
+                .or_insert_with(|| file.get("content").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    let mut restored = Vec::new();
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+    for (rel, content) in earliest {
+        let abs = resolve_path(cwd, &rel);
+        if !is_inside(cwd, &abs) {
+            continue;
+        }
+        if let Some(text) = content.as_str() {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&abs, text)?;
+            state.mark_read(&abs);
+            restored.push(rel);
+        } else if content.is_null() {
+            if abs.exists() {
+                fs::remove_file(&abs)?;
+                removed.push(rel);
+            }
+        } else {
+            // Unreadable at checkpoint time: never delete, just report it.
+            skipped.push(rel);
+        }
+    }
+    let mut result = json!({ "restored": restored, "removed": removed });
+    if !skipped.is_empty() {
+        result["skipped"] = json!(skipped);
+        result["warning"] =
+            json!("some files could not be captured at checkpoint time and were left untouched");
+    }
+    Ok(result)
+}
+
+fn checkpoint_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".jucode").join("checkpoints")
+}
+
+fn resolve_existing_or_future(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn is_inside(root: &Path, path: &Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    path == root || path.starts_with(root)
+}
+
+#[derive(Clone)]
+struct CommandResult {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+    truncated: bool,
+}
+
+fn run_command(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<CommandResult, String> {
+    run_command_events(program, args, None, cwd, timeout, &mut |_| Ok(()))
+}
+
+fn run_command_events(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&str>,
+    cwd: &Path,
+    timeout: Duration,
+    emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
+) -> Result<CommandResult, String> {
+    let stdout_path = temp_output_path("stdout");
+    let stderr_path = temp_output_path("stderr");
+    let stdout_file = File::create(&stdout_path).map_err(|error| error.to_string())?;
+    let stderr_file = File::create(&stderr_path).map_err(|error| error.to_string())?;
+
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start {program}: {error}"))?;
+    track_process_group(child.id());
+
+    if let Some(input) = stdin {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            child_stdin
+                .write_all(input.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    let started = SystemTime::now();
+    let mut last_update = started;
+    let mut timed_out = false;
+    if let Err(error) = emit(ToolExecutionEvent::Update(format!(
+        "started: {}",
+        command_display(program, args)
+    ))) {
+        abort_command(&mut child, &stdout_path, &stderr_path);
+        return Err(error);
+    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => {
+                abort_command(&mut child, &stdout_path, &stderr_path);
+                return Err(error.to_string());
+            }
+        }
+
+        if started.elapsed().unwrap_or_default() >= timeout {
+            timed_out = true;
+            kill_child(&mut child);
+            break;
+        }
+        if last_update.elapsed().unwrap_or_default() >= COMMAND_UPDATE_INTERVAL {
+            let (stdout, stdout_truncated) = read_output_file(&stdout_path);
+            let (stderr, stderr_truncated) = read_output_file(&stderr_path);
+            if let Err(error) = emit(ToolExecutionEvent::Update(command_update_text(
+                &stdout,
+                &stderr,
+                stdout_truncated || stderr_truncated,
+                started.elapsed().unwrap_or_default(),
+            ))) {
+                abort_command(&mut child, &stdout_path, &stderr_path);
+                return Err(error);
+            }
+            last_update = SystemTime::now();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let status = child.wait().ok();
+    let (stdout, stdout_truncated) = read_output_file(&stdout_path);
+    let (stderr, stderr_truncated) = read_output_file(&stderr_path);
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+
+    Ok(CommandResult {
+        exit_code: status.as_ref().and_then(|status| status.code()),
+        signal: status.as_ref().and_then(status_signal),
+        stdout,
+        stderr,
+        timed_out,
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+fn command_result_json(command: &str, result: Result<CommandResult, String>) -> Value {
+    let mut value = match result {
+        Ok(result) => {
+            let mut value = json!({
+                "command": command,
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "timed_out": result.timed_out,
+                "truncated": result.truncated,
+            });
+            // A missing exit code outside the timeout path means the command
+            // was killed; report it as an error instead of a silent success.
+            if result.exit_code.is_none() && !result.timed_out {
+                value["error"] = json!(match result.signal {
+                    Some(signal) => format!("command terminated by signal {signal}"),
+                    None => "command terminated without an exit code".to_string(),
+                });
+            }
+            value
+        }
+        Err(error) => json!({ "command": command, "error": error }),
+    };
+    add_command_soft_hint(&mut value);
+    value
+}
+
+fn add_command_soft_hint(value: &mut Value) {
+    let stdout = value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr = value
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let output_bytes = stdout.len().saturating_add(stderr.len());
+    let output_lines = stdout
+        .lines()
+        .count()
+        .saturating_add(stderr.lines().count());
+    if value
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        add_soft_hint(
+            value,
+            "command timed out",
+            "Inspect partial output, narrow the command, or rerun with a longer timeout only if the full command is necessary. In the sandbox, a program that writes outside the writable directories (a browser's profile under ~/Library, for example) can hang: rerun it with escalate.",
+        );
+    } else if value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        add_soft_hint(
+            value,
+            "command output was truncated",
+            "Rerun with a narrower command, redirect detailed output to a file, or inspect the referenced full output if provided.",
+        );
+    } else if output_bytes > COMMAND_OUTPUT_MAX_BYTES || output_lines > COMMAND_OUTPUT_MAX_LINES {
+        add_soft_hint(
+            value,
+            "large command output",
+            "Prefer a narrower command with paths, globs, grep/head/tail, or tool-native limits before requesting more output.",
+        );
+    }
+}
+
+pub(crate) fn unified_diff_for_file(
+    cwd: &Path,
+    path: &Path,
+    original: &str,
+    updated: &str,
+) -> Option<String> {
+    if original == updated {
+        return None;
+    }
+
+    let old_path = temp_output_path("diff-old");
+    let new_path = temp_output_path("diff-new");
+    if fs::write(&old_path, original).is_err() || fs::write(&new_path, updated).is_err() {
+        let _ = fs::remove_file(old_path);
+        let _ = fs::remove_file(new_path);
+        return None;
+    }
+
+    let label = diff_label(cwd, path);
+    let old_arg = old_path.display().to_string();
+    let new_arg = new_path.display().to_string();
+    let result = run_command(
+        "git",
+        &[
+            "diff",
+            "--no-index",
+            "--no-ext-diff",
+            "--",
+            &old_arg,
+            &new_arg,
+        ],
+        cwd,
+        Duration::from_secs(30),
+    );
+    let _ = fs::remove_file(old_path);
+    let _ = fs::remove_file(new_path);
+
+    if let Ok(result) = result {
+        if !result.stdout.trim().is_empty() {
+            return Some(relabel_no_index_diff(&result.stdout, &label));
+        }
+    }
+    Some(simple_unified_diff(&label, original, updated))
+}
+
+/// The working tree's changes against the index as a unified diff,
+/// untracked files included; `path` limits it to one file or directory.
+pub fn git_diff(cwd: &Path, path: Option<&Path>) -> Result<String, String> {
+    if path.is_some_and(|path| is_internal_tool_path(cwd, path)) {
+        return Ok(String::new());
+    }
+    let result = if let Some(path) = path {
+        let path_arg = diff_path_arg(cwd, path);
+        run_command(
+            "git",
+            &["diff", "--no-ext-diff", "--", &path_arg],
+            cwd,
+            Duration::from_secs(30),
+        )
+    } else {
+        run_command(
+            "git",
+            &["diff", "--no-ext-diff"],
+            cwd,
+            Duration::from_secs(30),
+        )
+    };
+
+    let result = result?;
+    if result.exit_code != Some(0) {
+        return Err(command_failure_message("git diff", &result));
+    }
+
+    let mut chunks = Vec::new();
+    let tracked_diff = filter_internal_diff_sections(&result.stdout);
+    if !tracked_diff.trim().is_empty() {
+        chunks.push(tracked_diff);
+    }
+    for path in git_untracked_paths(cwd, path)? {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Some(diff) = unified_diff_for_file(cwd, &path, "", &content) {
+                chunks.push(diff);
+            }
+        }
+    }
+    Ok(chunks.join("\n"))
+}
+
+fn git_untracked_paths(cwd: &Path, path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
+    if path.is_some_and(|path| is_internal_tool_path(cwd, path)) {
+        return Ok(Vec::new());
+    }
+    let path_arg = path.map(|path| diff_path_arg(cwd, path));
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "--"];
+    if let Some(path_arg) = path_arg.as_deref() {
+        args.push(path_arg);
+    }
+    let result = run_command("git", &args, cwd, Duration::from_secs(30))?;
+    if result.exit_code != Some(0) {
+        return Err(command_failure_message("git ls-files", &result));
+    }
+    Ok(result
+        .stdout
+        .lines()
+        .map(|line| cwd.join(line))
+        .filter(|path| path.is_file())
+        .filter(|path| !is_internal_tool_path(cwd, path))
+        .collect())
+}
+
+fn filter_internal_diff_sections(diff: &str) -> String {
+    let mut output = String::new();
+    let mut section = String::new();
+    let mut keep_section = true;
+    let mut saw_header = false;
+
+    for line in diff.split_inclusive('\n') {
+        let bare = line.trim_end_matches('\n');
+        if bare.starts_with("diff --git ") {
+            if keep_section {
+                output.push_str(&section);
+            }
+            section.clear();
+            saw_header = true;
+            keep_section = !diff_header_is_internal(bare);
+        }
+        section.push_str(line);
+    }
+    if keep_section {
+        output.push_str(&section);
+    }
+    if saw_header {
+        output
+    } else {
+        diff.to_string()
+    }
+}
+
+fn diff_header_is_internal(line: &str) -> bool {
+    line.split_whitespace().skip(2).any(|path| {
+        let path = strip_diff_prefix(path);
+        path == ".jucode" || path.starts_with(".jucode/")
+    })
+}
+
+fn is_internal_tool_path(cwd: &Path, path: &Path) -> bool {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let relative = path.strip_prefix(cwd).unwrap_or(path.as_path());
+    relative
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == ".jucode")
+}
+
+fn command_failure_message(command: &str, result: &CommandResult) -> String {
+    [result.stderr.trim(), result.stdout.trim()]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{command} failed"))
+}
+
+pub(crate) fn diff_label(cwd: &Path, path: &Path) -> String {
+    path.strip_prefix(cwd)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn diff_path_arg(cwd: &Path, path: &Path) -> String {
+    path.strip_prefix(cwd).unwrap_or(path).display().to_string()
+}
+
+fn relabel_no_index_diff(diff: &str, label: &str) -> String {
+    let mut output = String::new();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            output.push_str(&format!("diff --git a/{label} b/{label}\n"));
+        } else if line.starts_with("--- ") {
+            output.push_str(&format!("--- a/{label}\n"));
+        } else if line.starts_with("+++ ") {
+            output.push_str(&format!("+++ b/{label}\n"));
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn simple_unified_diff(label: &str, original: &str, updated: &str) -> String {
+    let old_lines = original.lines().collect::<Vec<_>>();
+    let new_lines = updated.lines().collect::<Vec<_>>();
+    let mut diff = format!(
+        "diff --git a/{label} b/{label}\n--- a/{label}\n+++ b/{label}\n@@ -1,{} +1,{} @@\n",
+        old_lines.len(),
+        new_lines.len()
+    );
+    for op in line_diff_ops(&old_lines, &new_lines) {
+        let (prefix, line) = match op {
+            DiffOp::Context(line) => (' ', line),
+            DiffOp::Remove(line) => ('-', line),
+            DiffOp::Add(line) => ('+', line),
+        };
+        diff.push(prefix);
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
+}
+
+enum DiffOp<'a> {
+    Context(&'a str),
+    Remove(&'a str),
+    Add(&'a str),
+}
+
+fn line_diff_ops<'a>(old_lines: &[&'a str], new_lines: &[&'a str]) -> Vec<DiffOp<'a>> {
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < old_lines.len().saturating_sub(prefix)
+        && suffix < new_lines.len().saturating_sub(prefix)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_mid = &old_lines[prefix..old_lines.len() - suffix];
+    let new_mid = &new_lines[prefix..new_lines.len() - suffix];
+    let mut ops = Vec::new();
+    ops.extend(old_lines[..prefix].iter().copied().map(DiffOp::Context));
+    ops.extend(line_diff_middle(old_mid, new_mid));
+    ops.extend(
+        old_lines[old_lines.len() - suffix..]
+            .iter()
+            .copied()
+            .map(DiffOp::Context),
+    );
+    ops
+}
+
+fn line_diff_middle<'a>(old_lines: &[&'a str], new_lines: &[&'a str]) -> Vec<DiffOp<'a>> {
+    if old_lines.is_empty() {
+        return new_lines.iter().copied().map(DiffOp::Add).collect();
+    }
+    if new_lines.is_empty() {
+        return old_lines.iter().copied().map(DiffOp::Remove).collect();
+    }
+
+    let cols = new_lines.len() + 1;
+    let mut lcs = vec![0usize; (old_lines.len() + 1) * cols];
+    for old_index in (0..old_lines.len()).rev() {
+        for new_index in (0..new_lines.len()).rev() {
+            let index = old_index * cols + new_index;
+            lcs[index] = if old_lines[old_index] == new_lines[new_index] {
+                lcs[(old_index + 1) * cols + new_index + 1] + 1
+            } else {
+                lcs[(old_index + 1) * cols + new_index].max(lcs[old_index * cols + new_index + 1])
+            };
+        }
+    }
+
+    let mut ops = Vec::new();
+    let mut old_index = 0usize;
+    let mut new_index = 0usize;
+    while old_index < old_lines.len() && new_index < new_lines.len() {
+        if old_lines[old_index] == new_lines[new_index] {
+            ops.push(DiffOp::Context(old_lines[old_index]));
+            old_index += 1;
+            new_index += 1;
+        } else if lcs[(old_index + 1) * cols + new_index] >= lcs[old_index * cols + new_index + 1] {
+            ops.push(DiffOp::Remove(old_lines[old_index]));
+            old_index += 1;
+        } else {
+            ops.push(DiffOp::Add(new_lines[new_index]));
+            new_index += 1;
+        }
+    }
+    ops.extend(old_lines[old_index..].iter().copied().map(DiffOp::Remove));
+    ops.extend(new_lines[new_index..].iter().copied().map(DiffOp::Add));
+    ops
+}
+
+fn command_display(program: &str, args: &[&str]) -> String {
+    let mut parts = vec![program.to_string()];
+    parts.extend(args.iter().map(|arg| arg.to_string()));
+    parts.join(" ")
+}
+
+fn command_update_text(stdout: &str, stderr: &str, truncated: bool, elapsed: Duration) -> String {
+    let mut lines = vec![format!("running {:.1}s", elapsed.as_secs_f32())];
+    if !stdout.is_empty() {
+        lines.push(format!("stdout:\n{}", tail_lines(stdout, 8)));
+    }
+    if !stderr.is_empty() {
+        lines.push(format!("stderr:\n{}", tail_lines(stderr, 8)));
+    }
+    if truncated {
+        lines.push("output truncated".to_string());
+    }
+    lines.join("\n")
+}
+
+fn tail_lines(text: &str, limit: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(limit);
+    lines[start..].join("\n")
+}
+
+fn read_output_file(path: &Path) -> (String, bool) {
+    let Ok(bytes) = fs::read(path) else {
+        return (String::new(), false);
+    };
+    truncate_command_output(&String::from_utf8_lossy(&bytes))
+}
+
+fn truncate_command_output(text: &str) -> (String, bool) {
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    let line_start = lines.len().saturating_sub(COMMAND_OUTPUT_MAX_LINES);
+    let mut output = lines[line_start..].concat();
+
+    let mut omitted_lines = line_start;
+    let mut omitted_bytes = text.len().saturating_sub(output.len());
+    if output.len() > COMMAND_OUTPUT_MAX_BYTES {
+        let keep_width = safe_boundary_rev(&output, COMMAND_OUTPUT_MAX_BYTES);
+        let keep_start = output.len() - keep_width;
+        omitted_bytes += keep_start;
+        omitted_lines += output[..keep_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        output = output[keep_start..].to_string();
+    }
+
+    if omitted_lines == 0 && omitted_bytes == 0 {
+        return (output, false);
+    }
+
+    (
+        format!(
+            "[...command output truncated: omitted {omitted_lines} earlier lines and {omitted_bytes} bytes...]\n{output}"
+        ),
+        true,
+    )
+}
+
+fn shell_command(command: &str) -> (&'static str, Vec<&str>) {
+    if cfg!(windows) {
+        ("powershell", vec!["-NoProfile", "-Command", command])
+    } else {
+        ("sh", vec!["-lc", command])
+    }
+}
+
+fn temp_output_path(label: &str) -> PathBuf {
+    // The counter keeps names unique across threads: the clock alone repeats
+    // when two tool calls (or two hosted sessions) ask in the same tick.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    env::temp_dir().join(format!(
+        "jucode-tool-{label}-{}-{}-{}.log",
+        std::process::id(),
+        now_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    Ok(optional_u64(args, key)?.and_then(|value| usize::try_from(value).ok()))
+}
+
+/// `Ok(None)` when the key is absent or null. Accepts integer-valued floats
+/// (e.g. 30.0); anything else is a descriptive error instead of a silent default.
+pub(crate) fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(number) = value.as_u64() {
+        return Ok(Some(number));
+    }
+    if let Some(number) = value.as_f64() {
+        if number >= 0.0 && number.fract() == 0.0 && number <= u64::MAX as f64 {
+            return Ok(Some(number as u64));
+        }
+    }
+    Err(format!("{key} must be a non-negative integer, got {value}"))
+}
+
+pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
+    let path = expand_tilde(path);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// Resolve `path` and enforce the workspace path policy: file tools only
+/// operate on paths inside the workspace root (`cwd`). This is a permission
+/// policy (resolve + prefix check), not an OS sandbox — shell commands are
+/// intentionally not gated. Symlinks in the existing part of the path are
+/// resolved before the check, so a symlink pointing outside the workspace is
+/// rejected too.
+/// Where a mutating file tool may write: the workspace, or one of the
+/// sandbox's read-write directories, and never where the sandbox forbids.
+pub(crate) fn write_target(cwd: &Path, path: &str, state: &ToolState) -> Result<PathBuf, String> {
+    let sandbox = state.sandbox();
+    let resolved = resolve_path(cwd, path);
+    let target = match &sandbox {
+        Some(sandbox) if sandbox.in_writable_dir(&resolved) => resolved,
+        _ => workspace_path(cwd, path)?,
+    };
+    if let Some(sandbox) = sandbox {
+        sandbox.check_write(cwd, &target)?;
+    }
+    Ok(target)
+}
+
+pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
+    let resolved = resolve_path(cwd, path);
+    ensure_in_workspace(cwd, &resolved)?;
+    Ok(resolved)
+}
+
+/// Workspace path policy for read-only file tools: the workspace plus any
+/// `extra_roots` (discovered skill directories, so a skill's relative
+/// references resolve). Returns the workspace error unchanged when the path
+/// is under neither.
+pub(crate) fn readable_path(
+    cwd: &Path,
+    path: &str,
+    extra_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let resolved = resolve_path(cwd, path);
+    match ensure_in_workspace(cwd, &resolved) {
+        Ok(()) => Ok(resolved),
+        Err(workspace_error) => {
+            let normalized = normalize_for_policy(&resolved);
+            if extra_roots.iter().any(|root| {
+                root.canonicalize()
+                    .map(|root| normalized == root || normalized.starts_with(&root))
+                    .unwrap_or(false)
+            }) {
+                Ok(resolved)
+            } else {
+                Err(workspace_error)
+            }
+        }
+    }
+}
+
+/// Errors when `resolved` escapes the workspace root after resolving
+/// symlinks in its existing prefix and `.`/`..` components lexically in the
+/// (necessarily symlink-free) non-existent remainder.
+pub(crate) fn ensure_in_workspace(cwd: &Path, resolved: &Path) -> Result<(), String> {
+    let workspace = cwd.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve the workspace root {}: {error}",
+            cwd.display()
+        )
+    })?;
+    let normalized = normalize_for_policy(resolved);
+    if normalized == workspace || normalized.starts_with(&workspace) {
+        Ok(())
+    } else {
+        Err(format!(
+            "path escapes the workspace: {} resolves outside {}. File tools only operate on paths inside the workspace.",
+            resolved.display(),
+            workspace.display()
+        ))
+    }
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` (resolving symlinks
+/// and `..`), then applies the remaining non-existent components lexically.
+fn normalize_for_policy(path: &Path) -> PathBuf {
+    let (base, remainder) = deepest_canonical_ancestor(path);
+    let mut normalized = base;
+    for component in remainder.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            // CurDir is dropped; RootDir/Prefix cannot appear in a stripped
+            // remainder.
+            _ => {}
+        }
+    }
+    normalized
+}
+
+fn deepest_canonical_ancestor(path: &Path) -> (PathBuf, PathBuf) {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            let remainder = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
+            return (canonical, remainder.to_path_buf());
+        }
+    }
+    (path.to_path_buf(), PathBuf::new())
+}
+
+/// Checks whether a mutating tool call targets a path outside `root` (used to
+/// confine subagent writes to their isolated workspace). Returns a description
+/// of the violation, or None when the call is allowed. Read-only tools and
+/// tools without static path arguments (bash) always pass; bash isolation
+/// relies on the workspace being the child's cwd plus approval gating.
+pub(crate) fn write_target_escapes_root(
+    name: &str,
+    arguments: &str,
+    cwd: &Path,
+    root: &Path,
+) -> Option<String> {
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    match name {
+        "write" | "str_replace" | "edit" | "hashline_edit" | crate::images::TOOL_NAME => {
+            let path = args.get("path").and_then(Value::as_str)?;
+            let resolved = normalize_lexically(&resolve_path(cwd, path));
+            if resolved.starts_with(normalize_lexically(root)) {
+                None
+            } else {
+                Some(format!("{name} targets {} outside the workspace", path))
+            }
+        }
+        "apply_patch" => {
+            let patch = args.get("patch").and_then(Value::as_str)?;
+            patch_escapes_workdir(patch)
+                .map(|path| format!("apply_patch touches {path} outside the workspace"))
+        }
+        _ => None,
+    }
+}
+
+/// Lexically resolves `.` and `..` components without touching the filesystem
+/// (targets may not exist yet). `..` at the root is kept, which can only make
+/// containment checks stricter.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// A patch applied with `git apply` in the workspace cwd can only escape via
+/// absolute paths or `..` traversal in its file headers; flag either.
+fn patch_escapes_workdir(patch: &str) -> Option<String> {
+    for line in patch.lines() {
+        let path = if let Some(rest) = line.strip_prefix("+++ ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("rename to ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("rename from ") {
+            rest
+        } else {
+            continue;
+        };
+        let path = path
+            .trim()
+            .trim_start_matches("a/")
+            .trim_start_matches("b/");
+        if path == "/dev/null" {
+            continue;
+        }
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if path != "~" && !path.starts_with("~/") {
+        return PathBuf::from(path);
+    }
+    let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let Some(home) = env::var_os(home_key) else {
+        return PathBuf::from(path);
+    };
+    let mut expanded = PathBuf::from(home);
+    if let Some(rest) = path.strip_prefix("~/") {
+        expanded.push(rest);
+    }
+    expanded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminating_a_tool_group_ends_the_command_and_its_children() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let grandchild: i32 = line.trim().parse().unwrap();
+
+        // Only this test's group: the suite runs other tool commands in
+        // parallel in this process.
+        terminate_groups(vec![child.id()]);
+
+        // SAFETY: signal 0 only probes the pid.
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(grandchild), "the command's child outlived it");
+        assert!(matches!(child.try_wait(), Err(_) | Ok(Some(_))));
+    }
+
+    #[test]
+    fn write_root_guard_blocks_targets_outside_workspace() {
+        let root = Path::new("/work/.jucode/agents/worker-1");
+
+        // Relative writes inside the workspace pass.
+        assert!(write_target_escapes_root(
+            "write",
+            &json!({ "path": "src/new.rs", "content": "x" }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+
+        // Absolute writes into the parent tree are blocked.
+        let violation = write_target_escapes_root(
+            "write",
+            &json!({ "path": "/work/src/main.rs", "content": "x" }).to_string(),
+            root,
+            root,
+        );
+        assert!(violation.unwrap().contains("outside the workspace"));
+
+        // `..` traversal out of the workspace is blocked lexically.
+        let violation = write_target_escapes_root(
+            "str_replace",
+            &json!({ "path": "../../../src/main.rs", "edits": [] }).to_string(),
+            root,
+            root,
+        );
+        assert!(violation.unwrap().contains("outside the workspace"));
+
+        // Read-only tools are never gated.
+        assert!(write_target_escapes_root(
+            "read",
+            &json!({ "path": "/work/src/main.rs" }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn write_root_guard_blocks_escaping_patches() {
+        let root = Path::new("/work/.jucode/agents/worker-1");
+        let safe = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": safe }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+
+        let absolute = "--- /work/src/lib.rs\n+++ /work/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": absolute }).to_string(),
+            root,
+            root
+        )
+        .is_some());
+
+        let traversal = "--- a/../escape.rs\n+++ b/../escape.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": traversal }).to_string(),
+            root,
+            root
+        )
+        .is_some());
+
+        let new_file = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+a\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": new_file }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn image_read_projects_note_and_builds_image_message() {
+        let output = json!({
+            "path": "/tmp/pic.png",
+            "kind": "image",
+            "mime": "image/png",
+            "bytes": 3,
+            "base64": "AAEC",
+        })
+        .to_string();
+
+        let projected = project_model_output("read", &output, Path::new("."));
+        let projected_value = serde_json::from_str::<Value>(&projected).unwrap();
+        assert!(projected_value.get("base64").is_none());
+        assert!(projected_value.get("note").is_some());
+
+        let image = image_content_item(&output).unwrap();
+        assert_eq!(image["role"], "user");
+        assert_eq!(image["content"][0]["type"], "input_image");
+        assert_eq!(
+            image["content"][0]["image_url"],
+            "data:image/png;base64,AAEC"
+        );
+    }
+
+    #[test]
+    fn non_image_read_has_no_image_message() {
+        let output = json!({ "content": "hello", "hashlines": "1#ab hello" }).to_string();
+        assert!(image_content_item(&output).is_none());
+    }
+
+    #[test]
+    fn read_supports_offset_and_limit() {
+        let dir = test_dir("read");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let result = run_tool(
+            "read",
+            &json!({ "path": path, "offset": 2, "limit": 1 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["content"], "two\n");
+        assert_eq!(value["lines_read"], 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_defaults_to_no_line_limit() {
+        let dir = test_dir("read-no-limit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        let content = (1..=550)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        fs::write(&path, &content).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["lines_read"], 550);
+        assert_eq!(value["truncated"], false);
+        assert_eq!(value["content"], content);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_warns_when_large_file_has_no_limit() {
+        let dir = test_dir("read-large-warning");
+        let path = dir.join("large.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "x".repeat(300 * 1024)).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["warning"]
+            .as_str()
+            .unwrap()
+            .contains("large file read"));
+        assert!(value["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("offset/limit"));
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bash_truncates_large_stdout() {
+        let dir = test_dir("bash-truncate");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool(
+            "bash",
+            &json!({
+                "command": "i=0; while [ $i -lt 3505 ]; do echo line-$i; i=$((i+1)); done"
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let stdout = value["stdout"].as_str().unwrap();
+
+        assert_eq!(value["truncated"], true);
+        assert!(stdout.contains("command output truncated"));
+        assert!(stdout.contains("line-3504"));
+        assert!(!stdout.contains("line-0\n"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_requires_unique_old_text() {
+        let dir = test_dir("edit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "same\nsame\n").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+
+        let result = run_tool(
+            "edit",
+            &json!({
+                "path": path,
+                "edits": [{ "oldText": "same", "newText": "next" }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["error"].as_str().unwrap().contains("exactly once"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "same\nsame\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_applies_targeted_replacement() {
+        let dir = test_dir("edit-ok");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+
+        let result = run_tool(
+            "edit",
+            &json!({
+                "path": path,
+                "edits": [{ "oldText": "beta", "newText": "gamma" }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["edits"], 1);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().replace("\r\n", "\n"),
+            "alpha\ngamma\n"
+        );
+        let diff = value["diff"].as_str().unwrap();
+        assert!(diff.contains("-beta"));
+        assert!(diff.contains("+gamma"));
+        assert!(diff.contains(" alpha"));
+        assert!(!diff.contains("-alpha"));
+        assert!(!diff.contains("+alpha"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_returns_git_style_diff() {
+        let dir = test_dir("write-diff");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "before\n").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "after\n" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["diff"].as_str().unwrap().contains("--- a/"));
+        assert!(value["diff"].as_str().unwrap().contains("+++ b/"));
+        assert!(value["diff"].as_str().unwrap().contains("-before"));
+        assert!(value["diff"].as_str().unwrap().contains("+after"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_creates_new_file_without_prior_read() {
+        let dir = test_dir("write-create");
+        let path = dir.join("src").join("main.rs");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "fn main() {}\n" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fn main() {}\n");
+        assert!(value.get("error").is_none());
+        assert!(value["diff"].as_str().unwrap().contains("+fn main() {}"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_still_requires_read_before_overwriting_existing() {
+        let dir = test_dir("write-read-first");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "before\n").unwrap();
+
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "after\n" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires reading"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_diff_returns_empty_success_for_clean_workspace() {
+        let dir = test_dir("diff-clean");
+        fs::create_dir_all(&dir).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+
+        let diff = git_diff(&dir, None).unwrap();
+
+        assert_eq!(diff, "");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_diff_includes_untracked_text_file() {
+        let dir = test_dir("diff-untracked");
+        fs::create_dir_all(&dir).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+        fs::write(dir.join("new.txt"), "hello\n").unwrap();
+
+        let diff = git_diff(&dir, Some(&dir.join("new.txt"))).unwrap();
+
+        assert!(diff.contains("new.txt"));
+        assert!(diff.contains("+hello"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_diff_excludes_jucode_internal_files() {
+        let dir = test_dir("diff-internal");
+        fs::create_dir_all(dir.join(".jucode").join("checkpoints")).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+        fs::write(
+            dir.join(".jucode").join("checkpoints").join("cp.json"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("new.txt"), "hello\n").unwrap();
+
+        let diff = git_diff(&dir, None).unwrap();
+
+        assert!(diff.contains("new.txt"));
+        assert!(!diff.contains(".jucode"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_edit_applies_anchor_replacement() {
+        let dir = test_dir("hashline-edit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let read = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let read = serde_json::from_str::<Value>(&read).unwrap();
+        let beta_anchor = read["hashlines"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find(|line| line.ends_with(":beta"))
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+
+        let result = run_tool(
+            "hashline_edit",
+            &json!({
+                "path": path,
+                "edits": [{ "op": "replace", "pos": beta_anchor, "lines": ["BETA"] }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().replace("\r\n", "\n"),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert!(value["anchors"].as_str().unwrap().contains("2#"));
+        assert!(value["diff"].as_str().unwrap().contains("-beta"));
+        assert!(value["diff"].as_str().unwrap().contains("+BETA"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_hash_matches_reference_encoding() {
+        assert_eq!(compute_line_hash(1, "alpha"), "JN");
+        assert_eq!(compute_line_hash(2, "beta"), "NK");
+        assert_eq!(compute_line_hash(3, "gamma"), "WB");
+        assert_eq!(compute_line_hash(4, ""), "RW");
+        assert_eq!(compute_line_hash(5, "  "), "BT");
+        assert_eq!(compute_line_hash(6, "{"), "KM");
+    }
+
+    #[test]
+    fn hashline_edit_rejects_stale_anchor() {
+        let dir = test_dir("hashline-stale");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        let read = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let read = serde_json::from_str::<Value>(&read).unwrap();
+        let beta_anchor = read["hashlines"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find(|line| line.ends_with(":beta"))
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+        fs::write(&path, "alpha\nchanged\n").unwrap();
+
+        let result = run_tool(
+            "hashline_edit",
+            &json!({
+                "path": path,
+                "edits": [{ "op": "replace", "pos": beta_anchor, "lines": ["BETA"] }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        // The file changed after the read, so the stale-read gate rejects the
+        // edit before the anchors are even checked.
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed on disk since you last read it"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_rejects_file_changed_since_read() {
+        let dir = test_dir("write-stale");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "original\n").unwrap();
+        run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        fs::write(&path, "someone else's change\n").unwrap();
+
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "mine\n" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed on disk since you last read it"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "someone else's change\n"
+        );
+
+        // Reading again picks up the current content and unblocks the write.
+        run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "mine\n" }).to_string(),
+            &dir,
+        );
+        assert!(serde_json::from_str::<Value>(&result).unwrap()["error"].is_null());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mine\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn subagent_tool_state_must_read_before_editing() {
+        let dir = test_dir("subagent-reads");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "original\n").unwrap();
+        let parent = ToolState::default();
+        run_tool_with_events(
+            "read",
+            &json!({ "path": path }).to_string(),
+            &dir,
+            &[],
+            &parent,
+            |_| Ok(()),
+        );
+
+        let child = parent.for_subagent();
+        let result = run_tool_with_events(
+            "write",
+            &json!({ "path": path, "content": "child\n" }).to_string(),
+            &dir,
+            &[],
+            &child,
+            |_| Ok(()),
+        );
+        assert!(
+            serde_json::from_str::<Value>(&result.output).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("requires reading an existing file first")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ls_sorts_and_marks_directories() {
+        let dir = test_dir("ls");
+        fs::create_dir_all(dir.join("b_dir")).unwrap();
+        fs::write(dir.join("a.txt"), "").unwrap();
+
+        let result = run_tool("ls", &json!({ "path": dir }).to_string(), &env::temp_dir());
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["entries"][0], "a.txt");
+        assert_eq!(value["entries"][1], "b_dir/");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ls_defaults_to_no_entry_limit() {
+        let dir = test_dir("ls-no-limit");
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..550 {
+            fs::write(dir.join(format!("{index:03}.txt")), "").unwrap();
+        }
+
+        let result = run_tool("ls", &json!({ "path": dir }).to_string(), &env::temp_dir());
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["entries"].as_array().unwrap().len(), 550);
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ripgrep_defaults_to_no_output_line_limit() {
+        let dir = test_dir("rg-no-limit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "needle\n".repeat(150)).unwrap();
+
+        let result = run_tool(
+            "ripgrep",
+            &json!({ "pattern": "needle", "path": path }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["stdout"].as_str().unwrap().lines().count(), 150);
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ripgrep_warns_when_broad_output_has_no_limit() {
+        let dir = test_dir("rg-large-warning");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "needle\n".repeat(250)).unwrap();
+
+        let result = run_tool(
+            "ripgrep",
+            &json!({ "pattern": "needle", "path": path }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["warning"]
+            .as_str()
+            .unwrap()
+            .contains("large ripgrep output"));
+        assert!(value["suggestion"].as_str().unwrap().contains("limit"));
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn definitions_expose_expected_tools() {
+        let tools = definitions();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "read",
+                "str_replace",
+                "hashline_edit",
+                "write",
+                "apply_patch",
+                "bash",
+                "exec_command",
+                "write_stdin",
+                "ls",
+                "ripgrep",
+                "outline",
+                "checkpoint",
+                "web_fetch",
+                "web_search",
+                "generate_image",
+                "present_files",
+                "propose_schedule"
+            ]
+        );
+        assert!(tools
+            .iter()
+            .all(|tool| tool.get("strict") == Some(&json!(false))));
+    }
+
+    #[test]
+    fn prompt_tool_names_match_filtered_definitions() {
+        // Mirror of the static filter OpenAiClient::tool_definitions applies:
+        // definitions() minus disabled edit tools, before the conditional
+        // subagent/dynamic additions.
+        let edit_tools = crate::config::default_edit_tools();
+        let definitions = definitions();
+        let expected = definitions
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .filter(|name| {
+                crate::config::canonical_edit_tool_name(name)
+                    .is_none_or(|canonical| edit_tools.iter().any(|tool| tool == canonical))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prompt_tool_names(&edit_tools, false, true, true), expected);
+        let without = prompt_tool_names(&edit_tools, false, false, false);
+        assert!(!without.contains(&"web_search"));
+        assert!(!without.contains(&"generate_image"));
+
+        let all = vec![
+            "str_replace".to_string(),
+            "hashline_edit".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ];
+        let names = prompt_tool_names(&all, true, false, true);
+        assert_eq!(
+            names,
+            [
+                "read",
+                "str_replace",
+                "hashline_edit",
+                "write",
+                "apply_patch",
+                "bash",
+                "exec_command",
+                "write_stdin",
+                "ls",
+                "ripgrep",
+                "outline",
+                "checkpoint",
+                "web_fetch",
+                "generate_image",
+                "present_files",
+                "propose_schedule",
+                "spawn_agent",
+                "wait_agent",
+                "list_agents",
+                "send_message",
+                "close_agent",
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_command_accepts_codex_style_cmd_and_workdir() {
+        let dir = test_dir("exec-command");
+        let subdir = dir.join("sub");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("marker.txt"), "ok").unwrap();
+        let command = if cfg!(windows) {
+            "Get-ChildItem marker.txt | Select-Object -ExpandProperty Name"
+        } else {
+            "pwd; ls marker.txt"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "workdir": "sub", "timeout": 5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("marker.txt"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exec_command_truncates_large_output() {
+        let dir = test_dir("exec-large-truncate");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "1..3500 | ForEach-Object { 'line' }"
+        } else {
+            "yes line | head -n 3500"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "timeout": 5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["truncated"], true);
+        assert!(value["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("command output truncated"));
+        assert!(value["warning"]
+            .as_str()
+            .unwrap()
+            .contains("command output was truncated"));
+        assert!(value["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("narrower command"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_accepts_workdir() {
+        let dir = test_dir("bash-workdir");
+        let subdir = dir.join("sub");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("marker.txt"), "ok").unwrap();
+        let command = if cfg!(windows) {
+            "Get-ChildItem marker.txt | Select-Object -ExpandProperty Name"
+        } else {
+            "ls marker.txt"
+        };
+
+        let result = run_tool(
+            "bash",
+            &json!({ "command": command, "workdir": "sub", "timeout": 5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("marker.txt"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_patch_applies_unified_diff() {
+        let dir = test_dir("apply-patch");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        let patch = r#"diff --git a/sample.txt b/sample.txt
+--- a/sample.txt
++++ b/sample.txt
+@@ -1,2 +1,2 @@
+ alpha
+-beta
++gamma
+"#;
+        let result = run_tool("apply_patch", &json!({ "patch": patch }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["applied"], true);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().replace("\r\n", "\n"),
+            "alpha\ngamma\n"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_emits_lifecycle_updates() {
+        let dir = test_dir("bash-updates");
+        fs::create_dir_all(&dir).unwrap();
+        let mut updates = Vec::new();
+
+        let result = run_tool_with_events(
+            "bash",
+            &json!({ "command": "echo hello", "timeout": 5 }).to_string(),
+            &dir,
+            &[],
+            &test_state(),
+            |event| {
+                let ToolExecutionEvent::Update(output) = event;
+                updates.push(output);
+                Ok(())
+            },
+        );
+        let value = serde_json::from_str::<Value>(&result.output).unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("hello"));
+        assert!(updates.iter().any(|update| update.contains("started:")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_can_yield_running_session_and_poll_it() {
+        let dir = test_dir("bash-session");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 300; Write-Output done"
+        } else {
+            "sleep 0.3; echo done"
+        };
+
+        let result = run_tool(
+            "bash",
+            &json!({ "command": command, "timeout": 5, "yield_time_ms": 1 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+        assert_eq!(value["running"], true);
+
+        let mut value = json!({ "running": true });
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            let result = run_tool(
+                "write_stdin",
+                &json!({ "session_id": session_id, "yield_time_ms": 100 }).to_string(),
+                &dir,
+            );
+            value = serde_json::from_str::<Value>(&result).unwrap();
+            if value["running"] != true {
+                break;
+            }
+        }
+
+        assert_eq!(value["exit_code"], 0, "{value}");
+        assert!(value["stdout"].as_str().unwrap().contains("done"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_stdin_accepts_codex_style_chars() {
+        let dir = test_dir("write-stdin-chars");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "$line = [Console]::In.ReadLine(); Write-Output $line"
+        } else {
+            "head -n 1"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "timeout": 5, "yield_time_ms": 1 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+
+        let mut value = json!({ "running": true });
+        for index in 0..20 {
+            let args = if index == 0 {
+                json!({ "session_id": session_id, "chars": "hello\n", "yield_time_ms": 250 })
+            } else {
+                json!({ "session_id": session_id, "yield_time_ms": 250 })
+            };
+            let result = run_tool("write_stdin", &args.to_string(), &dir);
+            value = serde_json::from_str::<Value>(&result).unwrap();
+            if value["running"] != true {
+                break;
+            }
+        }
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("hello"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_truncates_output_instead_of_returning_full_stdout() {
+        let dir = test_dir("bash-tail-limit");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "1..9000 | ForEach-Object { 'line' }"
+        } else {
+            "yes line | head -n 9000"
+        };
+
+        let result = run_tool(
+            "bash",
+            &json!({ "command": command, "timeout": 5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["truncated"], true);
+        assert!(value["stdout"].as_str().unwrap().lines().count() < 9000);
+        assert!(value["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("command output truncated"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn long_tool_result_is_projected_for_model() {
+        let dir = test_dir("tool-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let content = "x".repeat(128 * 1024);
+        let result = tool_result("test_tool", json!({ "content": content }), &dir);
+        let projected = serde_json::from_str::<Value>(&result.model_output).unwrap();
+        let full_output_path = projected["full_output_path"].as_str().unwrap();
+
+        assert_ne!(result.output, result.model_output);
+        assert!(result.model_output.contains("model_output_truncated"));
+        assert_eq!(fs::read_to_string(full_output_path).unwrap(), result.output);
+        assert!(dir.join(".jucode").join("truncated-results").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn large_edit_diff_is_summarized_for_model_output() {
+        let dir = test_dir("diff-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let diff_body = (0..700)
+            .map(|index| format!("+added line {index}\n"))
+            .collect::<String>();
+        let diff = format!(
+            "diff --git a/src/app.rs b/src/app.rs\n--- a/src/app.rs\n+++ b/src/app.rs\n@@ -0,0 +1,700 @@\n{diff_body}"
+        );
+
+        let result = tool_result(
+            "write",
+            json!({
+                "path": dir.display().to_string(),
+                "has_changes": true,
+                "diff": diff
+            }),
+            &dir,
+        );
+        let projected = serde_json::from_str::<Value>(&result.model_output).unwrap();
+        let full_output_path = projected["full_output_path"].as_str().unwrap();
+
+        assert_ne!(result.output, result.model_output);
+        assert_eq!(projected["model_output_truncated"], true);
+        assert_eq!(projected["diff_summary"]["files_changed"], 1);
+        assert_eq!(projected["diff_summary"]["additions"], 700);
+        assert!(projected["diff"].as_str().unwrap().len() < 6000);
+        assert_eq!(fs::read_to_string(full_output_path).unwrap(), result.output);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_model_output_omits_duplicate_content_but_keeps_hashlines() {
+        let dir = test_dir("read-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let content = format!("{}\n{}", "a".repeat(2048), "b".repeat(2048));
+        let hashlines = format!("1#AA:{}\n2#BB:{}", "a".repeat(2048), "b".repeat(2048));
+        let output = json!({
+            "path": "/tmp/example.py",
+            "kind": "text",
+            "content": content,
+            "hashlines": hashlines,
+            "lines_read": 2,
+            "truncated": false
+        })
+        .to_string();
+
+        let projected = serde_json::from_str::<Value>(
+            &project_read_model_output_inner("read", &output, &dir).unwrap(),
+        )
+        .unwrap();
+
+        assert!(projected.get("content").is_none());
+        assert!(projected["hashlines"].as_str().unwrap().contains("1#AA:"));
+        assert_eq!(projected["model_output_truncated"], true);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_model_output_truncates_large_hashlines_and_keeps_full_output_path() {
+        let dir = test_dir("read-hashlines-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let content = (0..600)
+            .map(|index| format!("line {index}: {}\n", "x".repeat(32)))
+            .collect::<String>();
+        let hashlines = content
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{}#AA:{line}\n", index + 1))
+            .collect::<String>();
+        let output = json!({
+            "path": "/tmp/example.py",
+            "kind": "text",
+            "content": content,
+            "hashlines": hashlines,
+            "lines_read": 600,
+            "truncated": false
+        })
+        .to_string();
+
+        let projected = serde_json::from_str::<Value>(
+            &project_read_model_output_inner("read", &output, &dir).unwrap(),
+        )
+        .unwrap();
+        let full_output_path = projected["full_output_path"].as_str().unwrap();
+
+        assert!(projected.get("content").is_none());
+        assert!(projected["hashlines"]
+            .as_str()
+            .unwrap()
+            .contains("model projection omitted"));
+        assert_eq!(fs::read_to_string(full_output_path).unwrap(), output);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_reports_image_payloads() {
+        let dir = test_dir("read-image");
+        let path = dir.join("tiny.png");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [137, 80, 78, 71]).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["kind"], "image");
+        assert_eq!(value["mime"], "image/png");
+        assert_eq!(value["base64"], "iVBORw==");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_supports_utf16_bom_text() {
+        let dir = test_dir("read-utf16");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [0xff, 0xfe, b'h', 0, b'i', 0, b'\n', 0]).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["kind"], "text");
+        assert_eq!(value["encoding"], "utf-16le");
+        assert_eq!(value["content"], "hi\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_requires_read_first() {
+        let dir = test_dir("read-before-edit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\n").unwrap();
+
+        let result = run_tool(
+            "edit",
+            &json!({ "path": path, "edits": [{ "oldText": "alpha", "newText": "beta" }] })
+                .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires reading"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_can_restore_file_content() {
+        let dir = test_dir("checkpoint");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "before\n").unwrap();
+
+        let created = run_tool(
+            "checkpoint",
+            &json!({ "action": "create", "name": "manual", "paths": [path] }).to_string(),
+            &dir,
+        );
+        let created = serde_json::from_str::<Value>(&created).unwrap();
+        fs::write(dir.join("sample.txt"), "after\n").unwrap();
+        let restored = run_tool(
+            "checkpoint",
+            &json!({ "action": "restore", "id": created["id"] }).to_string(),
+            &dir,
+        );
+        let restored = serde_json::from_str::<Value>(&restored).unwrap();
+
+        assert_eq!(restored["restored"][0], "sample.txt");
+        assert_eq!(
+            fs::read_to_string(dir.join("sample.txt")).unwrap(),
+            "before\n"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn outline_extracts_lightweight_symbols() {
+        let dir = test_dir("outline");
+        let path = dir.join("lib.rs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "pub struct App {}\nimpl App {}\npub fn run() {}\n").unwrap();
+
+        let result = run_tool("outline", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["symbols"][0]["symbol"], "pub struct App {}");
+        assert_eq!(value["symbols"][2]["symbol"], "pub fn run() {}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn write_stdin_sends_input_only_once_per_call() {
+        let dir = test_dir("write-stdin-once");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool(
+            "bash",
+            &json!({
+                "command": "while read line; do echo \"got:$line\"; done",
+                "timeout": 10,
+                "yield_time_ms": 1
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+
+        let _ = run_tool(
+            "write_stdin",
+            &json!({ "session_id": session_id, "text": "hello\n", "yield_time_ms": 500 })
+                .to_string(),
+            &dir,
+        );
+        let result = run_tool(
+            "write_stdin",
+            &json!({ "session_id": session_id, "yield_time_ms": 300 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        let stdout = value["stdout"].as_str().unwrap();
+        assert_eq!(stdout.matches("got:hello").count(), 1, "{stdout:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_edit_deletes_last_line_of_file_without_trailing_newline() {
+        let dir = test_dir("hashline-delete-last");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "a\nb\nc").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+
+        let anchor = format!("3#{}", compute_line_hash(3, "c"));
+        let result = run_tool(
+            "hashline_edit",
+            &json!({
+                "path": path,
+                "edits": [{ "op": "replace", "pos": anchor, "lines": [] }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value.get("error").is_none(), "{value}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\nb");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_restore_skips_unreadable_files_instead_of_deleting() {
+        let dir = test_dir("checkpoint-unreadable");
+        let path = dir.join("binary.bin");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [0xff, 0x00, 0x9f]).unwrap();
+
+        let created = create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
+        let id = created["id"].as_str().unwrap();
+        let restored = restore_checkpoint(&dir, id, &test_state()).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00, 0x9f]);
+        assert_eq!(restored["skipped"][0], "binary.bin");
+        assert_eq!(restored["removed"].as_array().unwrap().len(), 0);
+        assert!(restored["warning"].as_str().unwrap().contains("untouched"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_to_timestamp_skips_unreadable_files_instead_of_deleting() {
+        let dir = test_dir("restore-ts-unreadable");
+        let path = dir.join("binary.bin");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [0xff, 0x00]).unwrap();
+
+        create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
+        let restored = restore_to_timestamp(&dir, 0, &test_state()).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00]);
+        assert_eq!(restored["skipped"][0], "binary.bin");
+        assert_eq!(restored["removed"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ripgrep_accepts_pattern_starting_with_dash() {
+        let dir = test_dir("rg-dash-pattern");
+        let path = dir.join("sample.rs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "value->unwrap()\n").unwrap();
+
+        let result = run_tool(
+            "ripgrep",
+            &json!({ "pattern": "->unwrap", "path": path, "literal": true }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0, "{value}");
+        assert!(value["stdout"].as_str().unwrap().contains("->unwrap"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ripgrep_no_matches_is_success_not_error() {
+        let dir = test_dir("rg-no-match");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "haystack\n").unwrap();
+
+        let result = run_tool_with_events(
+            "ripgrep",
+            &json!({ "pattern": "definitely_not_present_xyz", "path": path }).to_string(),
+            &dir,
+            &[],
+            &test_state(),
+            |_| Ok(()),
+        );
+        let value = serde_json::from_str::<Value>(&result.output).unwrap();
+
+        assert!(!result.is_error, "{value}");
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("no matches found"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn interrupted_bash_kills_child_process() {
+        let dir = test_dir("bash-interrupt-kill");
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker.txt");
+
+        let result = run_tool_with_events(
+            "bash",
+            &json!({ "command": "sleep 0.4; echo done > marker.txt", "timeout": 10 }).to_string(),
+            &dir,
+            &[],
+            &test_state(),
+            |_| Err("interrupted".to_string()),
+        );
+
+        assert!(result.is_error);
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(!marker.exists(), "child kept running after interrupt");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Waits for `pid` to stop running. SIGKILL is delivered asynchronously, and a
+    /// process that has exited but not been reaped still answers `kill(pid, 0)`, so
+    /// a single check right after the kill can observe a survivor that is on its
+    /// way out (or already a zombie).
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if process_exited(pid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// True when `pid` is gone. A zombie counts as exited — it holds no CPU and
+    /// is only waiting to be reaped, which is the kernel's business — so on
+    /// Linux the `/proc` state is checked first. Everywhere else (no `/proc`)
+    /// the existence probe alone decides.
+    #[cfg(unix)]
+    fn process_exited(pid: i32) -> bool {
+        let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_string));
+        if matches!(state.as_deref(), Some("Z" | "X")) {
+            return true;
+        }
+        unsafe { libc::kill(pid, 0) != 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_bash_kills_process_group_descendants() {
+        let dir = test_dir("bash-interrupt-group");
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+
+        // The shell backgrounds a grandchild that keeps running after the
+        // interrupt; the group kill must take it down too. Fail on the second
+        // update so the grandchild has been spawned before the interrupt.
+        let emits = std::cell::Cell::new(0);
+        let result = run_tool_with_events(
+            "bash",
+            &json!({ "command": "sleep 30 & echo $! > grandchild.pid; wait", "timeout": 60 })
+                .to_string(),
+            &dir,
+            &[],
+            &test_state(),
+            |_| {
+                emits.set(emits.get() + 1);
+                if emits.get() == 1 {
+                    Ok(())
+                } else {
+                    Err("interrupted".to_string())
+                }
+            },
+        );
+
+        assert!(result.is_error);
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(5)),
+            "grandchild survived interrupt"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_bash_kills_process_group_descendants() {
+        let dir = test_dir("bash-timeout-group");
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+
+        let output = run_tool(
+            "bash",
+            &json!({ "command": "sleep 30 & echo $! > grandchild.pid; wait", "timeout": 1 })
+                .to_string(),
+            &dir,
+        );
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["timed_out"], true);
+
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(5)),
+            "grandchild survived timeout"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn numeric_params_accept_integer_valued_floats_and_reject_fractions() {
+        assert_eq!(optional_u64(&json!({ "x": 30.0 }), "x"), Ok(Some(30)));
+        assert_eq!(optional_u64(&json!({ "x": 7 }), "x"), Ok(Some(7)));
+        assert_eq!(optional_u64(&json!({}), "x"), Ok(None));
+        assert_eq!(optional_u64(&json!({ "x": null }), "x"), Ok(None));
+        assert!(optional_u64(&json!({ "x": 1.5 }), "x").is_err());
+        assert!(optional_u64(&json!({ "x": -1 }), "x").is_err());
+        assert!(optional_u64(&json!({ "x": "3" }), "x").is_err());
+    }
+
+    #[test]
+    fn read_accepts_float_offset_and_limit() {
+        let dir = test_dir("read-float-params");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let result = run_tool(
+            "read",
+            &json!({ "path": path, "offset": 2.0, "limit": 1.0 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert_eq!(value["content"], "two\n");
+
+        let result = run_tool(
+            "read",
+            &json!({ "path": path, "limit": 1.5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert!(value["error"].as_str().unwrap().contains("limit"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_killed_command_is_reported_as_error() {
+        let dir = test_dir("bash-signal");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool_with_events(
+            "bash",
+            &json!({ "command": "kill -9 $$", "timeout": 10 }).to_string(),
+            &dir,
+            &[],
+            &test_state(),
+            |_| Ok(()),
+        );
+        let value = serde_json::from_str::<Value>(&result.output).unwrap();
+
+        assert!(result.is_error, "{value}");
+        assert!(value["exit_code"].is_null());
+        assert!(value["error"].as_str().unwrap().contains("signal 9"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn workspace_path_allows_inside_and_rejects_outside() {
+        let dir = env::temp_dir().join(format!("jucode-policy-basic-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("inside.txt"), "ok").unwrap();
+
+        assert!(workspace_path(&dir, "inside.txt").is_ok());
+        assert!(workspace_path(&dir, "sub/../inside.txt").is_ok());
+        assert!(workspace_path(&dir, "new/dir/file.txt").is_ok());
+        assert!(workspace_path(&dir, &dir.join("inside.txt").display().to_string()).is_ok());
+
+        let error = workspace_path(&dir, "../escape.txt").unwrap_err();
+        assert!(error.contains("escapes the workspace"), "{error}");
+        assert!(workspace_path(&dir, "/etc/passwd").is_err());
+        assert!(workspace_path(&dir, "sub/../../escape.txt").is_err());
+        // `..` inside a not-yet-existing prefix must not escape either.
+        assert!(workspace_path(&dir, "missing/../../escape.txt").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn read_only_tools_allow_extra_read_roots() {
+        let pid = std::process::id();
+        let workspace = env::temp_dir().join(format!("jucode-read-roots-ws-{pid}"));
+        let skill = env::temp_dir().join(format!("jucode-read-roots-skill-{pid}"));
+        let outside = env::temp_dir().join(format!("jucode-read-roots-out-{pid}"));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(skill.join("refs")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(skill.join("SKILL.md"), "skill body").unwrap();
+        fs::write(skill.join("refs/guide.md"), "guide").unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let roots = vec![skill.clone()];
+        let run = |name: &str, args: Value| {
+            run_tool_with_events(
+                name,
+                &args.to_string(),
+                &workspace,
+                &roots,
+                &test_state(),
+                |_| Ok(()),
+            )
+        };
+
+        // The skill file and files it references resolve under the root.
+        let result = run(
+            "read",
+            json!({ "path": skill.join("SKILL.md").display().to_string() }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("skill body"));
+        let result = run(
+            "read",
+            json!({ "path": skill.join("refs/guide.md").display().to_string() }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        let result = run("ls", json!({ "path": skill.display().to_string() }));
+        assert!(!result.is_error, "{}", result.output);
+
+        // Paths outside the roots are still rejected.
+        let result = run(
+            "read",
+            json!({ "path": outside.join("secret.txt").display().to_string() }),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("escapes the workspace"),
+            "{}",
+            result.output
+        );
+        // `..` cannot climb out of a root either.
+        let escape = skill
+            .join("..")
+            .join(outside.file_name().unwrap())
+            .join("secret.txt");
+        let result = run("read", json!({ "path": escape.display().to_string() }));
+        assert!(result.is_error, "{}", result.output);
+
+        // Mutating tools stay confined even under a read root.
+        let result = run(
+            "write",
+            json!({
+                "path": skill.join("evil.txt").display().to_string(),
+                "content": "x"
+            }),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("escapes the workspace"),
+            "{}",
+            result.output
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&skill);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn file_tools_reject_paths_outside_the_workspace() {
+        let dir = env::temp_dir().join(format!("jucode-policy-tools-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cases: [(&str, Value); 7] = [
+            ("read", json!({ "path": "/etc/passwd" })),
+            ("write", json!({ "path": "../escape.txt", "content": "x" })),
+            (
+                "str_replace",
+                json!({ "path": "/etc/passwd", "edits": [{ "oldText": "a", "newText": "b" }] }),
+            ),
+            (
+                "hashline_edit",
+                json!({ "path": "/etc/passwd", "edits": [{ "op": "append", "lines": "x" }] }),
+            ),
+            ("ls", json!({ "path": ".." })),
+            ("outline", json!({ "path": "/etc/passwd" })),
+            (
+                "checkpoint",
+                json!({ "action": "create", "name": "cp", "paths": ["../escape.txt"] }),
+            ),
+        ];
+        for (tool, args) in cases {
+            let result = run_tool(tool, &args.to_string(), &dir);
+            let value = serde_json::from_str::<Value>(&result).unwrap();
+            let error = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(error.contains("escapes the workspace"), "{tool}: {result}");
+        }
+        assert!(!dir.parent().unwrap().join("escape.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_rejects_targets_outside_the_workspace() {
+        let dir = env::temp_dir().join(format!("jucode-policy-patch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let patch = "--- /dev/null\n+++ b/../evil.txt\n@@ -0,0 +1 @@\n+evil\n";
+        let result = run_tool("apply_patch", &json!({ "patch": patch }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(error.contains("escapes the workspace"), "{result}");
+        assert!(!dir.parent().unwrap().join("evil.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tools_reject_symlinks_that_point_outside_the_workspace() {
+        let outside = env::temp_dir().join(format!("jucode-policy-outside-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let dir = env::temp_dir().join(format!("jucode-policy-symlink-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+
+        let result = run_tool(
+            "read",
+            &json!({ "path": "link/secret.txt" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(error.contains("escapes the workspace"), "{result}");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn resolve_path_expands_tilde_to_home() {
+        let home = env::var("HOME").unwrap();
+        assert_eq!(
+            resolve_path(Path::new("/cwd"), "~/x"),
+            Path::new(&home).join("x")
+        );
+        assert_eq!(resolve_path(Path::new("/cwd"), "~"), PathBuf::from(&home));
+        assert_eq!(
+            resolve_path(Path::new("/cwd"), "~x"),
+            Path::new("/cwd").join("~x")
+        );
+    }
+
+    #[test]
+    fn decode_text_bytes_strips_utf8_bom() {
+        let (text, encoding) = decode_text_bytes(b"\xef\xbb\xbfhi\n").unwrap();
+        assert_eq!(text, "hi\n");
+        assert_eq!(encoding, "utf-8");
+    }
+
+    #[test]
+    fn outline_truncated_only_when_symbols_are_dropped() {
+        let dir = test_dir("outline-truncated");
+        let path = dir.join("lib.rs");
+        fs::create_dir_all(&dir).unwrap();
+        let filler = "// filler\n".repeat(300);
+        fs::write(&path, format!("fn one() {{}}\nfn two() {{}}\n{filler}")).unwrap();
+
+        let result = run_tool(
+            "outline",
+            &json!({ "path": path, "limit": 2 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert_eq!(value["truncated"], false, "{value}");
+
+        fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
+        let result = run_tool(
+            "outline",
+            &json!({ "path": path, "limit": 2 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["symbols"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_patch_diff_excludes_unrelated_workspace_changes() {
+        let dir = test_dir("apply-patch-scoped-diff");
+        fs::create_dir_all(&dir).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+        fs::write(dir.join("sample.txt"), "alpha\nbeta\n").unwrap();
+        fs::write(dir.join("unrelated.txt"), "junk\n").unwrap();
+
+        let patch = r#"diff --git a/sample.txt b/sample.txt
+--- a/sample.txt
++++ b/sample.txt
+@@ -1,2 +1,2 @@
+ alpha
+-beta
++gamma
+"#;
+        let result = run_tool("apply_patch", &json!({ "patch": patch }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["applied"], true, "{value}");
+        let diff = value["diff"].as_str().unwrap();
+        assert!(diff.contains("sample.txt"));
+        assert!(!diff.contains("unrelated.txt"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_stdin_null_text_falls_back_to_chars() {
+        let dir = test_dir("write-stdin-null-text");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "$line = [Console]::In.ReadLine(); Write-Output $line"
+        } else {
+            "head -n 1"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "timeout": 5, "yield_time_ms": 1 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+
+        let mut value = json!({ "running": true });
+        for index in 0..20 {
+            let args = if index == 0 {
+                json!({ "session_id": session_id, "text": null, "chars": "hello\n", "yield_time_ms": 250 })
+            } else {
+                json!({ "session_id": session_id, "yield_time_ms": 250 })
+            };
+            let result = run_tool("write_stdin", &args.to_string(), &dir);
+            value = serde_json::from_str::<Value>(&result).unwrap();
+            if value["running"] != true {
+                break;
+            }
+        }
+
+        assert_eq!(value["exit_code"], 0, "{value}");
+        assert!(value["stdout"].as_str().unwrap().contains("hello"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_read_licenses_edits_only_for_the_engine_that_read() {
+        let dir = test_dir("read-tracker-scope");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "old").unwrap();
+        let reader = ToolState::default();
+        let other = ToolState::default();
+        let call = |name: &str, args: Value, state: &ToolState| {
+            run_tool_with_events(name, &args.to_string(), &dir, &[], state, |_| Ok(())).output
+        };
+        call("read", json!({ "path": "notes.txt" }), &reader);
+
+        let blind = call(
+            "write",
+            json!({ "path": "notes.txt", "content": "x" }),
+            &other,
+        );
+        assert!(blind.contains("requires reading"), "{blind}");
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "old");
+
+        let informed = call(
+            "write",
+            json!({ "path": "notes.txt", "content": "new" }),
+            &reader,
+        );
+        assert!(!informed.contains("error"), "{informed}");
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_stdin_reaches_only_the_engines_own_shells() {
+        let dir = test_dir("shell-owner");
+        fs::create_dir_all(&dir).unwrap();
+        let owner = ToolState::default();
+        let other = ToolState::default();
+        let call = |name: &str, args: Value, state: &ToolState| -> Value {
+            let output =
+                run_tool_with_events(name, &args.to_string(), &dir, &[], state, |_| Ok(())).output;
+            serde_json::from_str(&output).unwrap()
+        };
+        let started = call(
+            "bash",
+            json!({ "command": "sleep 5", "timeout": 10, "yield_time_ms": 100 }),
+            &owner,
+        );
+        let session_id = started["session_id"].as_u64().expect("still running");
+
+        let foreign = call(
+            "write_stdin",
+            json!({ "session_id": session_id, "text": "" }),
+            &other,
+        );
+        assert!(
+            foreign["error"]
+                .as_str()
+                .unwrap()
+                .contains("no running shell session"),
+            "{foreign}"
+        );
+        let own = call(
+            "write_stdin",
+            json!({ "session_id": session_id, "text": "", "yield_time_ms": 10 }),
+            &owner,
+        );
+        assert!(own.get("error").is_none(), "{own}");
+    }
+
+    #[test]
+    fn file_writes_follow_the_sandbox() {
+        use crate::sandbox::{SandboxMode, SandboxPolicy};
+        let dir = test_dir("sandbox-writes");
+        let extra = test_dir("sandbox-extra");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+        let state = ToolState::default();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::WorkspaceWrite,
+            writable_dirs: vec![extra.clone()],
+            readable_dirs: Vec::new(),
+            network: true,
+            rules: Vec::new(),
+        };
+        state.set_sandbox(Some(policy.clone()));
+        let write = |state: &ToolState, path: String| -> Value {
+            let args = json!({ "path": path, "content": "x" }).to_string();
+            serde_json::from_str(
+                &run_tool_with_events("write", &args, &dir, &[], state, |_| Ok(())).output,
+            )
+            .unwrap()
+        };
+        assert!(write(&state, "src/a.txt".into()).get("error").is_none());
+        let blocked = write(&state, ".git/config".into());
+        assert!(
+            blocked["error"]
+                .as_str()
+                .unwrap()
+                .contains("read-only in the sandbox"),
+            "{blocked}"
+        );
+        // A read-write directory outside the workspace is writable.
+        let outside = extra.join("deploy.sh").display().to_string();
+        assert!(write(&state, outside).get("error").is_none());
+        assert!(extra.join("deploy.sh").exists());
+
+        let read_only = ToolState::default();
+        read_only.set_sandbox(Some(SandboxPolicy {
+            mode: SandboxMode::ReadOnly,
+            ..policy
+        }));
+        assert!(write(&read_only, "src/b.txt".into())["error"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"));
+        assert!(!dir.join("src/b.txt").exists());
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("jucode-tools-test-{name}-{nanos}"))
+    }
+}

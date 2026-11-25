@@ -1,0 +1,101 @@
+server:
+  listen: ":8090"
+  # request body size limit for non-streaming endpoints
+  max_body_bytes: 104857600
+  # IANA timezone for calendar days and months: finance and usage reports,
+  # day buckets, API key daily/monthly spend limits.
+  timezone: "Asia/Shanghai"
+  # ticket image uploads on local disk (not object storage). When several
+  # instances run side by side, mount one shared directory here.
+  ticket_attachment_dir: "./data/ticket-attachments"
+
+database:
+  # postgres DSN; env var JUCODE_DATABASE_DSN overrides
+  dsn: "postgres://jucode:jucode@localhost:5432/jucode?sslmode=disable"
+  max_open_conns: 32
+  max_idle_conns: 8
+  conn_max_lifetime: "30m"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+jwt:
+  # HS256 secret, at least 32 bytes; env var JUCODE_JWT_SECRET overrides.
+  # MUST be replaced in prod (e.g. `openssl rand -hex 32`).
+  secret: "change-me-in-prod-at-least-32-bytes"
+  access_ttl: "1h"
+  refresh_ttl: "720h"   # 30 days
+
+# AES-GCM key (32 bytes hex) for encrypting upstream API keys and other
+# secrets at rest. Env var JUCODE_ENCRYPT_KEY overrides. MUST be set in prod
+# (generate one with `openssl rand -hex 32`).
+encrypt_key: "0000000000000000000000000000000000000000000000000000000000000000"
+
+llm:
+  # Chat Completions / Responses / Anthropic dialect conversion and
+  # WebSocket (/v1/realtime, GET /v1/responses) are runtime toggles on
+  # SiteSettings (admin 网关行为): format_conversion_enabled (default off)
+  # and websocket_enabled (default on). A socket is relayed to the upstream
+  # provider's own socket when it has one (gated and billed per response),
+  # and otherwise served from the local HTTP bridge, which speaks the same
+  # event protocol over plain HTTP generation. Turning websocket_enabled off
+  # makes both endpoints 404, which is how a probing client learns to use the
+  # HTTP endpoints instead.
+  # max provider attempts per request (1 = no retry)
+  max_attempts: 3
+  # non-stream total upstream timeout; stream upstream idle timeout
+  # Maximum duration for non-streaming requests. Streaming requests use the
+  # dedicated first-token/idle/total policies from the site settings.
+  request_timeout: "600s"
+# Content moderation (OpenAI Moderation API) is configured at RUNTIME from the
+# admin console (Settings → Moderation), not here — base_url / api_key / model /
+# threshold / sample_rate live in the site_settings table so they can change
+# without a redeploy. The API key is stored encrypted-at-rest.
+
+# EXPERIMENTAL: control plane for regional edge nodes (jucode-edge). The
+# protocol, config keys and tables may change in any release; see
+# docs/edge.md. Disabled, /internal/region/v1 is not mounted (404) and no
+# lease loop runs. Expose /internal/region/v1 to the edges only, over TLS.
+region:
+  enabled: false
+  # Encrypts upstream credentials in the snapshots sent to edges. 64 hex
+  # chars; never reuse encrypt_key. Every edge's sync_encrypt_key must match.
+  sync_encrypt_key: ""
+  # Largest credit lease frozen for one account at a time.
+  lease_cny: "10"
+  # How far below zero a balance may go when a lease is frozen.
+  overdraft_cny: "10"
+  # Unreleased leases are returned to the balance after this long.
+  lease_ttl: "24h"
+  # One entry per edge node. The token (at least 32 characters, e.g.
+  # `openssl rand -hex 32`) authenticates the edge and fixes its region id.
+  edges: []
+  #  - id: "edge-1"
+  #    service_token: ""
+
+payments:
+  alipay:
+    # OpenAPI gateway mode, alipay.trade.page.pay for PC website checkout.
+    enabled: false
+    appid: ""
+    gateway_url: "https://openapi.alipay.com/gateway.do"
+    private_key_file: "/etc/jucode/alipay/app_private_key.pem"
+    alipay_public_key_file: "/etc/jucode/alipay/alipay_public_key.pem"
+    # Optional. Required if "接口内容加密" is enabled in the Alipay app.
+    encrypt_key: ""
+    # Must be externally reachable. Alipay expects the endpoint to return plain "success".
+    notify_url: "https://example.com/v1/payments/alipay/notify"
+
+# First-party OAuth clients that sign in through /v1/oauth/*. Every client may
+# redirect to a loopback address (the CLI and Desktop flow). The web client
+# additionally accepts the exact callback URLs in web_redirect_uris; env var
+# JUCODE_OAUTH_WEB_REDIRECT_URIS (comma-separated) overrides. Empty allows web
+# sign-in from loopback only (local development).
+oauth:
+  clients: ["jucode-cli", "jucode-desktop", "jucode-web"]
+  web_client_id: "jucode-web"
+  web_redirect_uris: []
+  # web_redirect_uris: ["https://app.example.com/auth/callback"]
+

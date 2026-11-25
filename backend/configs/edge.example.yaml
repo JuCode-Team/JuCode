@@ -1,0 +1,65 @@
+# jucode-edge configuration.
+#
+# EXPERIMENTAL: the regional edge feature, its protocol, config keys and
+# storage may change in any release, with no migration path. See
+# docs/edge.md before deploying it.
+#
+# Every key can also be set from the environment as JUCODE_EDGE_<KEY> with
+# dots as underscores, e.g. JUCODE_EDGE_CONTROL_SERVICE_TOKEN.
+
+listen: ":8091"
+
+# Required. This edge's id; the control plane must list it under
+# region.edges with the service_token below.
+region_id: "edge-1"
+
+# Calendar days and months for the API key spend limits. Set it to the
+# control plane's server.timezone.
+timezone: "Asia/Shanghai"
+
+# Take the client IP for API key IP allowlists from X-Forwarded-For. Only
+# enable it when every request reaches this listener through a proxy that
+# overwrites the header; otherwise clients can spoof their address.
+trust_forwarded_for: false
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 1
+
+control:
+  # The main server's base URL. Leave empty for standalone mode
+  # (upstreams.file, personal balances only, no usage reported anywhere).
+  url: "https://control.example.com"
+  # This edge's token from region.edges on the control plane.
+  service_token: ""
+  # The control plane's region.sync_encrypt_key (64 hex chars). Required in
+  # both modes: it decrypts the upstream credentials in the snapshot.
+  sync_encrypt_key: ""
+
+upstreams:
+  # Static upstream snapshot (region.ProviderSnapshotResponse JSON) for
+  # standalone mode or bootstrapping. Normally empty: the snapshot is
+  # fetched from control.url.
+  file: ""
+  # Required with control.url. The upstream account ids this edge may
+  # forward to; accounts outside the list are never used here, even if the
+  # control plane returns them.
+  allowed_ids: []
+
+# Durable queue of usage events not yet accepted by the control plane. Put
+# it on persistent disk: losing it loses charges.
+outbox_dir: "./data/edge-outbox"
+
+# Credit requested per lease; the control plane caps it at region.lease_cny.
+lease_cny: "10"
+# Amount reserved locally per request before it is forwarded.
+reserve_cny: "1"
+# How far below zero the local balance may go when a request costs more
+# than it reserved. An account snapshot's overdraft_cny takes precedence.
+overdraft_cny: "10"
+request_ttl: "30m"
+account_ttl: "10m"
+sync_interval: "30s"
+max_body_bytes: 104857600
+request_timeout: "600s"

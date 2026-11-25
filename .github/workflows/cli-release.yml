@@ -1,0 +1,156 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Release version without the leading v
+        required: true
+        type: string
+
+defaults:
+  run:
+    working-directory: cli
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.target.rust_target }}
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            binary_name: jucode.exe
+          - runner: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            binary_name: jucode
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.rust_target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target.rust_target }}
+
+      # Guard against the v0.1.10 incident: the npm package version is stamped
+      # from the tag / dispatch input, so a binary built from a checkout whose
+      # Cargo.toml wasn't bumped would ship mislabeled — and its self-update
+      # check would nag users forever. Fail the release instead.
+      - name: Verify binary version matches the release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            expected="${{ inputs.release_version }}"
+          else
+            expected="${GITHUB_REF_NAME#v}"
+          fi
+          actual="$(./target/${{ matrix.target.rust_target }}/release/${{ matrix.target.binary_name }} --version | awk '{print $NF}')"
+          echo "expected=${expected} actual=${actual}"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::built binary reports ${actual} but the release is ${expected} — bump Cargo.toml (and commit) before tagging"
+            exit 1
+          fi
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts/${{ matrix.target.rust_target }}
+          cp target/${{ matrix.target.rust_target }}/release/${{ matrix.target.binary_name }} artifacts/${{ matrix.target.rust_target }}/${{ matrix.target.binary_name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.rust_target }}
+          path: cli/artifacts/${{ matrix.target.rust_target }}/${{ matrix.target.binary_name }}
+
+  release:
+    name: Publish release assets
+    needs: build-native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: cli/artifacts
+          merge-multiple: false
+
+      - name: Resolve release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.release_version }}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${{ inputs.release_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Normalize artifact layout
+        shell: bash
+        run: |
+          mkdir -p artifacts-normalized
+          for dir in artifacts/*; do
+            target="$(basename "$dir")"
+            mkdir -p "artifacts-normalized/$target"
+            cp "$dir"/* "artifacts-normalized/$target/"
+          done
+
+      - name: Write third-party notices
+        run: |
+          node scripts/third-party-notices.mjs --cargo Cargo.toml --title "JuCode CLI: third-party software" --out jucode-third-party-notices.txt
+
+      - name: Sync npm versions
+        env:
+          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+        run: npm run release:sync-version
+
+      - name: Stage npm binaries
+        run: npm run release:stage-binaries -- --source-root artifacts-normalized --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
+
+      - name: Pack npm packages
+        run: npm run release:pack -- --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
+
+      # Release assets are named by target triple (as the macOS workflow
+      # does), so installers and the update service can pick one per platform.
+      - name: Name binaries by target for the release
+        shell: bash
+        run: |
+          cp artifacts-normalized/x86_64-unknown-linux-gnu/jucode jucode-x86_64-unknown-linux-gnu
+          cp artifacts-normalized/x86_64-pc-windows-msvc/jucode.exe jucode-x86_64-pc-windows-msvc.exe
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          files: |
+            cli/jucode-x86_64-unknown-linux-gnu
+            cli/jucode-x86_64-pc-windows-msvc.exe
+            cli/jucode-third-party-notices.txt
+            cli/dist/npm/*.tgz
+
+      - name: Publish npm packages
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        shell: bash
+        run: |
+          version="${{ steps.release_meta.outputs.version }}"
+          npm view "@jucode/cli-linux-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-linux-x64 --access public
+          npm view "@jucode/cli-win32-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-win32-x64 --access public

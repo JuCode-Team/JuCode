@@ -1,0 +1,15 @@
+/target/
+/target-check*/
+/target-build-*/
+/target-msvc/
+/artifacts/
+/dist/
+/npm/cli-darwin-arm64/bin/
+/npm/cli-darwin-x64/bin/
+/npm/cli-linux-x64/bin/
+/npm/cli-win32-x64/bin/
+/npm/*/LICENSE
+/npm/*/NOTICE
+/npm/*/THIRD-PARTY-NOTICES.txt
+/jucode-third-party-notices.txt
+/.jucode/

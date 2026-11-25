@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="%SITE_NAME% — AI 编程平台 · 统一 LLM 网关,提供 OpenAI Responses / Chat Completions / Anthropic Messages 三套协议,可接入 Codex CLI、Claude Code、Cursor 等开发者工具。" />
+    <meta property="og:title" content="%SITE_NAME% · AI 编程平台" />
+    <meta property="og:description" content="统一 LLM 网关,Codex / Claude Code 等开发者工具的接入终点。" />
+    <meta property="og:type" content="website" />
+    <title>%SITE_NAME% · AI 编程平台</title>
+    <!-- Brand faces (Space Grotesk / Noto Sans SC / IBM Plex Mono) are
+         self-hosted through @fontsource and bundled by Vite — no
+         third-party font CDN, no render-blocking external CSS. The
+         CJK face is unicode-range split, so only the glyph slices
+         actually rendered get downloaded. -->
+    <script>
+      // Apply persisted theme before paint to avoid flash.
+      (function () {
+        try {
+          var saved = localStorage.getItem('jucode-theme');
+          var theme = saved === 'light' ? 'light' : 'dark';
+          var root = document.documentElement;
+          root.classList.add(theme);
+          root.dataset.theme = theme;
+        } catch (_) {
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
+    <style>
+      /* Critical first-paint color: keep the WebGL hero region from flashing
+         white while the application stylesheet and shader initialize. */
+      html, body, #root { margin: 0; min-height: 100%; background: #131314; }
+      html.light, html.light body, html.light #root { background: #f7f7f8; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

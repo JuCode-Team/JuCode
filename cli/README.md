@@ -1,0 +1,303 @@
+# JuCode CLI
+
+JuCode CLI is a compact coding-agent CLI for repository work. It provides an interactive terminal UI, a headless JSONL mode, context-aware editing tools, lightweight subagents, and real token-usage reporting.
+
+The project is intentionally small: the agent harness is designed to give the model enough autonomy to implement and verify tasks without loading a large framework prompt or exposing high-noise tools by default.
+
+The CLI also runs `jucode daemon`, a local background service that desktop and web clients can drive (see [Daemon](#daemon-jucode-daemon)).
+
+## Highlights
+
+- **Interactive TUI by default** for day-to-day coding tasks.
+- **Headless mode** for benchmarks, CI experiments, and scripted agent runs.
+- **Context-efficient tool outputs** with projected read/bash/diff-like edit results and saved full outputs when needed.
+- **Real token accounting** for input, cached input, output, reasoning, and tokenizer-counted context usage.
+- **Parallel read-only/tool inspection** for independent file reads, searches, listings, and shell checks.
+- **Scoped editing tools**: exact replacement, hashline edits, full-file writes, and patch application.
+- **Large-output controls**: bash output truncation, ripgrep soft warnings, and `read` offset/limit support.
+- **Conversation compaction** based on tokenizer-counted context, not rough character estimates.
+- **Branchable sessions, resume, checkout, goals, lifecycle-managed skills, full MCP, and lightweight subagents**.
+- **TUI diff display without exposing `diff` as an agent tool**.
+
+## Installation
+
+Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x64 and Windows x64
+are published on [GitHub Releases](https://github.com/JuCode-Team/JuCode/releases/latest)
+and on npm:
+
+```bash
+npm install -g @jucode/cli
+jucode
+```
+
+### From source
+
+```bash
+git clone https://github.com/JuCode-Team/JuCode.git
+cd JuCode/cli
+cargo build --release
+./target/release/jucode
+```
+
+### With Cargo from Git
+
+```bash
+cargo install --git https://github.com/JuCode-Team/JuCode.git jucode-cli
+jucode
+```
+
+JuCode is written in Rust and uses the workspace binary name `jucode`.
+
+### Updating
+
+JuCode checks for new versions at startup and prints a notice when one is
+available. Update with:
+
+```bash
+jucode update
+```
+
+- npm installs run `npm i -g @jucode/cli@latest` (on Windows right after the
+  process exits, since the running executable is locked).
+- Release binaries download the new binary from GitHub Releases, check that
+  it runs and replace themselves; the new version runs from the next start.
+  `JUCODE_RELEASE_REPO=<owner>/<name>` makes them use another GitHub
+  repository's releases.
+
+## Configuration
+
+On first run, JuCode creates its configuration under the user profile directory (`~/.jucode/config.json`) with no model provider and connects to nothing. Until one is set, it says so at startup and refuses to start a turn. Pick one with `/login`:
+
+- `/login <provider> <api-key>` stores an API key for a catalog provider and switches to it; `/login list` shows the providers and `/login <provider>` says where to create a key.
+- `/login <web-url> [api-url]` signs in to a self-hosted JuCode server (its gateway is an OpenAI-compatible Responses API). The models come from the server's `/v1/models`.
+- Or set `provider`, `base_url`, `model` and the key's environment variable (`api_key_env`, default `OPENAI_API_KEY`) in `config.json`.
+
+When connecting to a self-hosted JuCode backend, its addresses are settings with no defaults: `jucode_api_url` (the account service), `jucode_web_url` (the sign-in page `/login` opens) and `jucode_app_url` (the web app remote-access pairing links open). `/login <web-url> [api-url]` saves the first two; `/login jucode` uses the saved ones and fails with a clear error while none is set. The daemon's relay is `jucode daemon --relay <wss url>` (default: `jucode_api_url`'s `/v1/relay`; none while it is unset).
+
+Built-in provider templates: `jucode` (a self-hosted JuCode server) and `openai` (Responses), `deepseek` (Anthropic Messages), and `ollama` and `openrouter` (Chat Completions). List them with `jucode providers`, or override the `protocol` setting for custom endpoints:
+
+```bash
+export OPENAI_API_KEY="..."
+jucode
+```
+
+The vendored provider catalog (from [oh-my-pi](https://github.com/can1357/oh-my-pi)) adds more providers that take their official API keys, such as `anthropic`, `xai`, `moonshot`, `zai` and `openrouter`. `/login` lists them; `/login <provider>` says where to create a key, and `/login <provider> <api-key>` stores it in `auth.json` and switches to that provider. Some need extra setup:
+
+- `azure` — Azure OpenAI deployments. Set `provider` and your own `base_url` (e.g. `https://<resource>.openai.azure.com/openai/v1`) in `config.json`, put the key under `providers.azure` in `auth.json`, and requests go to `/responses?api-version=…` with the `api-key` header. `AZURE_OPENAI_API_VERSION` overrides the default `v1`.
+
+You can switch model and reasoning effort inside the TUI:
+
+```text
+/model gpt-5.5 medium
+/model gpt-5.4-mini low
+/effort high
+```
+
+`ctrl+t` cycles the effort for the current model; inside the `/model` picker, `tab` cycles it for the highlighted model.
+
+The config also supports custom OpenAI-compatible base URLs, retry settings, model metadata, and project-instruction discovery.
+
+On the JuCode gateway, each model's context window, output cap and effort levels come from the gateway; values it does not set stay unknown rather than guessed. `context_window_overrides` in `config.json` (`{"<model>": tokens}`) sets a window by hand: it fills in a missing one or raises the advertised window up to the gateway's largest. With no known window JuCode does not compact on a guess; when the model rejects a request as too long, it compacts and retries the turn.
+
+### Edit tools (`edit_tools`)
+
+The default edit tool is `hashline_edit`; the other edit tools are off unless you enable them. The `edit_tools` array in `config.json` controls which edit tools the model sees (and may execute):
+
+```json
+"edit_tools": ["hashline_edit", "str_replace", "write", "apply_patch"]
+```
+
+Valid names are `hashline_edit`, `str_replace` (alias `edit`), `write`, and `apply_patch`. Omitting the field enables only `hashline_edit`; an empty array disables all edit tools. Disabled edit tools are not sent to the model and return a clear error if called anyway. Non-edit tools (`read`, `bash`, `ls`, `ripgrep`, `outline`, `checkpoint`, and so on) are not affected by this field.
+
+File tools (read/write/edit/ls/outline/checkpoint/apply_patch) only operate on paths inside the working directory: absolute paths, `..`, and symlinks that resolve outside the workspace are rejected with a clear error. This is a path policy, not an OS sandbox — shell commands are not restricted by it.
+
+### Approval modes
+
+`approval_mode` in `config.json` (or `/permissions <mode>` in a session; `shift+tab` cycles modes) picks one of five levels:
+
+| Mode | File edits | Shell commands |
+|---|---|---|
+| `manual` (default) | ask | ask |
+| `plan` | refused | read-only commands only |
+| `auto-edit` | run freely | ask |
+| `auto` | run freely | a safety model auto-approves safe commands; the rest still ask |
+| `full-access` | run freely | run freely, no prompts |
+
+In `plan` mode the agent investigates and then proposes a plan. The TUI shows it with a choice: approve it and run in `auto-edit`, `manual` or `auto`, or type what to change and get a revised plan. Esc leaves it pending; `/plan` brings the choice back.
+
+Under `auto`, every shell command first goes through a one-shot safety classification in an isolated context — the classifier sees only the command, the working directory, and your request, never the conversation history. Commands it judges safe run immediately; anything unsafe, ambiguous, or a failed classification falls back to the interactive prompt. The classifier model is configured with `safety_model` (defaults to `compact_model`) and `safety_reasoning_effort` in `config.json`:
+
+```json
+"safety_model": "gpt-5.4-mini",
+"safety_reasoning_effort": "low"
+```
+
+`full-access` runs the model's shell commands and file writes with your user permissions and no prompts — `bash` is not confined to the workspace, so only use it for tasks and repositories you trust.
+
+## Usage
+
+### Interactive mode
+
+Run JuCode in a repository:
+
+```bash
+cd path/to/project
+jucode
+```
+
+Then ask for implementation, debugging, refactoring, or verification work in natural language.
+
+Useful commands:
+
+```text
+/help                         show command summary
+/login [provider|web-url]     pick a provider or sign in to a JuCode server
+/model [model] [effort]       view or change model and reasoning effort
+/effort [effort]              cycle or set reasoning effort
+/permissions [mode]           view or change the approval mode
+/tree                         show branchable session tree
+/resume [session-id]          resume a previous session
+/context                      inspect context and token statistics
+/goal <objective>             start or update a persistent goal
+/skills list                  list installed and available skills
+/skills install <id>          install a skill
+/skills update <id>           update an installed skill
+/skills enable|disable <id>   toggle an installed skill
+/skills uninstall <id>        remove an installed skill
+/pin <skill>                  keep a skill in current session context
+/mcp                          show MCP server status
+/image <path>                 attach an image to your next message
+/compact                      compact older conversation context
+/quit                         exit
+```
+
+Installed and project-local skill behavior is documented in [docs/skills.md](docs/skills.md).
+MCP stdio/HTTP setup, prompt commands, resource tools, roots, and HTTP authentication are
+documented in [docs/mcp.md](docs/mcp.md).
+
+Other TUI conveniences:
+
+- **`!` shell escape** — input starting with `!` (for example `!git log -3`) runs in your local shell and shows its output in the history; it is never sent to the model.
+- **`@` file mentions** — type `@` plus a few characters to fuzzy-pick a project file (gitignore-aware via `rg --files`, falling back to `git ls-files` or a capped walk); Tab/Enter inserts the path.
+- **Git status bar** — the bottom bar shows the current branch with a `*` dirty marker, refreshed by a cheap cached `git` call on a background thread.
+- **Custom commands** — Markdown prompt files in `~/.jucode/commands/*.md` appear as `/name` commands; project-local `.jucode/commands/*.md` load after you trust the project (same gate as skills). `$ARGUMENTS` in the file body is replaced with whatever you type after the command.
+- **Images** — paste or drag-and-drop an image file path into the TUI (it attaches automatically), or use `/image <path>`.
+
+### Headless mode
+
+Headless mode emits JSONL events and finishes with a `final_result` event containing status, usage, context, tool-call counts, and elapsed time.
+
+Headless runs default to the `manual` approval mode: tool calls that would need interactive approval (edits, shell commands) are auto-denied with a clear message instead of hanging. Pass `--approval-mode` explicitly for tasks that change files or run commands:
+
+```bash
+jucode --headless --approval-mode full-access "Fix the failing test and verify the focused suite"
+```
+
+Read-only tasks work without a flag:
+
+```bash
+jucode --headless "List the repository structure and stop."
+```
+
+You can also pipe the task through stdin:
+
+```bash
+cat task.md | jucode --headless
+```
+
+`full-access` runs the model's shell commands and file writes with your user
+permissions and no prompts — `bash` is not confined to the workspace, so only
+use it for tasks and repositories you trust.
+
+The `final_result` event reports the effective `approval_mode` and how many approvals were auto-denied.
+
+This mode is useful for evaluation harnesses and reproducible agent experiments. A minimal in-repo harness lives in [`evals/`](evals/README.md).
+
+### Daemon (`jucode daemon`)
+
+`jucode daemon` is the local background service desktop and web clients talk to (`ws://127.0.0.1:7788`). It hosts every session — JuCode's own engine, Claude Code, Codex and ACP agents — translated into one event stream, plus scheduled tasks, and keeps them running when no window is open. With remote access turned on (it is off by default) it also holds an end-to-end encrypted relay connection for the web app. The protocol is documented in [docs/daemon-protocol.md](docs/daemon-protocol.md).
+
+`jucode logout` signs this computer out of JuCode and revokes its device.
+
+### When connected to a self-hosted JuCode backend
+
+JuCode's backend is open source and self-hosted; the CLI has no default server. When connected to a JuCode backend (`jucode_api_url`, set by `/login <web-url> [api-url]`), the CLI and daemon send it account data only while signed in:
+
+- **At sign-in**, the device label shown in the account's device list: the app name, this computer's hostname, the OS and the first four characters of the machine id (a hash of the OS machine id; `JUCODE_MACHINE_ID` replaces the OS value). The full id stays on this computer, where the saved login records it so a copied `auth.json` is not used elsewhere.
+- **Agent usage**, from the daemon: one record per agent turn billed through the JuCode gateway, whichever engine ran it (JuCode, or a Claude Code / Codex / ACP session set to use the gateway) — turn id, session id, engine, channel and its id, model, request count, start and end time, and token counts. The project directory and the conversation are not included. Turns on local subscriptions and third-party providers are never uploaded; they, and records made while signed out, stay in `~/.jucode/daemon/usage.jsonl`.
+- **Remote access** (off by default; turn it on with `jucode daemon relay on` or from the desktop app, and it connects only while signed in): once it is on, a paired device can do anything you could in a shell on this computer, so pair only devices you trust. The daemon keeps a WebSocket to the account's relay, authenticated with the login and the computer's key, and registers its hostname, OS and version. Session traffic over the relay is end-to-end encrypted (see [docs/relay-protocol.md](docs/relay-protocol.md)).
+
+Model requests go to the account's gateway only when the provider is `jucode` (or a Claude Code / Codex session is set to use the JuCode gateway). `web_search` (offered while signed in) and `web_fetch` with a non-`local` fetch engine call the gateway's web tools, billed to the account. Update checks ask GitHub Releases only.
+
+### ACP mode (`jucode acp`)
+
+`jucode acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio) so ACP-capable editors such as Zed can drive JuCode as an external agent. It maps prompts, streaming message/thought chunks, tool-call progress, plan updates, cancellation, and permission requests; features ACP cannot express (session loading, hunk-subset approvals, the conversation tree) are explicitly rejected rather than half-implemented. `jucode serve` (the native newline-JSON protocol) is unchanged and remains the richer interface; its command/event schema is documented in [docs/serve-protocol.md](docs/serve-protocol.md).
+
+## Agent tools
+
+JuCode exposes a small set of direct tools to the model:
+
+| Tool | Purpose |
+| --- | --- |
+| `read` | Read text, image metadata/payload, or binary metadata. Supports `offset` and `limit`. |
+| `hashline_edit` | Patch lines using stable `LINE#HASH` anchors from `read`. The only edit tool enabled by default. |
+| `str_replace` | Apply exact targeted replacements after reading a file. Off by default; enable via `edit_tools`. |
+| `write` | Create new files or overwrite previously read files. Off by default; enable via `edit_tools`. |
+| `apply_patch` | Apply a unified patch when targeted edits are awkward. Off by default; enable via `edit_tools`. |
+| `bash` / `exec_command` | Run shell commands with timeout, sessions, output truncation, and progress updates. |
+| `write_stdin` | Poll or send input to a running shell session. |
+| `ls` | List directory entries. |
+| `ripgrep` | Search with ripgrep and optional limits. |
+| `outline` | Get lightweight source-file symbols without reading full bodies. |
+| `checkpoint` | Create/list/restore local `.jucode/checkpoints` snapshots. |
+| `generate_image` | Generate an image from a prompt, or edit workspace images, through the provider's OpenAI-compatible `/images/generations` and `/images/edits` endpoints, and save it in the workspace (never overwriting a file). Offered on `responses`/`chat` providers when an image model resolves: `image_model` in `config.json`, else the first configured model whose name contains `image` (e.g. `gpt-image-2`). Gated like `write`. |
+| `spawn_agent`, `wait_agent`, `list_agents`, `send_message`, `close_agent` | Coordinate lightweight subagents. |
+
+`diff` is intentionally not exposed as an agent tool. Edit tools still return diff data for the TUI and for compact model-facing summaries, but workspace diff inspection should happen through scoped shell commands when needed.
+
+## Context and token efficiency
+
+JuCode focuses on reducing unnecessary context growth without hiding useful information:
+
+- tool outputs have separate full output and model-projected output paths;
+- large command output is truncated before entering model context;
+- large reads return soft guidance to use `offset`, `limit`, `outline`, or `ripgrep`;
+- large edit diffs are summarized for the model while the TUI can still display useful change previews;
+- tokenizer-counted context is used for context statistics and compaction thresholds;
+- prompt-cache usage is reported from real API usage, including cached input tokens.
+
+## Development
+
+Run the full Rust test suite:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Build the CLI:
+
+```bash
+cargo build -p jucode-cli
+```
+
+Run a quick headless smoke task:
+
+```bash
+./target/debug/jucode --headless "List the repository structure and stop."
+```
+
+## Project status
+
+JuCode CLI is an active experimental coding-agent harness. The current direction is to keep the framework small, improve task completion reliability, and optimize context quality rather than adding broad agent abstractions.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright 2026 Jucode Innovations INC.
+
+`crates/llm-provider-kit` includes code and data from
+[oh-my-pi](https://github.com/can1357/oh-my-pi) under the MIT License; see
+[its NOTICE](crates/llm-provider-kit/NOTICE). The JuCode name and logo are
+trademarks of Jucode Innovations INC. and are not licensed for use by forks.

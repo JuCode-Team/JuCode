@@ -1,0 +1,457 @@
+/* Auth pages (login/register/reset/verify/cli-oauth).
+   AuthLayout splits the viewport: a brand panel with a live platform
+   readout on the left, the form panel on the right. Pages only render form
+   content into .pn-auth-body. All auth styling lives in this file. */
+
+/* The form panel is always the lifted surface: darkest-to-page in dark
+   mode, page-to-white in light mode. */
+.pn-auth-shell {
+  --auth-panel-bg: var(--c-surface-container-lowest);
+  --auth-main-bg: var(--c-background);
+  --auth-input-line: color-mix(in oklab, var(--c-on-surface) 14%, transparent);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(480px, 42%);
+  min-height: 100dvh;
+  background: var(--auth-main-bg);
+}
+:root.light .pn-auth-shell,
+.light .pn-auth-shell {
+  --auth-panel-bg: var(--c-background);
+  --auth-main-bg: var(--c-surface-container-lowest);
+}
+
+/* ============ Brand panel ============ */
+.pn-auth-panel {
+  position: sticky;
+  top: 0;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 40px;
+  padding: 36px 56px 32px;
+  overflow: hidden;
+  background: var(--auth-panel-bg);
+  border-right: 1px solid var(--c-outline-variant);
+}
+.pn-auth-raster {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  /* Keep the dot field off the copy column; it rises toward the divider. */
+  mask-image: linear-gradient(100deg, transparent 30%, #000 78%);
+  -webkit-mask-image: linear-gradient(100deg, transparent 30%, #000 78%);
+}
+.pn-auth-raster canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity var(--dur-base) var(--ease-io);
+}
+.pn-auth-raster canvas[data-ready="true"] { opacity: .5; }
+:root.light .pn-auth-raster canvas[data-ready="true"],
+.light .pn-auth-raster canvas[data-ready="true"] { opacity: .85; }
+
+.pn-auth-panel > :not(.pn-auth-raster) { position: relative; z-index: 1; }
+
+.pn-auth-panel-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.pn-auth-wordmark {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--c-on-surface);
+}
+.pn-auth-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--c-on-surface-variant);
+  transition: color var(--dur-fast) var(--ease-io);
+}
+.pn-auth-back:hover { color: var(--c-on-surface); }
+
+.pn-auth-pitch { max-width: 520px; }
+.pn-auth-pitch h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(30px, 2.8vw, 40px);
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--c-on-surface);
+  white-space: pre-line;
+  text-wrap: balance;
+}
+.pn-auth-pitch p {
+  margin: 18px 0 44px;
+  max-width: 440px;
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--c-on-surface-variant);
+}
+
+/* Live readout: every value comes from a public endpoint or site setting;
+   rows without data are not rendered. */
+.pn-auth-readout {
+  margin: 0;
+  max-width: 440px;
+  border-top: 1px solid var(--c-outline-variant);
+}
+.pn-auth-readout > div {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--c-outline-variant);
+}
+.pn-auth-readout dt {
+  font-size: 13px;
+  color: var(--c-on-surface-variant);
+}
+.pn-auth-readout dd {
+  margin: 0;
+  font-size: 14px;
+  color: var(--c-on-surface);
+  font-variant-numeric: tabular-nums;
+}
+.pn-auth-readout a { color: inherit; }
+.pn-auth-readout a:hover { text-decoration: underline; text-underline-offset: 3px; }
+/* Static status dot; colour carries the state only. */
+.pn-auth-gateway {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.pn-auth-gateway::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--c-status-ok);
+}
+.pn-auth-gateway[data-tone="warn"]::before { background: var(--c-status-warn); }
+.pn-auth-gateway[data-tone="critical"]::before { background: var(--c-status-critical); }
+
+.pn-auth-legal {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 12px;
+  color: var(--c-on-surface-subtle);
+}
+
+/* ============ Form panel ============ */
+.pn-auth-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 28px 40px;
+  background: var(--auth-main-bg);
+}
+.pn-auth-main-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+/* The brand panel already shows the wordmark on wide screens. */
+.pn-auth-main-top .pn-auth-wordmark { visibility: hidden; }
+
+/* Language toggle. The auth pages sit outside the Navbar, so this is the
+   only place to switch language before signing in. */
+.pn-auth-lang {
+  padding: 5px 10px;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 6px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--c-on-surface-variant);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-io), border-color var(--dur-fast) var(--ease-io);
+}
+.pn-auth-lang:hover {
+  color: var(--c-on-surface);
+  border-color: var(--c-border-strong);
+}
+
+.pn-auth-body {
+  flex: 1;
+  width: 100%;
+  max-width: 400px;
+  margin: 0 auto;
+  padding: 56px 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.pn-auth-main-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 16px;
+  font-size: 12px;
+  color: var(--c-on-surface-subtle);
+}
+.pn-auth-main-foot > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.pn-auth-main-foot > .pn-auth-icp { display: none; }
+
+/* ============ Form content ============ */
+.pn-auth-heading {
+  margin: 0 0 8px;
+  color: var(--c-on-surface);
+  font: 500 28px/1.2 var(--font-display);
+  letter-spacing: -0.02em;
+}
+.pn-auth-copy {
+  margin: 0 0 32px;
+  color: var(--c-on-surface-variant);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.pn-auth-field {
+  display: block;
+  margin-bottom: 18px;
+}
+.pn-auth-field-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--c-on-surface);
+}
+.pn-auth-field-aside {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--c-on-surface-subtle);
+}
+a.pn-auth-field-aside { color: var(--c-primary-bright); }
+a.pn-auth-field-aside:hover { text-decoration: underline; text-underline-offset: 3px; }
+:root.light a.pn-auth-field-aside,
+.light a.pn-auth-field-aside { color: var(--c-primary); }
+
+/* Native <input> rather than Radix: the console gets Radix theming, the
+   auth pages stay handcrafted. */
+.pn-auth-input {
+  width: 100%;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: 8px;
+  background: var(--c-card-faint-bg);
+  color: var(--c-on-surface);
+  font-family: var(--font-body);
+  font-size: 14px;
+  border: 1px solid var(--auth-input-line);
+  transition: border-color var(--dur-base) var(--ease-io), box-shadow var(--dur-base) var(--ease-io);
+  box-sizing: border-box;
+}
+.pn-auth-input::placeholder { color: var(--c-on-surface-subtle); }
+.pn-auth-input:hover:not(:focus) {
+  border-color: color-mix(in oklab, var(--c-on-surface) 24%, transparent);
+}
+.pn-auth-input:focus {
+  outline: none;
+  border-color: color-mix(in oklab, var(--c-primary-bright) 70%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--c-primary) 22%, transparent);
+}
+.pn-auth-invite-input {
+  font-family: var(--font-mono);
+  letter-spacing: 0.025em;
+}
+
+.pn-auth-password {
+  position: relative;
+  display: block;
+}
+.pn-auth-password .pn-auth-input { padding-right: 46px; }
+.pn-auth-reveal {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--c-on-surface-subtle);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-io);
+}
+.pn-auth-reveal:hover { color: var(--c-on-surface); }
+
+.pn-auth-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 24px;
+  font-size: 13px;
+  color: var(--c-on-surface-variant);
+  cursor: pointer;
+  user-select: none;
+}
+.pn-auth-check input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--c-primary);
+  cursor: pointer;
+}
+
+.pn-auth-code-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px;
+  gap: 8px;
+}
+.pn-auth-code-button {
+  height: 44px;
+  border-radius: 8px;
+  border: 1px solid var(--auth-input-line);
+  background: var(--c-btn-secondary-bg);
+  color: var(--c-on-surface);
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: border-color var(--dur-base) var(--ease-io), background var(--dur-base) var(--ease-io);
+}
+.pn-auth-code-button:hover:not(:disabled) {
+  border-color: var(--c-border-strong);
+  background: var(--c-btn-secondary-bg-hover);
+}
+.pn-auth-code-button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.pn-auth-hint {
+  margin-top: 7px;
+  font-size: 12px;
+  color: var(--c-tertiary);
+}
+.pn-auth-hint.is-muted { color: var(--c-on-surface-subtle); }
+/* Field-level failure (e.g. an unusable invite code): same compact line as
+   .pn-auth-hint, coloured like .pn-auth-error. */
+.pn-auth-hint.is-error { color: var(--c-error); }
+
+.pn-auth-error {
+  margin: 4px 0 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--c-error);
+  background: color-mix(in oklab, var(--c-error) 12%, transparent);
+  border: 1px solid color-mix(in oklab, var(--c-error) 30%, transparent);
+}
+
+/* Secondary route (login <-> register) under a hairline. */
+.pn-auth-alt {
+  display: grid;
+  gap: 12px;
+  margin-top: 28px;
+  padding-top: 24px;
+  border-top: 1px solid var(--c-outline-variant);
+  font-size: 13px;
+  text-align: center;
+  color: var(--c-on-surface-variant);
+}
+
+.pn-auth-meta {
+  margin-top: 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--c-on-surface-variant);
+}
+.pn-auth-meta a {
+  color: var(--c-primary-bright);
+  font-weight: 500;
+}
+.pn-auth-meta a:hover { text-decoration: underline; }
+:root.light .pn-auth-meta a,
+.light .pn-auth-meta a { color: var(--c-primary); }
+
+.pn-auth-state { display: flex; flex-direction: column; }
+.pn-auth-progress {
+  height: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+  background: var(--c-outline-variant);
+}
+.pn-auth-progress i {
+  display: block;
+  width: 34%;
+  height: 100%;
+  background: var(--c-primary-bright);
+  animation: pn-auth-progress 1.2s ease-in-out infinite alternate;
+}
+@keyframes pn-auth-progress { to { transform: translateX(194%); } }
+
+/* Pending-approval panel. */
+.pn-auth-pending {
+  border-radius: 10px;
+  padding: 18px;
+  background: var(--c-card-faint-bg);
+  border: 1px solid var(--c-outline-variant);
+}
+.pn-auth-pending-title {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--c-on-surface);
+  margin-bottom: 6px;
+}
+.pn-auth-pending-body {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--c-on-surface-variant);
+}
+.pn-auth-pending-email {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--c-card-faint-bg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--c-on-surface);
+  border: 1px solid var(--c-outline-variant);
+}
+
+/* ============ Narrow screens: form only ============ */
+@media (max-width: 1023px) {
+  .pn-auth-shell { grid-template-columns: minmax(0, 1fr); }
+  .pn-auth-panel { display: none; }
+  .pn-auth-main { min-height: 100dvh; padding: 20px 24px; }
+  .pn-auth-main-top .pn-auth-wordmark { visibility: visible; }
+  .pn-auth-body { padding: 40px 0; }
+  .pn-auth-main-foot > .pn-auth-icp { display: inline-flex; }
+}
+@media (max-width: 640px) {
+  .pn-auth-main { padding: 16px; }
+  .pn-auth-body { justify-content: flex-start; padding: 32px 0; }
+  .pn-auth-heading { font-size: 24px; }
+  /* Below 16px, iOS Safari zooms the page in when a field takes focus. */
+  .pn-auth-input { font-size: 16px; }
+  .pn-auth-code-row { grid-template-columns: minmax(0, 1fr); }
+  .pn-auth-code-button { width: 100%; }
+}

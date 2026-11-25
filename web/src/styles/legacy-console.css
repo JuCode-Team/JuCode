@@ -1,0 +1,775 @@
+/* Legacy .jc-* utilities + root shell + console sidebar layout (admin/console). */
+/* ============ Utilities (legacy `.jc-*` kept for admin / console) ============ */
+.jc-mono {
+  font-family: var(--font-mono);
+}
+.jc-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+  display: inline-block;
+}
+.jc-num { font-variant-numeric: tabular-nums; }
+.jc-admin-page {
+  width: 100%;
+}
+.jc-admin-metric {
+  min-width: 0;
+}
+/* Status color is functional: only amber / red are state colors and only
+   when a threshold trips. Other tones read as the neutral readout. */
+.jc-admin-metric[data-tone="amber"] .rt-Heading { color: var(--c-warning-text); }
+.jc-admin-metric[data-tone="red"] .rt-Heading { color: var(--c-danger-text); }
+.jc-live-metric {
+  display: inline-flex;
+  min-width: 3ch;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-end;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.jc-live-delta {
+  min-height: 12px;
+  margin-bottom: 2px;
+  color: var(--c-success);
+  font-size: var(--text-caption);
+  font-weight: 700;
+  line-height: 1;
+}
+.jc-overview-live-value {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+}
+.jc-data-table-bulkbar {
+  padding: 8px 10px;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--c-primary) 8%, transparent);
+}
+.jc-ticket-page {
+  container-type: inline-size;
+}
+.jc-ticket-layout {
+  width: 100%;
+}
+.jc-ticket-list-pane,
+.jc-ticket-detail-pane {
+  min-width: 0;
+}
+.jc-ticket-list-item {
+  padding: 10px 12px;
+  border-left: 3px solid transparent;
+  border-radius: 8px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  transition: background-color var(--dur-base) var(--ease-io), border-color var(--dur-base) var(--ease-io), box-shadow var(--dur-base) var(--ease-io), transform var(--dur-fast) var(--ease-out);
+}
+.jc-ticket-list-item:hover {
+  background: color-mix(in oklab, var(--accent-3) 62%, transparent);
+}
+.jc-ticket-list-item:active {
+  background: var(--accent-3);
+}
+.jc-ticket-list-item.is-selected {
+  background: var(--accent-3);
+  border-left-color: var(--accent-9);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent-9) 12%, transparent);
+}
+.jc-ticket-detail-card {
+  animation: jc-ticket-detail-in var(--dur-base) var(--ease-out);
+}
+@keyframes jc-ticket-detail-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.jc-ticket-filter-row > .rt-SelectTrigger {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.jc-ticket-thread-actions {
+  justify-content: flex-end;
+  margin-left: auto;
+  min-width: 0;
+}
+.jc-ticket-thread-actions > .rt-Button,
+.jc-ticket-thread-actions > .rt-SelectTrigger {
+  flex: 0 0 auto;
+}
+.jc-ticket-thread-actions > .rt-SelectTrigger {
+  width: auto;
+  min-width: 104px;
+}
+.jc-adjust-balance-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px;
+  gap: 8px;
+  align-items: end;
+}
+.jc-adjust-balance-row > * {
+  min-width: 0;
+}
+.jc-adjust-balance-row .rt-SelectTrigger {
+  width: 100%;
+}
+@container (max-width: 860px) {
+  .jc-ticket-layout {
+    align-content: flex-start;
+  }
+  .jc-ticket-list-pane,
+  .jc-ticket-detail-pane {
+    flex-basis: 100% !important;
+    width: 100%;
+    min-width: 0 !important;
+  }
+  .jc-ticket-list-pane {
+    flex-grow: 0 !important;
+    flex-shrink: 0 !important;
+  }
+  .jc-ticket-list-card {
+    height: 280px;
+    flex: 0 0 auto !important;
+    width: 100%;
+  }
+  .jc-ticket-detail-pane {
+    height: 520px;
+    min-height: 520px !important;
+    overflow: visible;
+  }
+}
+@container (max-width: 520px) {
+  .jc-ticket-filter-row > .rt-SelectTrigger {
+    flex-basis: 100%;
+  }
+}
+/* When the ticket layout stacks (panes go full-width via the @container
+   rule above), the page can no longer fit its two tall panes inside the
+   fixed `calc(100dvh - 156px)` height — the bottom pane (and its reply
+   composer) gets clipped with no way to reach it. Release the fixed
+   height on narrow viewports so the panes flow vertically and the
+   document scroll takes over. Inline style sets the height, so this
+   needs `!important`. */
+@media (max-width: 860px) {
+  .jc-ticket-page {
+    height: auto !important;
+    min-height: calc(100dvh - 156px);
+  }
+}
+@media (max-width: 480px) {
+  .jc-adjust-balance-row {
+    grid-template-columns: 1fr;
+  }
+}
+.jc-stat-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(min(160px, 100%), 1fr));
+}
+.jc-agent-dashboard-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+}
+.jc-agent-dashboard-card {
+  min-width: 0;
+  height: 100%;
+}
+.jc-agent-dashboard-value {
+  overflow-wrap: anywhere;
+}
+.jc-error-toast {
+  position: fixed;
+  top: 72px;
+  right: 18px;
+  z-index: 2000;
+  width: min(360px, calc(100vw - 36px));
+  padding: 12px 14px;
+  border: 1px solid var(--red-a6);
+  border-radius: 8px;
+  background: var(--c-surface-container-lowest);
+  box-shadow: 0 14px 40px -22px rgba(0, 0, 0, 0.65);
+}
+.jc-error-fallback {
+  min-height: calc(100dvh - 60px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.jc-error-fallback-card {
+  width: min(520px, 100%);
+}
+.jc-overview-topology,
+.jc-overview-metric-grid,
+.jc-vitals-grid {
+  min-width: 0;
+}
+.jc-overview-topology {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(min(360px, 100%), 0.85fr);
+  gap: 12px;
+  align-items: stretch;
+}
+.pn-console .rt-Card.jc-overview-panel.pn-card-flat {
+  --pn-card-pad: 18px;
+  height: 100%;
+  border: 1px solid var(--c-outline-variant);
+  background: var(--c-surface-container-lowest);
+}
+.jc-overview-panel-head {
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--c-outline-variant);
+}
+.jc-overview-panel-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--c-on-surface-variant);
+  background: var(--c-card-faint-bg);
+}
+.jc-overview-panel-meta {
+  flex: 0 0 auto;
+}
+.jc-overview-metric,
+.jc-vitals-metric,
+.jc-overview-ratio {
+  --jc-overview-tone: var(--gray-11);
+  --jc-overview-tone-bar: var(--gray-9);
+}
+.jc-overview-metric[data-tone="iris"],
+.jc-vitals-metric[data-tone="iris"],
+.jc-overview-ratio[data-tone="iris"] {
+  --jc-overview-tone: var(--accent-11);
+  --jc-overview-tone-bar: var(--accent-9);
+}
+.jc-overview-metric[data-tone="green"],
+.jc-vitals-metric[data-tone="green"],
+.jc-overview-ratio[data-tone="green"] {
+  --jc-overview-tone: var(--green-11);
+  --jc-overview-tone-bar: var(--green-9);
+}
+.jc-overview-metric[data-tone="red"],
+.jc-vitals-metric[data-tone="red"],
+.jc-overview-ratio[data-tone="red"] {
+  --jc-overview-tone: var(--red-11);
+  --jc-overview-tone-bar: var(--red-9);
+}
+.jc-overview-metric[data-tone="blue"],
+.jc-vitals-metric[data-tone="blue"],
+.jc-overview-ratio[data-tone="blue"] {
+  --jc-overview-tone: var(--blue-11);
+  --jc-overview-tone-bar: var(--blue-9);
+}
+.jc-overview-metric[data-tone="amber"],
+.jc-vitals-metric[data-tone="amber"],
+.jc-overview-ratio[data-tone="amber"] {
+  --jc-overview-tone: var(--amber-11);
+  --jc-overview-tone-bar: var(--amber-9);
+}
+.jc-overview-metric[data-tone="purple"],
+.jc-vitals-metric[data-tone="purple"],
+.jc-overview-ratio[data-tone="purple"] {
+  --jc-overview-tone: var(--purple-11);
+  --jc-overview-tone-bar: var(--purple-9);
+}
+.jc-overview-metric-grid,
+.jc-vitals-grid {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 10px;
+  background: var(--c-outline-variant);
+}
+.jc-overview-metric-grid {
+  grid-template-columns: repeat(var(--jc-overview-cols, 3), minmax(0, 1fr));
+}
+.jc-vitals-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.jc-overview-metric,
+.jc-vitals-metric {
+  min-width: 0;
+  background: var(--c-surface-container-lowest);
+}
+.jc-overview-metric {
+  min-height: 76px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.jc-overview-metric-label,
+.jc-vitals-topline {
+  color: var(--c-on-surface-variant);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.jc-overview-metric-value,
+.jc-vitals-value {
+  margin-top: 5px;
+  color: var(--jc-overview-tone);
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.08;
+  overflow-wrap: anywhere;
+}
+.jc-overview-metric-note {
+  margin-top: 5px;
+  color: var(--c-on-surface-variant);
+  font-size: 12px;
+  line-height: 1.25;
+}
+.jc-overview-ratio {
+  margin-top: 12px;
+}
+.jc-overview-ratio-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--c-on-surface-variant);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.jc-overview-ratio-track {
+  width: 100%;
+  height: 7px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--c-outline-variant) 70%, transparent);
+}
+.jc-overview-ratio-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--jc-overview-tone-bar);
+}
+.jc-vitals-metric {
+  padding: 12px;
+}
+.jc-vitals-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.jc-vitals-badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--jc-overview-tone);
+  background: color-mix(in oklab, var(--jc-overview-tone-bar) 14%, transparent);
+  font-size: var(--text-caption);
+}
+.jc-vitals-value {
+  font-size: 20px;
+}
+.jc-vitals-good-track {
+  height: 5px;
+  margin-top: 10px;
+}
+.jc-vitals-metric .jc-vitals-good-track > span {
+  background: var(--jc-overview-tone-bar);
+}
+.jc-overview-panel,
+.jc-overview-metric,
+.jc-vitals-metric {
+  min-width: 0;
+}
+.jc-usage-quota-grid {
+  display: grid;
+  gap: 12px;
+  width: 100%;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.jc-usage-quota-grid > * {
+  min-width: 0;
+}
+.jc-token-usage-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.jc-token-usage-grid > * {
+  min-width: 0;
+}
+.jc-token-usage-grid .rt-Card,
+.jc-token-usage-grid .rt-Card > * {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .jc-overview-topology {
+    grid-template-columns: 1fr;
+  }
+  .jc-vitals-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .jc-token-usage-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .jc-usage-quota-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 700px) {
+  .jc-overview-metric-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 560px) {
+  .jc-vitals-grid {
+    grid-template-columns: 1fr;
+  }
+  .jc-overview-metric-value {
+    font-size: 22px;
+  }
+  .jc-token-usage-grid {
+    grid-template-columns: 1fr;
+  }
+  .jc-usage-quota-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.jc-chart-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
+}
+.jc-log-filters,
+.jc-log-filter-row {
+  display: contents;
+}
+.jc-log-filter-select {
+  flex: 1 1 118px;
+  width: auto;
+  min-width: 108px;
+}
+.jc-log-filter-input {
+  flex: 1 1 var(--jc-log-filter-width);
+  width: auto;
+  min-width: 88px;
+  max-width: none;
+}
+.jc-log-filter-input .rt-TextFieldRoot {
+  width: 100%;
+  min-width: 0;
+}
+.jc-log-filter-range {
+  --jc-date-range-min-width: 356px;
+  flex: 1 1 var(--jc-date-range-min-width);
+  width: auto;
+  min-width: min(100%, var(--jc-date-range-min-width));
+  max-width: 100%;
+}
+.jc-log-filter-row.is-admin .jc-log-filter-range {
+  max-width: none;
+}
+.jc-admin-stats-filters .jc-log-filter-range {
+  --jc-date-range-min-width: 420px;
+  max-width: 560px;
+}
+.jc-admin-stats-filters .rt-SelectTrigger,
+.jc-admin-stats-filters .rt-TextFieldRoot {
+  width: 100%;
+}
+.jc-admin-log-filter-bar .jc-log-filter-range {
+  flex: 0 1 420px;
+  min-width: min(100%, 356px);
+  max-width: 520px;
+}
+.jc-admin-log-filter-bar .jc-log-filter-select {
+  flex: 0 0 auto;
+}
+.jc-admin-log-filter-bar .jc-log-filter-input {
+  flex: 0 0 var(--jc-log-filter-width);
+}
+.jc-admin-log-filter-reset {
+  flex: 0 0 auto;
+}
+.jc-date-range-trigger {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 8px;
+  background: var(--c-card-faint-bg);
+  color: var(--c-on-surface);
+  font: inherit;
+  font-size: 13px;
+  line-height: 18px;
+  text-align: left;
+  cursor: pointer;
+}
+.jc-date-range-trigger:hover {
+  border-color: color-mix(in oklab, var(--c-primary) 44%, var(--c-outline-variant));
+}
+.jc-date-range-trigger svg {
+  flex: 0 0 auto;
+  color: var(--c-on-surface-variant);
+}
+.jc-date-range-trigger span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.jc-date-range-popover {
+  padding: 0 !important;
+  overflow: hidden;
+  max-width: calc(100vw - 20px);
+  box-sizing: border-box;
+  background: var(--c-surface-container-lowest) !important;
+  border: 1px solid var(--c-outline-variant) !important;
+  box-shadow: 0 18px 48px -28px rgba(0, 0, 0, 0.45);
+}
+.jc-date-range-panel {
+  width: min(calc(100vw - 24px), 640px);
+  color: var(--c-on-surface);
+}
+.jc-date-range-calendars {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px;
+  padding: 14px 14px 12px;
+}
+.jc-date-calendar {
+  min-width: 0;
+}
+.jc-date-calendar-head {
+  display: grid;
+  grid-template-columns: 28px 28px minmax(0, 1fr) 28px 28px;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  margin-bottom: 14px;
+}
+.jc-date-calendar-head > div {
+  text-align: center;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--c-on-surface);
+}
+.jc-date-calendar-head button,
+.jc-date-days button,
+.jc-date-range-presets button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.jc-date-calendar-head button {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  color: var(--c-on-surface-variant);
+}
+.jc-date-calendar-head button:hover {
+  background: var(--c-card-faint-bg);
+  color: var(--c-on-surface);
+}
+.jc-date-weekdays,
+.jc-date-days {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+.jc-date-weekdays {
+  border-bottom: 1px solid var(--c-outline-variant);
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+}
+.jc-date-weekdays span {
+  text-align: center;
+  color: var(--c-on-surface-variant);
+  font-size: 13px;
+  line-height: 24px;
+}
+.jc-date-days button {
+  position: relative;
+  z-index: 0;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.jc-date-days button:hover {
+  background: color-mix(in oklab, var(--c-primary) 10%, transparent);
+}
+.jc-date-days button.is-outside {
+  color: color-mix(in oklab, var(--c-on-surface-variant) 44%, transparent);
+}
+.jc-date-days button.is-in-range {
+  background: color-mix(in oklab, var(--c-secondary) 14%, transparent);
+}
+.jc-date-days button.is-selected {
+  border-radius: 5px;
+  background: var(--c-primary);
+  color: var(--c-on-primary);
+  font-weight: 700;
+}
+.jc-date-days button.is-today:not(.is-selected) {
+  color: var(--c-primary-bright);
+  font-weight: 700;
+}
+.jc-date-range-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  border-top: 1px solid var(--c-outline-variant);
+}
+.jc-date-time-endpoint {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: max-content max-content;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+}
+.jc-date-time-endpoint + .jc-date-time-endpoint {
+  border-left: 1px solid var(--c-outline-variant);
+}
+.jc-date-time-date,
+.jc-date-time-time {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--c-on-surface);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.jc-date-time-date {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+.jc-date-time-date span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.jc-date-time-time {
+  color: var(--c-on-surface-variant);
+}
+.jc-date-time-date svg,
+.jc-date-time-time svg {
+  flex: 0 0 auto;
+  color: var(--c-on-surface-variant);
+}
+.jc-date-time-time input {
+  width: 96px;
+  min-width: 96px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color-scheme: dark light;
+}
+.jc-date-time-time input:focus {
+}
+.jc-date-range-presets {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--c-outline-variant);
+}
+.jc-date-range-presets button {
+  min-height: 24px;
+  border-radius: 999px;
+  background: var(--c-card-faint-bg);
+  font-size: 14px;
+  font-weight: 700;
+}
+.jc-date-range-presets button:hover {
+  background: color-mix(in oklab, var(--c-primary) 14%, transparent);
+}
+
+@media (max-width: 900px) {
+  .jc-date-range-panel {
+    width: min(calc(100vw - 24px), 360px);
+  }
+  .jc-date-range-calendars,
+  .jc-date-range-footer {
+    grid-template-columns: 1fr;
+  }
+  .jc-date-range-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .jc-date-range-calendars .jc-date-calendar + .jc-date-calendar {
+    display: none;
+  }
+  .jc-date-time-endpoint + .jc-date-time-endpoint {
+    border-top: 1px solid var(--c-outline-variant);
+    border-left: 0;
+  }
+  .jc-date-range-presets {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Container shared by admin/console pages (max 1200px + symmetric padding). */
+.jc-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding-inline: 24px;
+  width: 100%;
+  box-sizing: border-box;
+}
+@media (max-width: 640px) {
+  .jc-container { padding-inline: 16px; }
+}
+
+/* ============ Root shell ============ */
+.jc-root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.jc-root-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.recharts-responsive-container { max-width: 100%; }
+.jc-table-card {
+  background: var(--c-surface-container);
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 12px;
+  overflow: hidden;
+}
+

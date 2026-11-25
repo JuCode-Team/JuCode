@@ -1,0 +1,648 @@
+//! JuCode gateway OAuth: the `/cli/oauth` authorization-code flow against the
+//! JuCode web/API pair, plus the token refresh the LLM client uses.
+//!
+//! Provider-agnostic pieces (PKCE, loopback callbacks, URL encoding, browser
+//! launch, JSON plumbing) live in `llm_provider_kit::oauth`; this module owns
+//! what is JuCode's own: the gateway endpoints, the device label, and the
+//! gateway's model list.
+
+use crate::config::{AuthStore, JucodeTokens};
+use llm_provider_kit::oauth::{
+    open_browser, parse_callback_query, pkce_challenge, random_token, unix_now, url_encode,
+    write_callback_response,
+};
+use serde_json::{json, Value};
+use std::{
+    io::{BufRead, BufReader},
+    net::TcpListener,
+    process::Command,
+    sync::{Mutex, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
+
+const CLIENT_ID: &str = "jucode-cli";
+/// How a revoke may hold up a logout or a new login: it is only tidying.
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// Text the browser shows after landing on the CLI callback.
+const CALLBACK_LOGIN_COMPLETE: &str = "JuCode CLI login complete. You can close this tab.";
+const CALLBACK_LOGIN_FAILED: &str = "JuCode CLI login failed. Return to the terminal.";
+
+#[derive(Debug)]
+pub struct OAuthLoginResult {
+    pub web_url: String,
+    pub api_url: String,
+    pub tokens: Tokens,
+    pub models: Vec<OAuthModel>,
+}
+
+/// OAuth token bundle. Times are absolute unix seconds so the caller can
+/// decide when to refresh without re-deriving from a relative TTL.
+#[derive(Debug, Clone)]
+pub struct Tokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_at: u64,
+    pub refresh_expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthModel {
+    pub id: String,
+    /// Smallest window among the gateway accounts serving the model;
+    /// `max_context_window` the largest. None: the gateway has none set.
+    pub context_window: Option<u64>,
+    pub max_context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub reasoning_efforts: Option<Vec<String>>,
+    /// What pickers show; None: the id.
+    pub display_name: Option<String>,
+    /// The window range through each of the user's groups (group id →
+    /// smallest, largest).
+    pub group_windows: std::collections::BTreeMap<String, (u64, u64)>,
+    /// Left out of model pickers; still callable by name.
+    pub hidden: bool,
+}
+
+pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
+    let web_url = web_url.trim().trim_end_matches('/').to_string();
+    let api_url = api_url.trim().trim_end_matches('/').to_string();
+    if web_url.is_empty() {
+        return Err("JuCode web URL cannot be empty".to_string());
+    }
+    if api_url.is_empty() {
+        return Err("JuCode API URL cannot be empty".to_string());
+    }
+
+    let verifier = random_token(32)?;
+    let challenge = pkce_challenge(&verifier);
+    let state = random_token(24)?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    let authorize_url = format!(
+        "{}/cli/oauth?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}",
+        web_url,
+        url_encode(CLIENT_ID),
+        url_encode(&redirect_uri),
+        url_encode(&challenge),
+        url_encode(&state),
+    );
+    open_browser(&authorize_url)
+        .map_err(|error| format!("{error}. Open manually: {authorize_url}"))?;
+
+    let deadline = Instant::now() + CALLBACK_TIMEOUT;
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err("timed out waiting for OAuth callback".to_string());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(CALLBACK_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .map_err(|error| error.to_string())?;
+    let params = parse_callback_query(&request_line)?;
+    let mut stream = reader.into_inner();
+
+    if params.get("state") != Some(&state) {
+        write_callback_response(&mut stream, CALLBACK_LOGIN_FAILED)?;
+        return Err("OAuth state mismatch".to_string());
+    }
+    let Some(code) = params.get("code").filter(|value| !value.is_empty()) else {
+        write_callback_response(&mut stream, CALLBACK_LOGIN_FAILED)?;
+        return Err("OAuth callback did not include code".to_string());
+    };
+    write_callback_response(&mut stream, CALLBACK_LOGIN_COMPLETE)?;
+
+    let tokens = exchange_code(&api_url, code, &redirect_uri, &verifier, &device_name())?;
+    let models = fetch_models(&api_url, &tokens.access_token).unwrap_or_default();
+    Ok(OAuthLoginResult {
+        web_url,
+        api_url,
+        tokens,
+        models,
+    })
+}
+
+fn exchange_code(
+    base_url: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    device_name: &str,
+) -> Result<Tokens, String> {
+    let url = format!("{}/v1/oauth/token", base_url);
+    // ureq::Error is large; it is ureq's own type, passed through as is.
+    #[allow(clippy::result_large_err)]
+    let response = send_with_retry(|| {
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_json(json!({
+                "grant_type": "authorization_code",
+                "client_id": CLIENT_ID,
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
+                "device_name": device_name,
+            }))
+    });
+    parse_tokens(&json_response(response)?)
+}
+
+/// Why a refresh failed: the server refused the refresh token (revoked,
+/// expired, already used), or it could not be asked (network, server error).
+#[derive(Debug)]
+pub enum RefreshError {
+    Rejected(String),
+    Failed(String),
+}
+
+/// Exchange a refresh token for a fresh access+refresh pair (rotation).
+/// Used by the LLM client when the access token has expired or is rejected.
+pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, RefreshError> {
+    let api_url = api_url.trim().trim_end_matches('/');
+    if api_url.is_empty() {
+        return Err(RefreshError::Failed(
+            "JuCode API URL cannot be empty".to_string(),
+        ));
+    }
+    let url = format!("{}/v1/oauth/token", api_url);
+    // ureq::Error is large; it is ureq's own type, passed through as is.
+    #[allow(clippy::result_large_err)]
+    let response = send_with_retry(|| {
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_json(json!({
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "refresh_token": refresh_token,
+            }))
+    });
+    // 400/401 are the gateway refusing this refresh token; anything else
+    // (a dropped connection, a 5xx while its database is slow) is worth retrying.
+    let refused = matches!(&response, Err(ureq::Error::Status(400 | 401, _)));
+    json_response(response)
+        .and_then(|value| parse_tokens(&value))
+        .map_err(|error| {
+            if refused {
+                RefreshError::Rejected(error)
+            } else {
+                RefreshError::Failed(error)
+            }
+        })
+}
+
+/// Serializes session checks within the process. Refresh tokens are single
+/// use, so the turn loop and a tool thread refreshing at once would burn the
+/// session.
+static SESSION_REFRESH: Mutex<()> = Mutex::new(());
+
+/// Serializes session checks across processes: the desktop, the daemon and
+/// every `jucode serve` share auth.json, and the gateway revokes a refresh
+/// token as soon as it is used, so two processes refreshing at once leave one
+/// of them saving a dead token. Held from the reload to the save; the lock is
+/// released when the file closes.
+fn lock_auth_refresh() -> Result<std::fs::File, String> {
+    let dir = crate::config::profile_dir().map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join("auth.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    file.lock()
+        .map_err(|error| format!("failed to lock {}: {error}", path.display()))?;
+    Ok(file)
+}
+
+/// Reloads auth.json and returns it holding a JuCode access token that is good
+/// for at least two more minutes, refreshing the session first when needed.
+pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore, String> {
+    session(api_url, encrypt_secrets, None)
+}
+
+/// `ensure_session` after a server refused `refused`, the access token it was
+/// given: refreshes although the token has not expired, unless another
+/// process has replaced it already.
+pub fn refresh_refused(
+    api_url: &str,
+    encrypt_secrets: bool,
+    refused: &str,
+) -> Result<AuthStore, String> {
+    session(api_url, encrypt_secrets, Some(refused))
+}
+
+fn session(
+    api_url: &str,
+    encrypt_secrets: bool,
+    refused: Option<&str>,
+) -> Result<AuthStore, String> {
+    let _guard = SESSION_REFRESH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_guard = lock_auth_refresh()?;
+    // Reload from disk first. The Desktop shell shares ~/.jucode/auth.json and
+    // may have rotated the refresh token out-of-band; picking up its tokens
+    // avoids refreshing with a stale one and a spurious "session expired".
+    let mut auth = AuthStore::load_or_create(encrypt_secrets)
+        .map_err(|error| format!("failed to reload auth.json: {error}"))?;
+    if auth.jucode_login_copied() {
+        return Err(
+            "this JuCode login was copied from another computer. Run /login to sign in on this one."
+                .to_string(),
+        );
+    }
+    if auth.claim_jucode_login() {
+        auth.save().map_err(|error| error.to_string())?;
+    }
+    let now = unix_now();
+    let (access_ok, refresh_token, refresh_alive) = match auth.jucode_tokens() {
+        Some(t) => (
+            t.access_expires_at > now + 120 && refused != Some(t.access_token.as_str()),
+            t.refresh_token.clone(),
+            t.refresh_expires_at > now,
+        ),
+        None => return Err("not logged in to JuCode. Run /login.".to_string()),
+    };
+    if access_ok {
+        return Ok(auth);
+    }
+    if !refresh_alive {
+        auth.clear_jucode();
+        let _ = auth.save();
+        return Err("JuCode session expired. Run /login to sign in again.".to_string());
+    }
+    match refresh(api_url, &refresh_token) {
+        Ok(t) => {
+            crate::log_info!("oauth", "refreshed jucode access token");
+            auth.set_jucode_tokens(JucodeTokens {
+                access_token: t.access_token,
+                refresh_token: t.refresh_token,
+                access_expires_at: t.access_expires_at,
+                refresh_expires_at: t.refresh_expires_at,
+                machine: crate::machine::machine_id().map(str::to_string),
+            });
+            auth.save().map_err(|error| error.to_string())?;
+            Ok(auth)
+        }
+        Err(RefreshError::Rejected(error)) => {
+            // Revoked or expired on the server: signed out here too, so every
+            // client shows sign-in instead of retrying a dead login.
+            crate::log_error!("oauth", "token refresh refused", error = error.clone());
+            auth.clear_jucode();
+            let _ = auth.save();
+            Err(format!(
+                "the JuCode login is no longer valid ({error}). Run /login to sign in again."
+            ))
+        }
+        Err(RefreshError::Failed(error)) => {
+            crate::log_error!("oauth", "token refresh failed", error = error.clone());
+            Err(format!("failed to refresh JuCode session: {error}"))
+        }
+    }
+}
+
+/// Signs this computer out: the device authorization is revoked on the
+/// gateway (best effort: offline, the web console can still revoke it) and
+/// the tokens are dropped. A login copied from another computer is only
+/// dropped; revoking it would sign that computer out.
+pub fn logout(api_url: &str, encrypt_secrets: bool) -> Result<(), String> {
+    let _guard = SESSION_REFRESH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_guard = lock_auth_refresh()?;
+    let mut auth = AuthStore::load_or_create(encrypt_secrets)
+        .map_err(|error| format!("failed to reload auth.json: {error}"))?;
+    if let Some(tokens) = auth.jucode_tokens() {
+        if let Err(error) = revoke(api_url, &tokens.refresh_token) {
+            crate::log_error!("oauth", "device revoke failed", error = error);
+        }
+    }
+    auth.clear_jucode();
+    auth.save().map_err(|error| error.to_string())
+}
+
+/// Revokes the device authorization a refresh token belongs to.
+pub fn revoke(api_url: &str, refresh_token: &str) -> Result<(), String> {
+    let url = format!("{}/v1/oauth/revoke", api_url.trim().trim_end_matches('/'));
+    json_response(
+        ureq::post(&url)
+            .timeout(REVOKE_TIMEOUT)
+            .set("Content-Type", "application/json")
+            .send_json(json!({ "refresh_token": refresh_token })),
+    )
+    .map(|_| ())
+}
+
+fn parse_tokens(value: &Value) -> Result<Tokens, String> {
+    let access_token = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "OAuth token response did not include access_token".to_string())?;
+    let refresh_token = value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "OAuth token response did not include refresh_token".to_string())?;
+    let now = unix_now();
+    let expires_in = value
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600);
+    let refresh_expires_in = value
+        .get("refresh_expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(90 * 24 * 3600);
+    Ok(Tokens {
+        access_token,
+        refresh_token,
+        access_expires_at: now.saturating_add(expires_in),
+        refresh_expires_at: now.saturating_add(refresh_expires_in),
+    })
+}
+
+/// GET an OAuth-protected JSON endpoint (e.g. /v1/oauth/userinfo) with the
+/// device access token. Used by the `/usage` command.
+pub fn get_json(api_url: &str, path: &str, access_token: &str) -> Result<Value, String> {
+    let url = format!("{}{}", api_url.trim_end_matches('/'), path);
+    json_response(
+        ureq::get(&url)
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .call(),
+    )
+}
+
+fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, String> {
+    let url = format!("{}/v1/models", base_url);
+    // ureq::Error is large; it is ureq's own type, passed through as is.
+    #[allow(clippy::result_large_err)]
+    let value = json_response(send_with_retry(|| {
+        ureq::get(&url)
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .call()
+    }))?;
+    Ok(parse_models_response(&value))
+}
+
+static CLIENT_LABEL: OnceLock<&'static str> = OnceLock::new();
+
+/// Names the app in device labels ("JuCode CLI" unless set): the daemon
+/// signs in for the desktop.
+pub fn set_client_label(label: &'static str) {
+    let _ = CLIENT_LABEL.set(label);
+}
+
+/// A human-facing device label shown under 授权设备管理: the app, hostname,
+/// OS and the start of the machine id, which tells apart two computers
+/// with the same default hostname. Never fails.
+fn device_name() -> String {
+    let app = CLIENT_LABEL.get().copied().unwrap_or("JuCode CLI");
+    let host = hostname().unwrap_or_else(|| "unknown-host".to_string());
+    let mut name = format!("{app} · {host} ({})", std::env::consts::OS);
+    if let Some(id) = crate::machine::machine_id() {
+        name.push_str(&format!(" · {}", &id[..4]));
+    }
+    name
+}
+
+pub fn hostname() -> Option<String> {
+    if cfg!(windows) {
+        return std::env::var("COMPUTERNAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+fn parse_models_response(value: &Value) -> Vec<OAuthModel> {
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(parse_model)
+        .collect()
+}
+
+fn parse_model(item: &Value) -> Option<OAuthModel> {
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some(OAuthModel {
+        id,
+        context_window: read_u64_field(item, &["context_window", "context_length"]),
+        max_context_window: read_u64_field(item, &["max_context_window"]),
+        max_output_tokens: read_u64_field(item, &["max_output_tokens", "max_output"]),
+        reasoning_efforts: item
+            .get("reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty()),
+        display_name: item
+            .get("display_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string),
+        group_windows: crate::config::read_group_windows(item.get("group_context_windows")),
+        hidden: item.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// A positive count under the first of `keys` present; 0 reads as unset.
+fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(Value::as_u64)
+        .filter(|v| *v > 0)
+}
+
+/// Gateway errors name the service; the kit's helper reports the bare status.
+/// Sends a request, retrying failures that happen before the server sees it
+/// (DNS, connect, TLS setup). Proxies on flaky links drop these now and then,
+/// and a one-time authorization code or single-use refresh token must not be
+/// lost to one; a request that reached the server is never repeated.
+#[allow(clippy::result_large_err)] // ureq::Error, passed through as is
+fn send_with_retry(
+    send: impl Fn() -> Result<ureq::Response, ureq::Error>,
+) -> Result<ureq::Response, ureq::Error> {
+    let mut delay = Duration::from_millis(500);
+    for _ in 0..3 {
+        match send() {
+            Err(ureq::Error::Transport(t))
+                if matches!(
+                    t.kind(),
+                    ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed
+                ) =>
+            {
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            other => return other,
+        }
+    }
+    send()
+}
+
+fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
+    llm_provider_kit::oauth::json_response(response)
+        .map_err(|error| format!("JuCode OAuth returned {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server that answers one request with `status` and a JSON error.
+    fn answering(status: u16) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = r#"{"error":"nope"}"#;
+                let _ = std::io::Write::write_all(
+                    &mut stream,
+                    format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes(),
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_refused_refresh_token_is_rejected_and_a_server_error_is_not() {
+        assert!(matches!(
+            refresh(&answering(401), "rt"),
+            Err(RefreshError::Rejected(_))
+        ));
+        assert!(matches!(
+            refresh(&answering(400), "rt"),
+            Err(RefreshError::Rejected(_))
+        ));
+        assert!(matches!(
+            refresh(&answering(500), "rt"),
+            Err(RefreshError::Failed(_))
+        ));
+        assert!(matches!(
+            refresh("http://127.0.0.1:1", "rt"),
+            Err(RefreshError::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn parses_model_metadata_from_models_response() {
+        let value = json!({
+            "data": [{
+                "id": "gpt-5.5",
+                "context_window": 272000,
+                "max_context_window": 1050000,
+                "max_output_tokens": 128000,
+                "reasoning_efforts": ["low", "medium"],
+                "display_name": " GPT-5.5 ",
+                "group_context_windows": {
+                    "g-small": { "context_window": 272000, "max_context_window": 272000 },
+                    "g-big": { "context_window": 1050000 },
+                    "g-unset": { "context_window": 0 }
+                }
+            }]
+        });
+
+        assert_eq!(
+            parse_models_response(&value),
+            vec![OAuthModel {
+                id: "gpt-5.5".to_string(),
+                context_window: Some(272_000),
+                max_context_window: Some(1_050_000),
+                max_output_tokens: Some(128_000),
+                reasoning_efforts: Some(vec!["low".to_string(), "medium".to_string()]),
+                display_name: Some("GPT-5.5".to_string()),
+                group_windows: [
+                    ("g-big".to_string(), (1_050_000, 1_050_000)),
+                    ("g-small".to_string(), (272_000, 272_000)),
+                ]
+                .into(),
+                hidden: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_hidden_flag_and_defaults_to_shown() {
+        let value =
+            json!({ "data": [{ "id": "codex-auto-review", "hidden": true }, { "id": "gpt-5.5" }] });
+        let models = parse_models_response(&value);
+        assert!(models[0].hidden);
+        assert!(!models[1].hidden);
+    }
+
+    #[test]
+    fn parses_legacy_id_only_models_response() {
+        let value = json!({ "data": [{ "id": "gpt-5.4-mini" }] });
+
+        assert_eq!(
+            parse_models_response(&value),
+            vec![OAuthModel {
+                id: "gpt-5.4-mini".to_string(),
+                context_window: None,
+                max_context_window: None,
+                max_output_tokens: None,
+                reasoning_efforts: None,
+                display_name: None,
+                group_windows: Default::default(),
+                hidden: false,
+            }]
+        );
+    }
+}

@@ -1,0 +1,2660 @@
+use serde_json::{json, Map, Value};
+use std::{
+    collections::BTreeMap,
+    env, fs, io,
+    io::{IsTerminal, Write},
+    path::{Path, PathBuf},
+};
+
+/// What a session without a model provider says instead of running a turn.
+pub const NO_PROVIDER_MESSAGE: &str = "No model provider is configured. Run /login to pick one: \
+/login <provider> <api-key> stores an API key (/login list shows the providers), \
+/login <web-url> [api-url] signs in to a self-hosted JuCode server. \
+Or set provider, base_url and model in ~/.jucode/config.json.";
+
+pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are JuCode, a focused coding agent.
+
+Work with care before speed. Understand the task and the existing code before making changes. If the request is ambiguous or a key detail cannot be inferred safely, say so and ask a concise question. If there are multiple reasonable approaches, surface the tradeoff briefly.
+
+Autonomy and persistence: for implementation, debugging, and evaluation tasks, assume the user wants the work completed end-to-end in the current turn whenever feasible. Do not stop at analysis, repo exploration, a partial patch, or a failed tool call. Continue through implementation, focused verification, and a clear final report unless the user explicitly asks only for a plan or redirects you.
+
+Prefer the smallest change that correctly solves the problem. Avoid speculative features, unnecessary abstraction, broad refactors, and hidden compatibility layers unless they are explicitly needed. Match the project's existing structure, style, naming, and conventions.
+
+Fix root causes rather than symptoms. Do not hide problems with silent fallback behavior or vague recovery paths. Use defensive programming only when the boundary is real and relevant.
+
+Use tools when you need filesystem, search, shell, or verification access. Inspect before editing. Logically group related actions: when multiple read-only searches, listings, file reads, or shell inspections are independent, call them together in one assistant response; keep dependent edit-after-read and verify-after-edit steps ordered. Keep edits scoped to the affected files, and do not modify unrelated work. If a tool call fails, read the error, correct the call or use another suitable tool, and keep going when the task is still feasible.
+
+For greenfield tasks in an empty or minimal repository, create the required project skeleton instead of stopping after inspection. Add the expected manifest/config, source entrypoints, and test files for the requested language or framework before verifying.
+
+Be accurate. Do not fabricate facts about APIs, tools, commands, or the codebase. When uncertain, verify from reliable sources or state the uncertainty clearly.
+
+Verify before claiming completion. Use the smallest meaningful checks for the change, such as focused tests, builds, formatters, or linters. If verification fails, inspect the failure, fix the likely cause, and rerun the focused check before ending. If verification is not possible, report that plainly.
+
+Finish gate: do not end an implementation task after only listing or reading files, and do not report success without either relevant file changes or a clear reason no change was needed. Do not end while required files are missing, a required contract is unimplemented, or the last relevant verification failed.
+
+For user-facing work, preserve the existing product language and design system. Build coherent, useful interfaces without fake data, decorative filler, or new visual styles unless requested.
+
+Communicate directly and concisely. Report behavior-level changes, important risks, verification results, and any remaining gaps."#;
+const PROMPT_FILE_NAME: &str = "prompt.txt";
+const DEFAULT_RETRY_ATTEMPTS: usize = 5;
+const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_READ_TIMEOUT_SECONDS: u64 = 300;
+/// Percentage of the model's context window at which older turns are compacted.
+const DEFAULT_COMPACTION_THRESHOLD_PERCENT: u64 = 75;
+const DEFAULT_COMPACT_REASONING_EFFORT: &str = "low";
+/// Default per-call timeout for MCP servers; overridable per server.
+pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 60;
+
+/// Engine-level tool approval mode. The single decision point for which tool
+/// calls need a user decision is [`ApprovalMode::requires_approval`]; every
+/// other layer (client-side gating, core-side auto-approval) defers to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalMode {
+    /// Every mutating tool (file edits and shell/stdin) requires approval.
+    #[default]
+    Manual,
+    /// File-editing tools run without approval; shell/stdin still ask.
+    AutoEdit,
+    /// AutoEdit plus a safety classifier that auto-approves shell commands it
+    /// judges safe; unsafe, ambiguous, or unclassifiable commands still ask.
+    Auto,
+    /// Everything runs without approval.
+    FullAccess,
+    /// Planning: only read-only tools run (see `plan_mode::refusal`); the
+    /// agent ends by proposing a plan. Gated like `Manual` for anything that
+    /// reaches the approval layer.
+    Plan,
+}
+
+impl ApprovalMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::AutoEdit => "auto-edit",
+            Self::Auto => "auto",
+            Self::FullAccess => "full-access",
+            Self::Plan => "plan",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "manual" => Ok(Self::Manual),
+            "auto-edit" => Ok(Self::AutoEdit),
+            "auto" => Ok(Self::Auto),
+            "full-access" => Ok(Self::FullAccess),
+            "plan" => Ok(Self::Plan),
+            other => Err(format!(
+                "unknown approval mode '{other}': use manual, auto-edit, auto, full-access, or plan"
+            )),
+        }
+    }
+
+    /// Whether a call to `tool_name` needs a user decision under this mode.
+    /// Under `auto`, shell tools still count as gated here — the safety
+    /// classifier runs first and may resolve the call before the user is asked.
+    pub fn requires_approval(&self, tool_name: &str) -> bool {
+        // MCP tools are untrusted by default. Without the readOnlyHint in
+        // hand this gates conservatively; hint-aware callers use
+        // `requires_approval_for_mcp` instead.
+        if is_mcp_tool(tool_name) {
+            return self.requires_approval_for_mcp(false);
+        }
+        if is_shell_tool(tool_name) {
+            return *self != Self::FullAccess;
+        }
+        // generate_image writes files into the workspace like `write`.
+        if is_edit_tool(tool_name) || tool_name == crate::images::TOOL_NAME {
+            return self.is_strict();
+        }
+        // Network egress can exfiltrate local context, so the strictest mode
+        // still asks; both auto modes already accept broader side effects.
+        if is_network_tool(tool_name) {
+            return self.is_strict();
+        }
+        false
+    }
+
+    /// Whether a shell-tool call should go through the safety classifier
+    /// before falling back to a user decision. Only `auto` classifies.
+    pub fn classifies_shell(&self) -> bool {
+        *self == Self::Auto
+    }
+
+    /// Manual, and plan mode for any call that still reaches the approval
+    /// layer (plan mode refuses mutating tools before that).
+    fn is_strict(&self) -> bool {
+        matches!(self, Self::Manual | Self::Plan)
+    }
+
+    /// Approval policy for MCP tools, given the server's `readOnlyHint`
+    /// annotation: manual asks for everything, the auto modes ask unless the
+    /// tool is marked read-only, full-access never asks.
+    pub fn requires_approval_for_mcp(&self, read_only_hint: bool) -> bool {
+        match self {
+            Self::Manual | Self::Plan => true,
+            Self::AutoEdit | Self::Auto => !read_only_hint,
+            Self::FullAccess => false,
+        }
+    }
+}
+
+/// A session's approval mode as its core and its running clients (the
+/// turn, subagents) all see it: a switch applies to the next tool call,
+/// mid-turn too, tightening as well as loosening.
+#[derive(Debug, Clone, Default)]
+pub struct LiveApprovalMode(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl LiveApprovalMode {
+    const MODES: [ApprovalMode; 5] = [
+        ApprovalMode::Manual,
+        ApprovalMode::AutoEdit,
+        ApprovalMode::Auto,
+        ApprovalMode::FullAccess,
+        ApprovalMode::Plan,
+    ];
+
+    pub fn new(mode: ApprovalMode) -> Self {
+        let live = Self::default();
+        live.set(mode);
+        live
+    }
+
+    pub fn get(&self) -> ApprovalMode {
+        let index = self.0.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        Self::MODES.get(index).copied().unwrap_or_default()
+    }
+
+    pub fn set(&self, mode: ApprovalMode) {
+        let index = Self::MODES.iter().position(|m| *m == mode).unwrap_or(0);
+        self.0
+            .store(index as u8, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a tool name belongs to an MCP server (`mcp__<server>__<tool>`).
+pub(crate) fn is_mcp_tool(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
+pub(crate) fn is_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash" | "execute" | "exec_command" | "shell_command" | "write_stdin"
+    )
+}
+
+fn is_edit_tool(name: &str) -> bool {
+    canonical_edit_tool_name(name).is_some()
+}
+
+/// Canonical edit-tool names in the order they appear in
+/// `tools::definitions()`.
+pub const EDIT_TOOL_NAMES: [&str; 4] = ["str_replace", "hashline_edit", "write", "apply_patch"];
+
+/// Canonical name for an edit tool, accepting the `edit` alias for
+/// `str_replace`. Returns None for anything that is not an edit tool.
+pub fn canonical_edit_tool_name(name: &str) -> Option<&'static str> {
+    match name {
+        "hashline_edit" => Some("hashline_edit"),
+        "str_replace" | "edit" => Some("str_replace"),
+        "write" => Some("write"),
+        "apply_patch" => Some("apply_patch"),
+        _ => None,
+    }
+}
+
+/// Edit tools exposed to the model when config.json has no `edit_tools`
+/// field. Only hashline_edit is on by default; users opt in to the others
+/// with e.g. `"edit_tools": ["hashline_edit", "str_replace", "write"]`.
+pub fn default_edit_tools() -> Vec<String> {
+    vec!["hashline_edit".to_string()]
+}
+
+fn is_network_tool(name: &str) -> bool {
+    matches!(name, "web_fetch" | "web_search")
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub provider: String,
+    /// Wire protocol override: "responses" | "azure" | "anthropic" |
+    /// "chat". Empty falls back to the per-model heuristic (claude-* →
+    /// anthropic, else responses).
+    pub protocol: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub compact_model: String,
+    pub compact_reasoning_effort: String,
+    /// Model used by the `auto` approval mode's safety classifier. Absent or
+    /// empty in config.json falls back to `compact_model`.
+    pub safety_model: String,
+    pub safety_reasoning_effort: String,
+    /// Model that names conversations (`jucode daemon`). Empty: the main
+    /// `model`.
+    pub title_model: String,
+    /// Model behind `generate_image`. Empty: the first of `models` whose
+    /// name contains "image" (see `images::resolve_model`).
+    pub image_model: String,
+    pub models: Vec<ModelConfig>,
+    /// Models the main agent may pick for `spawn_agent` (`subagent_models`),
+    /// each with a note on when to use it. Empty: subagents run on the main
+    /// agent's own model only.
+    pub subagent_models: Vec<SubagentModel>,
+    /// The JuCode gateway models the user chose to show (`jucode_models`),
+    /// out of everything their account can reach. Becomes `models` whenever
+    /// the provider is jucode; empty until the first login.
+    pub jucode_models: Vec<ModelConfig>,
+    /// JuCode group id per model name (`jucode_groups`): requests for that
+    /// model go only through that group (`X-JuCode-Group`). A model without
+    /// an entry is routed automatically across every group the account has.
+    pub jucode_groups: BTreeMap<String, String>,
+    /// Context windows the user set by hand (`context_window_overrides`),
+    /// keyed by model name. Applied by `model_config`: fills in a window the
+    /// gateway did not configure, or raises the advertised (smallest-account)
+    /// window toward the model's `max_context_window`. Survives re-login,
+    /// which rewrites `jucode_models` from the gateway.
+    pub context_window_overrides: BTreeMap<String, u64>,
+    pub base_url: String,
+    /// Where `/login` opens the JuCode sign-in page; empty until the user
+    /// sets their self-hosted server.
+    pub jucode_web_url: String,
+    /// The JuCode account service (OAuth tokens, usage); empty until set.
+    pub jucode_api_url: String,
+    /// The JuCode web app; remote-access pairing links open here. Empty
+    /// until set.
+    pub jucode_app_url: String,
+    pub api_key_env: String,
+    pub retry_attempts: usize,
+    pub connect_timeout_seconds: u64,
+    pub read_timeout_seconds: u64,
+    pub compaction_threshold_percent: u64,
+    pub include_project_instructions: bool,
+    pub encrypt_secrets: bool,
+    pub approval_mode: ApprovalMode,
+    /// Edit tools offered to the model (`edit_tools` in config.json).
+    /// Canonical names: hashline_edit, str_replace (alias edit), write,
+    /// apply_patch. Defaults to hashline_edit only; an explicit empty array
+    /// disables all edit tools. Tools not listed here are neither sent to the
+    /// model nor executed if called anyway.
+    pub edit_tools: Vec<String>,
+    /// Optional additional GitHub skill repository. "anthropic" selects the
+    /// pinned built-in index for https://github.com/anthropics/skills.
+    pub extra_skills_source: Option<String>,
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Sandbox for shell commands (`sandbox`, `sandbox_network`,
+    /// `sandbox_directories`, `command_rules` in config.json).
+    pub sandbox: crate::sandbox::SandboxPolicy,
+    /// Engine behind `web_search`, served by the JuCode gateway: one of
+    /// `crate::web::SEARCH_ENGINES`.
+    pub web_search_engine: String,
+    /// Engine behind `web_fetch`: `local` fetches from this machine, the
+    /// others go through the JuCode gateway (`crate::web::FETCH_ENGINES`).
+    pub web_fetch_engine: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
+}
+
+impl McpTransportKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "" | "stdio" => Ok(Self::Stdio),
+            "http" => Ok(Self::Http),
+            other => Err(format!(
+                "unknown MCP transport '{other}': use stdio or http"
+            )),
+        }
+    }
+}
+
+/// One `mcp_servers` entry in config.json.
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub transport: McpTransportKind,
+    /// stdio: executable plus args/env for the spawned server process.
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// http: endpoint URL plus extra request headers (e.g. Authorization).
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    /// Optional OAuth refresh metadata. Tokens live in auth.json, never config.json.
+    pub oauth: Option<McpOAuthConfig>,
+    pub enabled: bool,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOAuthConfig {
+    pub client_id: String,
+    pub token_url: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOAuthTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_at: u64,
+}
+
+/// One `subagent_models` entry: a model `spawn_agent` may use and when to use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentModel {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelConfig {
+    pub name: String,
+    /// 0 = unknown: no window-based compaction, nothing shown.
+    pub context_window: u64,
+    /// Largest window any route offers (JuCode: the biggest account window;
+    /// `context_window` is the smallest). 0 = same as `context_window`.
+    pub max_context_window: u64,
+    pub max_output_tokens: u64,
+    pub reasoning_efforts: Vec<String>,
+    /// USD price per 1M tokens. 0 means unknown, which suppresses cost display.
+    pub input_cost: f64,
+    pub cached_input_cost: f64,
+    pub output_cost: f64,
+    /// What pickers show (e.g. "Gateway Model 2"); None: the name.
+    pub display_name: Option<String>,
+    /// JuCode: the window range through each group (group id → smallest,
+    /// largest), when a group's channel gives the model another window.
+    pub group_windows: BTreeMap<String, (u64, u64)>,
+    /// JuCode: left out of model pickers; still callable by name.
+    pub hidden: bool,
+}
+
+impl ModelConfig {
+    /// Cumulative USD cost for a turn's token usage. Returns 0 when no prices are
+    /// configured for the model.
+    pub fn cost_for(&self, input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> f64 {
+        let non_cached_input = input_tokens.saturating_sub(cached_input_tokens);
+        (non_cached_input as f64 * self.input_cost
+            + cached_input_tokens as f64 * self.cached_input_cost
+            + output_tokens as f64 * self.output_cost)
+            / 1_000_000.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthStore {
+    keys: BTreeMap<String, String>,
+    jucode: Option<JucodeTokens>,
+    encryption_key: Option<crate::secrets::SecretKey>,
+    path: PathBuf,
+}
+
+/// OAuth tokens for the JuCode account, stored separately from the raw
+/// `providers` map (which holds bring-your-own keys for openai/deepseek/…).
+/// The CLI no longer holds a JuCode API key — only these rotating tokens.
+#[derive(Debug, Clone)]
+pub struct JucodeTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_at: u64,
+    pub refresh_expires_at: u64,
+    /// The computer the login was made on (`machine::machine_id`); None for
+    /// logins saved before it was recorded.
+    pub machine: Option<String>,
+}
+
+impl Config {
+    pub fn load_or_create() -> io::Result<Self> {
+        let path = config_path()?;
+        ensure_system_prompt_file()?;
+        if !path.exists() {
+            // No provider until the user picks one with /login.
+            let config = Self {
+                provider: String::new(),
+                protocol: String::new(),
+                model: String::new(),
+                reasoning_effort: "medium".to_string(),
+                compact_model: String::new(),
+                compact_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
+                safety_model: String::new(),
+                safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
+                title_model: String::new(),
+                image_model: String::new(),
+                models: Vec::new(),
+                subagent_models: Vec::new(),
+                jucode_models: Vec::new(),
+                jucode_groups: BTreeMap::new(),
+                context_window_overrides: BTreeMap::new(),
+                base_url: String::new(),
+                jucode_web_url: String::new(),
+                jucode_api_url: String::new(),
+                jucode_app_url: String::new(),
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+                connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+                read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
+                compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+                include_project_instructions: true,
+                encrypt_secrets: false,
+                approval_mode: ApprovalMode::default(),
+                edit_tools: default_edit_tools(),
+                extra_skills_source: None,
+                mcp_servers: Vec::new(),
+                sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+                web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
+                web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
+                path,
+            };
+            config.save()?;
+            return Ok(config);
+        }
+
+        let content = fs::read_to_string(&path)?;
+        match Self::from_value(&content, path.clone()) {
+            Ok(config) => {
+                config.save()?;
+                Ok(config)
+            }
+            Err(error) => {
+                if offer_config_reset(&path, &error)? {
+                    Self::load_or_create()
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// The saved config, only read: `load_or_create` rewrites the file, which
+    /// a caller on every request (the daemon's local gateway) must not do.
+    pub(crate) fn load_existing() -> io::Result<Self> {
+        let path = config_path()?;
+        let content = fs::read_to_string(&path)?;
+        Self::from_value(&content, path)
+    }
+
+    /// Parse `content` as config.json. Malformed JSON and invalid field values
+    /// are hard errors; `load_or_create` offers to reset the file in that case.
+    pub(crate) fn from_value(content: &str, path: PathBuf) -> io::Result<Self> {
+        let value = serde_json::from_str::<Value>(content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("config.json is not valid JSON: {error}"),
+            )
+        })?;
+        let provider = read_string(&value, "provider", "");
+        let model = read_string(&value, "model", "");
+        let mut models = read_model_configs(&value, &provider);
+        if !model.is_empty() && !models.iter().any(|entry| entry.name == model) {
+            models.insert(0, default_model_config(&model));
+        }
+        let reasoning_effort =
+            read_reasoning_effort(&value, "reasoning_effort", "medium", &model, &models);
+        let compact_model = read_string(&value, "compact_model", &model);
+        let compact_reasoning_effort = read_reasoning_effort(
+            &value,
+            "compact_reasoning_effort",
+            DEFAULT_COMPACT_REASONING_EFFORT,
+            &compact_model,
+            &models,
+        );
+        let safety_model = read_string(&value, "safety_model", &compact_model);
+        let safety_reasoning_effort = read_reasoning_effort(
+            &value,
+            "safety_reasoning_effort",
+            DEFAULT_COMPACT_REASONING_EFFORT,
+            &safety_model,
+            &models,
+        );
+        let default_base_url = default_base_url_for_provider(&provider).unwrap_or_default();
+        let config = Self {
+            protocol: read_string(&value, "protocol", ""),
+            model,
+            reasoning_effort,
+            compact_model,
+            compact_reasoning_effort,
+            safety_model,
+            safety_reasoning_effort,
+            title_model: read_string(&value, "title_model", ""),
+            image_model: read_string(&value, "image_model", ""),
+            subagent_models: read_subagent_models(&value),
+            models,
+            jucode_models: value
+                .get("jucode_models")
+                .map(|list| read_model_configs(&json!({ "models": list }), "jucode"))
+                .unwrap_or_default(),
+            jucode_groups: read_jucode_groups(&value),
+            context_window_overrides: read_context_window_overrides(&value),
+            base_url: normalize_base_url(&read_string(&value, "base_url", &default_base_url)),
+            provider,
+            jucode_web_url: normalize_base_url(&read_string(&value, "jucode_web_url", "")),
+            jucode_api_url: normalize_base_url(&read_string(&value, "jucode_api_url", "")),
+            jucode_app_url: normalize_base_url(&read_string(&value, "jucode_app_url", "")),
+            api_key_env: read_api_key_env(&value),
+            retry_attempts: read_usize(&value, "retry_attempts", DEFAULT_RETRY_ATTEMPTS),
+            connect_timeout_seconds: read_u64(
+                &value,
+                "connect_timeout_seconds",
+                DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            ),
+            read_timeout_seconds: read_u64(
+                &value,
+                "read_timeout_seconds",
+                DEFAULT_READ_TIMEOUT_SECONDS,
+            ),
+            compaction_threshold_percent: read_u64(
+                &value,
+                "compaction_threshold_percent",
+                DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+            )
+            .clamp(10, 95),
+            include_project_instructions: read_bool(&value, "include_project_instructions", true),
+            encrypt_secrets: read_bool(&value, "encrypt_secrets", false),
+            approval_mode: read_approval_mode(&value)?,
+            edit_tools: read_edit_tools(&value)?,
+            extra_skills_source: read_optional_string(&value, "extra_skills_source"),
+            mcp_servers: read_mcp_servers(&value),
+            sandbox: read_sandbox(&value)?,
+            web_search_engine: read_web_engine(
+                &value,
+                "web_search_engine",
+                crate::web::DEFAULT_SEARCH_ENGINE,
+                crate::web::SEARCH_ENGINES,
+            )?,
+            web_fetch_engine: read_web_engine(
+                &value,
+                "web_fetch_engine",
+                crate::web::DEFAULT_FETCH_ENGINE,
+                crate::web::FETCH_ENGINES,
+            )?,
+            path,
+        };
+        Ok(config)
+    }
+
+    pub fn save(&self) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut value = json!({
+            "provider": self.provider,
+            "protocol": self.protocol,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "compact_model": self.compact_model,
+            "compact_reasoning_effort": self.compact_reasoning_effort,
+            "safety_model": self.safety_model,
+            "safety_reasoning_effort": self.safety_reasoning_effort,
+            "title_model": self.title_model,
+            "image_model": self.image_model,
+            "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
+            "subagent_models": self.subagent_models.iter().map(|model| json!({
+                "name": model.name,
+                "description": model.description,
+            })).collect::<Vec<_>>(),
+            "jucode_models": self.jucode_models.iter().map(model_config_value).collect::<Vec<_>>(),
+            "jucode_groups": self.jucode_groups,
+            "context_window_overrides": self.context_window_overrides,
+            "base_url": normalize_base_url(&self.base_url),
+            "jucode_web_url": normalize_base_url(&self.jucode_web_url),
+            "jucode_api_url": normalize_base_url(&self.jucode_api_url),
+            "jucode_app_url": normalize_base_url(&self.jucode_app_url),
+            "api_key_env": self.api_key_env,
+            "retry_attempts": self.retry_attempts,
+            "connect_timeout_seconds": self.connect_timeout_seconds,
+            "read_timeout_seconds": self.read_timeout_seconds,
+            "compaction_threshold_percent": self.compaction_threshold_percent,
+            "include_project_instructions": self.include_project_instructions,
+            "encrypt_secrets": self.encrypt_secrets,
+            "approval_mode": self.approval_mode.as_str(),
+            "edit_tools": self.edit_tools,
+            "extra_skills_source": self.extra_skills_source,
+            "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>(),
+            "sandbox": self.sandbox.mode.as_str(),
+            "sandbox_network": self.sandbox.network,
+            "sandbox_directories": crate::sandbox::directories_to_json(
+                &self.sandbox.writable_dirs,
+                &self.sandbox.readable_dirs,
+            ),
+            "command_rules": crate::sandbox::rules_to_json(&self.sandbox.rules),
+            "web_search_engine": self.web_search_engine,
+            "web_fetch_engine": self.web_fetch_engine,
+        });
+        // Keys this version does not know stay as they are: JuCode Desktop's
+        // own settings, and a newer CLI's when an older one saves.
+        if let Ok(Value::Object(mut saved)) = fs::read_to_string(&self.path)
+            .map_err(|_| ())
+            .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|_| ()))
+        {
+            if let Value::Object(known) = value {
+                saved.extend(known);
+                value = Value::Object(saved);
+            }
+        }
+        write_atomically(
+            &self.path,
+            &format!("{}\n", serde_json::to_string_pretty(&value)?),
+        )
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn profile_dir(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    /// Whether a model provider is set (`/login` or config.json).
+    pub fn has_provider(&self) -> bool {
+        !self.provider.trim().is_empty()
+    }
+
+    pub fn current_model_config(&self) -> ModelConfig {
+        self.model_config(&self.model)
+    }
+
+    pub fn compact_model_config(&self) -> ModelConfig {
+        self.model_config(&self.compact().0)
+    }
+
+    /// Compaction model and effort. A provider switch rewrites `model` and
+    /// `models` but leaves `compact_model` naming the previous provider's
+    /// model, which the new endpoint rejects; fall back to the chat model.
+    pub fn compact(&self) -> (String, String) {
+        self.helper_model(&self.compact_model, &self.compact_reasoning_effort)
+    }
+
+    /// Safety-classifier model and effort, with the same fallback as `compact`.
+    pub fn safety(&self) -> (String, String) {
+        self.helper_model(&self.safety_model, &self.safety_reasoning_effort)
+    }
+
+    /// Conversation-title model: `title_model` when it is one of `models`,
+    /// else the main model; at its lightest reasoning effort.
+    pub fn title(&self) -> (String, String) {
+        let model = if self.models.iter().any(|m| m.name == self.title_model) {
+            self.title_model.clone()
+        } else {
+            self.model.clone()
+        };
+        let effort = self
+            .models
+            .iter()
+            .find(|m| m.name == model)
+            .and_then(|m| m.reasoning_efforts.first().cloned())
+            .unwrap_or_default();
+        (model, effort)
+    }
+
+    fn helper_model(&self, model: &str, effort: &str) -> (String, String) {
+        if self.models.iter().any(|m| m.name == model) {
+            (model.to_string(), effort.to_string())
+        } else {
+            (self.model.clone(), self.reasoning_effort.clone())
+        }
+    }
+
+    pub fn model_config(&self, model: &str) -> ModelConfig {
+        let config = self
+            .models
+            .iter()
+            .find(|entry| entry.name == model)
+            .cloned()
+            .unwrap_or_else(|| default_model_config(model));
+        let config = apply_group_window(config, &self.jucode_groups);
+        apply_context_window_override(config, &self.context_window_overrides)
+    }
+
+    pub fn system_prompt(&self) -> io::Result<String> {
+        fs::read_to_string(system_prompt_path()?)
+    }
+}
+
+impl AuthStore {
+    pub fn load_or_create(encrypt_secrets: bool) -> io::Result<Self> {
+        let path = auth_path()?;
+        if !path.exists() {
+            let auth = Self {
+                keys: BTreeMap::new(),
+                jucode: None,
+                encryption_key: if encrypt_secrets {
+                    crate::secrets::find_key()?
+                } else {
+                    None
+                },
+                path,
+            };
+            auth.save()?;
+            return Ok(auth);
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let mut value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+        let envelope_key = crate::secrets::reveal_auth(&mut value)?;
+        let encryption_key = match envelope_key {
+            Some(key) => Some(key),
+            None if encrypt_secrets => crate::secrets::find_key()?,
+            None => None,
+        };
+        let keys = value
+            .get("providers")
+            .and_then(Value::as_object)
+            .map(read_provider_keys)
+            .unwrap_or_default();
+        let jucode = value.get("jucode").and_then(read_jucode_tokens);
+
+        Ok(Self {
+            keys,
+            jucode,
+            encryption_key,
+            path,
+        })
+    }
+
+    pub fn key_for(&self, provider: &str) -> Option<&str> {
+        self.keys.get(provider).map(String::as_str)
+    }
+
+    pub fn set_key(&mut self, provider: &str, key: String) {
+        self.keys.insert(provider.to_string(), key);
+    }
+
+    /// The current JuCode OAuth token bundle, if logged in on this computer.
+    /// A login copied from another computer is not one: refreshing it would
+    /// sign that computer out.
+    pub fn jucode_tokens(&self) -> Option<&JucodeTokens> {
+        self.jucode
+            .as_ref()
+            .filter(|t| crate::machine::is_this_machine(t.machine.as_deref()))
+    }
+
+    /// The current JuCode access token (used as the gateway Bearer).
+    pub fn jucode_access_token(&self) -> Option<&str> {
+        self.jucode_tokens().map(|t| t.access_token.as_str())
+    }
+
+    /// A JuCode login is saved but was made on another computer.
+    pub fn jucode_login_copied(&self) -> bool {
+        self.jucode.is_some() && self.jucode_tokens().is_none()
+    }
+
+    /// A login saved here before computers were recorded: claimed for this
+    /// one. Returns whether it changed.
+    pub fn claim_jucode_login(&mut self) -> bool {
+        match (self.jucode.as_mut(), crate::machine::machine_id()) {
+            (Some(tokens), Some(id)) if tokens.machine.is_none() => {
+                tokens.machine = Some(id.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_jucode_tokens(&mut self, tokens: JucodeTokens) {
+        self.jucode = Some(tokens);
+    }
+
+    pub fn clear_jucode(&mut self) {
+        self.jucode = None;
+    }
+
+    pub fn save(&self) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut value = json!({ "providers": self.keys });
+        if let Some(t) = &self.jucode {
+            value["jucode"] = json!({
+                "access_token": t.access_token,
+                "refresh_token": t.refresh_token,
+                "access_expires_at": t.access_expires_at,
+                "refresh_expires_at": t.refresh_expires_at,
+            });
+            if let Some(machine) = &t.machine {
+                value["jucode"]["machine"] = json!(machine);
+            }
+        }
+        // MCP transports refresh their own credentials while the agent is
+        // running. Preserve that independently-managed block when account
+        // login or provider-key changes rewrite auth.json.
+        if let Ok(content) = fs::read_to_string(&self.path) {
+            if let Ok(current) = serde_json::from_str::<Value>(&content) {
+                if let Some(tokens) = current.get("mcp_servers") {
+                    value["mcp_servers"] = tokens.clone();
+                }
+            }
+        }
+        if let Some(key) = &self.encryption_key {
+            crate::secrets::protect_auth(&mut value, key)?;
+        }
+        write_atomically(
+            &self.path,
+            &format!("{}\n", serde_json::to_string_pretty(&value)?),
+        )
+    }
+}
+
+/// Write `contents` to `path` atomically via a temp file in the same
+/// directory plus rename, so a crash or interrupt mid-write never leaves a
+/// truncated file behind. The temp name carries the pid so concurrent saves
+/// do not collide.
+fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("jucode");
+    // Unique per call, not just per process: threads of one process (a
+    // daemon's title and handoff writers) save the config at the same time,
+    // and a shared temp file is renamed away under the other one.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_file_name(format!(".{file_name}.{}.{n}.tmp", std::process::id()));
+    fs::write(&temp, contents)?;
+    // Windows refuses to replace a file another process has open (the
+    // desktop reading config.json, an antivirus scan); that lasts moments, so
+    // retry briefly instead of failing the save (a model pick that silently
+    // did nothing). Elsewhere a refused rename is a real error.
+    let mut attempt = 0;
+    loop {
+        match fs::rename(&temp, path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && attempt < 20
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
+                    ) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25 * attempt));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// When config.json fails to parse (invalid values, malformed JSON), offer an
+/// interactive reset: the file is removed and `load_or_create` regenerates
+/// defaults. Only prompts on a TTY; non-interactive callers get the error.
+fn offer_config_reset(path: &Path, error: &io::Error) -> io::Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprintln!("{}: {error}", path.display());
+    eprint!("Reset config to defaults? [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Ok(false);
+    }
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+pub fn profile_dir() -> io::Result<PathBuf> {
+    jucode_dir()
+}
+
+pub fn normalize_base_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+fn read_string(value: &Value, key: &str, default: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn read_optional_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn read_usize(value: &Value, key: &str, default: usize) -> usize {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+fn read_u64(value: &Value, key: &str, default: u64) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+/// Optional `approval_mode` in config.json; absent/empty defaults to manual,
+/// an unknown value is a hard load error rather than a silent fallback.
+/// The sandbox settings; absent keys take the platform defaults, and a
+/// configured directory that no longer exists is dropped.
+fn read_sandbox(value: &Value) -> io::Result<crate::sandbox::SandboxPolicy> {
+    use crate::sandbox::{directories_from_json, rules_from_json, SandboxMode, SandboxPolicy};
+    let invalid = |error: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid sandbox settings in config.json: {error}"),
+        )
+    };
+    let mut policy = SandboxPolicy::default_for_platform();
+    if let Some(mode) = value
+        .get("sandbox")
+        .and_then(Value::as_str)
+        .filter(|mode| !mode.trim().is_empty())
+    {
+        policy.mode = SandboxMode::parse(mode.trim()).map_err(invalid)?;
+    }
+    if let Some(network) = value.get("sandbox_network").and_then(Value::as_bool) {
+        policy.network = network;
+    }
+    if let Some(directories) = value.get("sandbox_directories") {
+        let (writable, readable) = directories_from_json(directories, false).map_err(invalid)?;
+        policy.writable_dirs = writable;
+        policy.readable_dirs = readable;
+    }
+    if let Some(rules) = value.get("command_rules") {
+        policy.rules = rules_from_json(rules).map_err(invalid)?;
+    }
+    Ok(policy)
+}
+
+/// A web engine name from config.json. Absent or empty takes the default;
+/// an unknown name is a hard load error.
+fn read_web_engine(
+    value: &Value,
+    key: &str,
+    default: &str,
+    engines: &[&str],
+) -> io::Result<String> {
+    let raw = value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .filter(|raw| !raw.is_empty());
+    match raw {
+        None => Ok(default.to_string()),
+        Some(raw) if engines.contains(&raw.as_str()) => Ok(raw),
+        Some(raw) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid {key} in config.json: {raw:?} (want one of {})",
+                engines.join(", ")
+            ),
+        )),
+    }
+}
+
+fn read_approval_mode(value: &Value) -> io::Result<ApprovalMode> {
+    let raw = value
+        .get("approval_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    match raw {
+        None => Ok(ApprovalMode::default()),
+        Some(raw) => ApprovalMode::parse(raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid approval_mode in config.json: {error}"),
+            )
+        }),
+    }
+}
+
+/// Optional `edit_tools` in config.json. Absent defaults to hashline_edit
+/// only; an explicit empty array disables all edit tools. Unknown names are a
+/// hard load error rather than a silent fallback. The `edit` alias is stored
+/// canonically as `str_replace` and duplicates collapse.
+fn read_edit_tools(value: &Value) -> io::Result<Vec<String>> {
+    let Some(raw) = value.get("edit_tools") else {
+        return Ok(default_edit_tools());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid edit_tools in config.json: expected an array of tool names",
+        ));
+    };
+    let mut tools = Vec::new();
+    for item in items {
+        let name = item.as_str().map(str::trim).unwrap_or_default();
+        let Some(canonical) = canonical_edit_tool_name(name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid edit_tools entry '{name}' in config.json: use hashline_edit, str_replace (alias edit), write, or apply_patch"
+                ),
+            ));
+        };
+        if !tools.iter().any(|tool| tool == canonical) {
+            tools.push(canonical.to_string());
+        }
+    }
+    Ok(tools)
+}
+
+fn read_bool(value: &Value, key: &str, default: bool) -> bool {
+    value.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+fn read_f64(value: &Value, key: &str, default: f64) -> f64 {
+    value.get(key).and_then(Value::as_f64).unwrap_or(default)
+}
+
+fn read_api_key_env(value: &Value) -> String {
+    let raw = value
+        .get("api_key_env")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("OPENAI_API_KEY");
+
+    if raw.is_empty() || raw.starts_with("sk-") {
+        "OPENAI_API_KEY".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn read_reasoning_effort(
+    value: &Value,
+    key: &str,
+    default: &str,
+    model: &str,
+    models: &[ModelConfig],
+) -> String {
+    let effort = read_string(value, key, default);
+    let supported = models
+        .iter()
+        .find(|entry| entry.name == model)
+        .map(|entry| entry.reasoning_efforts.as_slice())
+        .unwrap_or(&[]);
+    if supported.iter().any(|entry| entry == &effort) {
+        effort
+    } else if supported.iter().any(|entry| entry == "medium") {
+        "medium".to_string()
+    } else {
+        supported
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "medium".to_string())
+    }
+}
+
+/// `subagent_models` as saved in `path` right now: Desktop edits it while
+/// engines run, so each turn reads the current list.
+pub(crate) fn read_subagent_models_at(path: &Path) -> io::Result<Vec<SubagentModel>> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_subagent_models(&value))
+}
+
+fn read_subagent_models(value: &Value) -> Vec<SubagentModel> {
+    let Some(entries) = value.get("subagent_models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut models: Vec<SubagentModel> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if models.iter().any(|model| model.name == name) {
+            continue;
+        }
+        models.push(SubagentModel {
+            name: name.to_string(),
+            description: read_string(entry, "description", "").trim().to_string(),
+        });
+    }
+    models
+}
+
+fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
+    let Some(models) = value.get("models").and_then(Value::as_array) else {
+        return models_for_provider(provider);
+    };
+
+    let mut configs = Vec::new();
+    for model in models {
+        let Some(name) = model
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let reasoning_efforts = model
+            .get("reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(default_reasoning_efforts);
+        // Missing = unknown (0): requests then omit the cap where the protocol
+        // allows it instead of inventing one.
+        let mut max_output_tokens = model
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        // Migrate older / metadata-poor Claude entries that only offer "none",
+        // or the budget tiers older versions wrote for a model that now takes
+        // adaptive effort: surface the current tiers (and lift the tiny
+        // default cap so high-tier budgets fit) without forcing a re-login.
+        let reasoning_efforts =
+            if name.starts_with("claude-") && stale_claude_tiers(name, &reasoning_efforts) {
+                max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
+                claude_thinking_tiers(name)
+            } else {
+                reasoning_efforts
+            };
+
+        configs.push(ModelConfig {
+            name: name.to_string(),
+            context_window: model
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            max_context_window: model
+                .get("max_context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            max_output_tokens,
+            reasoning_efforts,
+            input_cost: read_f64(model, "input_cost", 0.0),
+            cached_input_cost: read_f64(model, "cached_input_cost", 0.0),
+            output_cost: read_f64(model, "output_cost", 0.0),
+            display_name: model
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string),
+            group_windows: read_group_windows(model.get("group_context_windows")),
+            hidden: model
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+
+    if configs.is_empty() {
+        models_for_provider(provider)
+    } else {
+        configs
+    }
+}
+
+fn read_mcp_servers(value: &Value) -> Vec<McpServerConfig> {
+    let Some(servers) = value.get("mcp_servers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut configs: Vec<McpServerConfig> = Vec::new();
+    for entry in servers {
+        match parse_mcp_server_value(entry) {
+            Ok(config) if configs.iter().any(|c| c.name == config.name) => {
+                crate::log_warn!("mcp", "duplicate server name in config", name = config.name);
+            }
+            Ok(config) => configs.push(config),
+            Err(error) => {
+                crate::log_warn!("mcp", "skipping invalid mcp_servers entry", error = error);
+            }
+        }
+    }
+    configs
+}
+
+/// Parse and validate one `mcp_servers` entry (also used by the serve
+/// `mcp_set` op). Names must match `^[A-Za-z0-9_-]+$`; stdio entries need a
+/// command, http entries a URL.
+pub fn parse_mcp_server_value(entry: &Value) -> Result<McpServerConfig, String> {
+    let name = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !is_valid_mcp_name(name) {
+        return Err(format!(
+            "invalid MCP server name '{name}': use letters, digits, '_' or '-'"
+        ));
+    }
+    let transport =
+        McpTransportKind::parse(entry.get("transport").and_then(Value::as_str).unwrap_or(""))?;
+    let command = read_string(entry, "command", "");
+    let url = read_string(entry, "url", "");
+    let oauth = parse_mcp_oauth(entry.get("oauth"))?;
+    match transport {
+        McpTransportKind::Stdio if command.is_empty() => {
+            return Err(format!(
+                "MCP server {name}: stdio transport requires command"
+            ));
+        }
+        McpTransportKind::Http if url.is_empty() => {
+            return Err(format!("MCP server {name}: http transport requires url"));
+        }
+        McpTransportKind::Stdio if oauth.is_some() => {
+            return Err(format!("MCP server {name}: oauth requires http transport"));
+        }
+        _ => {}
+    }
+    Ok(McpServerConfig {
+        name: name.to_string(),
+        transport,
+        command,
+        args: read_string_array(entry, "args"),
+        env: read_string_map(entry, "env"),
+        url,
+        headers: read_string_map(entry, "headers"),
+        oauth,
+        enabled: read_bool(entry, "enabled", true),
+        timeout_seconds: read_u64(entry, "timeout_seconds", DEFAULT_MCP_TIMEOUT_SECONDS)
+            .clamp(1, 3600),
+    })
+}
+
+fn parse_mcp_oauth(value: Option<&Value>) -> Result<Option<McpOAuthConfig>, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "MCP oauth must be an object".to_string())?;
+    let client_id = object
+        .get("client_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let token_url = object
+        .get("token_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let scope = object
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if client_id.is_empty() != token_url.is_empty() {
+        return Err("MCP oauth client_id and token_url must be set together".to_string());
+    }
+    Ok(Some(McpOAuthConfig {
+        client_id,
+        token_url,
+        scope,
+    }))
+}
+
+fn is_valid_mcp_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn read_string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_string_map(value: &Value, key: &str) -> BTreeMap<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mcp_server_config_value(server: &McpServerConfig) -> Value {
+    let mut value = json!({
+        "name": server.name,
+        "transport": server.transport.as_str(),
+        "command": server.command,
+        "args": server.args,
+        "env": server.env,
+        "url": server.url,
+        "headers": server.headers,
+        "enabled": server.enabled,
+        "timeout_seconds": server.timeout_seconds,
+    });
+    if let Some(oauth) = &server.oauth {
+        value["oauth"] = json!({
+            "client_id": oauth.client_id,
+            "token_url": oauth.token_url,
+            "scope": oauth.scope,
+        });
+    }
+    value
+}
+
+fn model_config_value(model: &ModelConfig) -> Value {
+    let mut value = json!({
+        "name": model.name,
+        "context_window": model.context_window,
+        "max_context_window": model.max_context_window,
+        "max_output_tokens": model.max_output_tokens,
+        "reasoning_efforts": model.reasoning_efforts,
+        "input_cost": model.input_cost,
+        "cached_input_cost": model.cached_input_cost,
+        "output_cost": model.output_cost,
+    });
+    if let Some(label) = &model.display_name {
+        value["display_name"] = json!(label);
+    }
+    if !model.group_windows.is_empty() {
+        value["group_context_windows"] = group_windows_value(&model.group_windows);
+    }
+    if model.hidden {
+        value["hidden"] = json!(true);
+    }
+    value
+}
+
+/// `group_context_windows` as /v1/models sends it and config.json keeps it:
+/// `{group id: {context_window, max_context_window}}`.
+pub(crate) fn read_group_windows(value: Option<&Value>) -> BTreeMap<String, (u64, u64)> {
+    value
+        .and_then(Value::as_object)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|(group, range)| {
+                    let window = range
+                        .get("context_window")
+                        .and_then(Value::as_u64)
+                        .filter(|w| *w > 0)?;
+                    let max = range
+                        .get("max_context_window")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(window)
+                        .max(window);
+                    Some((group.clone(), (window, max)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn group_windows_value(groups: &BTreeMap<String, (u64, u64)>) -> Value {
+    groups
+        .iter()
+        .map(|(group, (window, max))| {
+            (
+                group.clone(),
+                json!({ "context_window": window, "max_context_window": max }),
+            )
+        })
+        .collect::<Map<String, Value>>()
+        .into()
+}
+
+fn default_reasoning_efforts() -> Vec<String> {
+    ["none", "low", "medium", "high", "xhigh"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+/// Minimum max-output budget for Claude models so a high-tier thinking budget
+/// (see `llm::anthropic_thinking_budget`) isn't clamped away.
+pub(crate) const CLAUDE_MIN_MAX_OUTPUT_TOKENS: u64 = 32_000;
+
+/// Thinking-strength tiers offered for Claude models. They map to an Anthropic
+/// extended-thinking budget on the Messages path and to `reasoning.effort` on
+/// the Responses path.
+/// Thinking-strength choices for a Claude model: the adaptive effort levels
+/// on current models, budget tiers on older ones.
+pub(crate) fn claude_thinking_tiers(model: &str) -> Vec<String> {
+    let tiers: &[&str] = if llm_provider_kit::anthropic::uses_adaptive_thinking(model) {
+        &["none", "low", "medium", "high", "xhigh", "max"]
+    } else {
+        &["none", "low", "medium", "high"]
+    };
+    tiers.iter().map(|value| value.to_string()).collect()
+}
+
+/// A stored Claude effort list to replace with `claude_thinking_tiers`: no
+/// thinking at all, or the budget tiers every Claude model got before adaptive
+/// effort (xhigh, max) came in, kept on a model that now takes it.
+fn stale_claude_tiers(model: &str, efforts: &[String]) -> bool {
+    const BUDGET_TIERS: [&str; 4] = ["none", "low", "medium", "high"];
+    is_thinking_disabled(efforts)
+        || (efforts.iter().map(String::as_str).eq(BUDGET_TIERS)
+            && llm_provider_kit::anthropic::uses_adaptive_thinking(model))
+}
+
+/// True when an effort list offers no actual thinking — empty, or only "none".
+/// Such a list hides thinking-strength selection in the model picker.
+pub(crate) fn is_thinking_disabled(efforts: &[String]) -> bool {
+    efforts.is_empty() || efforts.iter().all(|effort| effort == "none")
+}
+
+/// Reasoning-effort tiers for a catalog model. Upstream's exact ladders live
+/// in KDL class rules we don't compile; this maps the model's dialect to the
+/// tiers JuCode's wire protocols understand.
+fn efforts_for_catalog_model(model: &llm_provider_kit::omp::CatalogModel) -> Vec<String> {
+    if !model.reasoning {
+        return vec!["none".to_string()];
+    }
+    match model.api.as_str() {
+        "anthropic-messages" => ["none", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .map(|e| e.to_string())
+            .collect(),
+        "openai-completions" | "openrouter" => vec!["none".to_string()],
+        _ => ["none", "low", "medium", "high", "xhigh"]
+            .iter()
+            .map(|e| e.to_string())
+            .collect(),
+    }
+}
+
+fn model_config_from_catalog(model: &llm_provider_kit::omp::CatalogModel) -> ModelConfig {
+    ModelConfig {
+        name: model.id.clone(),
+        context_window: model.context_window,
+        max_context_window: 0,
+        max_output_tokens: model.max_tokens,
+        reasoning_efforts: efforts_for_catalog_model(model),
+        input_cost: model.input_cost,
+        cached_input_cost: model.cached_input_cost,
+        output_cost: model.output_cost,
+        display_name: Some(model.name.clone()).filter(|name| !name.is_empty() && *name != model.id),
+        group_windows: BTreeMap::new(),
+        hidden: false,
+    }
+}
+
+fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelConfig {
+    ModelConfig {
+        name: model.name.to_string(),
+        context_window: model.context_window,
+        max_context_window: 0,
+        max_output_tokens: model.max_output_tokens,
+        reasoning_efforts: model
+            .reasoning_efforts
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        input_cost: 0.0,
+        cached_input_cost: 0.0,
+        output_cost: 0.0,
+        display_name: None,
+        group_windows: BTreeMap::new(),
+        hidden: false,
+    }
+}
+
+/// The JuCode models the user chose to show (empty before the first login).
+/// Only reads config.json: the daemon asks on every model menu.
+pub fn jucode_visible_models() -> Vec<ModelConfig> {
+    Config::load_existing()
+        .map(|c| {
+            c.jucode_models
+                .into_iter()
+                .map(|m| apply_group_window(m, &c.jucode_groups))
+                .map(|m| apply_context_window_override(m, &c.context_window_overrides))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The window range through the group the user pinned for `config.name`
+/// (`jucode_groups`), when the gateway gave one for that group; otherwise
+/// the range over all of the user's groups.
+pub(crate) fn apply_group_window(
+    mut config: ModelConfig,
+    groups: &BTreeMap<String, String>,
+) -> ModelConfig {
+    if let Some(&(window, max)) = groups
+        .get(&config.name)
+        .and_then(|group| config.group_windows.get(group))
+    {
+        config.context_window = window;
+        config.max_context_window = max;
+    }
+    config
+}
+
+/// Applies the user's hand-set window for `config.name`, if any. A gateway
+/// that advertises a range caps the override at `max_context_window`: above
+/// it no account can serve the request.
+pub(crate) fn apply_context_window_override(
+    mut config: ModelConfig,
+    overrides: &BTreeMap<String, u64>,
+) -> ModelConfig {
+    if let Some(&window) = overrides.get(&config.name).filter(|w| **w > 0) {
+        config.context_window = match config.max_context_window {
+            0 => window,
+            max => window.min(max),
+        };
+    }
+    config
+}
+
+/// `context_window_overrides` as saved in config.json; Desktop edits it
+/// while engines run, so turns re-read it (see `read_context_window_overrides_at`).
+fn read_context_window_overrides(value: &Value) -> BTreeMap<String, u64> {
+    value
+        .get("context_window_overrides")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(model, window)| {
+                    let window = window.as_u64().filter(|w| *w > 0)?;
+                    let model = model.trim();
+                    (!model.is_empty()).then(|| (model.to_string(), window))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_jucode_groups(value: &Value) -> BTreeMap<String, String> {
+    value
+        .get("jucode_groups")
+        .and_then(Value::as_object)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|(model, group)| {
+                    let group = group.as_str()?.trim();
+                    (!group.is_empty()).then(|| (model.clone(), group.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `jucode_groups` as saved now: Desktop changes a model's group while
+/// engines run, and the window follows the group (see `apply_group_window`).
+pub(crate) fn read_jucode_groups_at(path: &Path) -> io::Result<BTreeMap<String, String>> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_jucode_groups(&value))
+}
+
+/// `image_model` as config.json has it now (Desktop sets it while engines run).
+pub(crate) fn read_image_model_at(path: &Path) -> io::Result<String> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_string(&value, "image_model", ""))
+}
+
+pub(crate) fn read_context_window_overrides_at(path: &Path) -> io::Result<BTreeMap<String, u64>> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_context_window_overrides(&value))
+}
+
+/// Built-in providers as (id, default base_url, protocol) — for UIs to offer a
+/// picker. The jucode gateway comes first; the rest follows the vendored omp
+/// catalog's login order, listing providers with at least one servable model
+/// or no declared table (manual/BYOK providers like ollama).
+pub fn builtin_providers() -> Vec<(String, String, String)> {
+    let catalog = llm_provider_kit::omp::catalog();
+    let mut providers: Vec<(String, String, String)> = Vec::new();
+    if let Some(jucode) = crate::providers::template("jucode") {
+        providers.push((
+            jucode.id.to_string(),
+            jucode.base_url.to_string(),
+            jucode.protocol.as_str().to_string(),
+        ));
+    }
+    for auth in catalog.auth_providers() {
+        let models = catalog.models(&auth.id);
+        let supported = catalog.supported_models(&auth.id, models);
+        let template = crate::providers::template(&auth.id);
+        if supported.is_empty() && template.is_none() {
+            // Either every declared model speaks a dialect JuCode doesn't
+            // serve, or the catalog has no models for it (discovery-driven
+            // upstream) and no local template can fill in.
+            continue;
+        }
+        let base_url = catalog
+            .default_base_url(&auth.id)
+            .map(str::to_string)
+            .or_else(|| template.map(|p| p.base_url.to_string()))
+            .unwrap_or_default();
+        let protocol = supported
+            .first()
+            .and_then(|m| catalog.protocol_for(&auth.id, &m.id))
+            .map(|p| p.as_str().to_string())
+            .or_else(|| template.map(|p| p.protocol.as_str().to_string()))
+            .unwrap_or_default();
+        providers.push((auth.id.clone(), base_url, protocol));
+    }
+    providers
+}
+
+/// Default model table for a provider. The omp catalog wins (it carries real
+/// costs and context sizes); providers without catalog entries keep their
+/// template; unknown ids (and jucode, whose models come from the server)
+/// have none.
+pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
+    let catalog = llm_provider_kit::omp::catalog();
+    let models = catalog.models(id);
+    let supported = catalog.supported_models(id, models);
+    if !supported.is_empty() {
+        return supported
+            .iter()
+            .map(|model| model_config_from_catalog(model))
+            .collect();
+    }
+    crate::providers::template(id)
+        .map(|p| p.models.iter().map(model_config_from_template).collect())
+        .unwrap_or_default()
+}
+
+fn default_base_url_for_provider(id: &str) -> Option<String> {
+    llm_provider_kit::omp::catalog()
+        .default_base_url(id)
+        .map(str::to_string)
+        .or_else(|| crate::providers::template(id).map(|p| p.base_url.to_string()))
+}
+
+fn default_model_config(name: &str) -> ModelConfig {
+    crate::providers::templates()
+        .flat_map(|p| p.models.iter())
+        .find(|entry| entry.name == name)
+        .map(model_config_from_template)
+        .unwrap_or_else(|| ModelConfig {
+            // Not in any table: nothing is known about it, so nothing is
+            // claimed (no window-based compaction, no output cap sent).
+            name: name.to_string(),
+            context_window: 0,
+            max_context_window: 0,
+            max_output_tokens: 0,
+            reasoning_efforts: default_reasoning_efforts(),
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
+            display_name: None,
+            group_windows: BTreeMap::new(),
+            hidden: false,
+        })
+}
+
+fn read_provider_keys(providers: &Map<String, Value>) -> BTreeMap<String, String> {
+    let mut keys = BTreeMap::new();
+    for (provider, value) in providers {
+        if let Some(key) = value.as_str().map(str::trim).filter(|key| !key.is_empty()) {
+            keys.insert(provider.to_string(), key.to_string());
+        }
+    }
+    keys
+}
+
+fn read_jucode_tokens(value: &Value) -> Option<JucodeTokens> {
+    let access_token = read_nonempty_str(value, "access_token")?;
+    let refresh_token = read_nonempty_str(value, "refresh_token")?;
+    Some(JucodeTokens {
+        access_token,
+        refresh_token,
+        access_expires_at: value
+            .get("access_expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        refresh_expires_at: value
+            .get("refresh_expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        machine: read_nonempty_str(value, "machine"),
+    })
+}
+
+fn read_nonempty_str(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn config_path() -> io::Result<PathBuf> {
+    Ok(jucode_dir()?.join("config.json"))
+}
+
+fn auth_path() -> io::Result<PathBuf> {
+    Ok(jucode_dir()?.join("auth.json"))
+}
+
+pub(crate) fn mcp_auth_path() -> io::Result<PathBuf> {
+    auth_path()
+}
+
+pub(crate) fn load_mcp_oauth_tokens(server: &str) -> io::Result<Option<McpOAuthTokens>> {
+    let path = auth_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+    let Some(tokens) = value
+        .get("mcp_servers")
+        .and_then(Value::as_object)
+        .and_then(|servers| servers.get(server))
+    else {
+        return Ok(None);
+    };
+    let Some(access_token) = read_nonempty_str(tokens, "access_token") else {
+        return Ok(None);
+    };
+    Ok(Some(McpOAuthTokens {
+        access_token,
+        refresh_token: read_nonempty_str(tokens, "refresh_token").unwrap_or_default(),
+        access_expires_at: tokens
+            .get("access_expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }))
+}
+
+fn system_prompt_path() -> io::Result<PathBuf> {
+    Ok(jucode_dir()?.join(PROMPT_FILE_NAME))
+}
+
+fn ensure_system_prompt_file() -> io::Result<()> {
+    let path = system_prompt_path()?;
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{DEFAULT_SYSTEM_PROMPT}\n"))
+}
+
+/// The JuCode server's API base from the saved config, read without
+/// rewriting the file; empty when none is set.
+pub(crate) fn saved_jucode_api_url() -> String {
+    Config::load_existing()
+        .map(|config| config.jucode_api_url)
+        .unwrap_or_default()
+}
+
+pub(crate) fn jucode_dir() -> io::Result<PathBuf> {
+    let home = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    Ok(PathBuf::from(home).join(".jucode"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_jucode_login_from_another_computer_is_not_used() {
+        let Some(here) = crate::machine::machine_id() else {
+            return;
+        };
+        let mut auth = AuthStore {
+            keys: BTreeMap::new(),
+            jucode: read_jucode_tokens(&json!({
+                "access_token": "a", "refresh_token": "r", "machine": "another-computer"
+            })),
+            encryption_key: None,
+            path: PathBuf::from("auth.json"),
+        };
+        assert!(auth.jucode_tokens().is_none());
+        assert!(auth.jucode_login_copied());
+        assert!(!auth.claim_jucode_login());
+
+        // Saved before computers were recorded: claimed for this one.
+        auth.jucode = read_jucode_tokens(&json!({ "access_token": "a", "refresh_token": "r" }));
+        assert!(auth.claim_jucode_login());
+        assert_eq!(auth.jucode_tokens().unwrap().machine.as_deref(), Some(here));
+        assert!(!auth.jucode_login_copied());
+    }
+
+    #[test]
+    fn context_window_override_is_capped_by_the_gateway_range() {
+        let model = |window, max| ModelConfig {
+            name: "gateway-model".to_string(),
+            context_window: window,
+            max_context_window: max,
+            max_output_tokens: 0,
+            reasoning_efforts: vec![],
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
+            display_name: None,
+            group_windows: BTreeMap::new(),
+            hidden: false,
+        };
+        let overrides = BTreeMap::from([("gateway-model".to_string(), 2_000_000)]);
+        // Raised toward, but never past, the largest account window.
+        let raised = apply_context_window_override(model(272_000, 1_050_000), &overrides);
+        assert_eq!(raised.context_window, 1_050_000);
+        // Nothing configured on the gateway: the user's value is all there is.
+        let filled = apply_context_window_override(model(0, 0), &overrides);
+        assert_eq!(filled.context_window, 2_000_000);
+        // No override: the gateway's smallest window stands.
+        let untouched = apply_context_window_override(model(272_000, 1_050_000), &BTreeMap::new());
+        assert_eq!(untouched.context_window, 272_000);
+    }
+
+    #[test]
+    fn the_window_follows_the_pinned_group_and_survives_config_json() {
+        let model = ModelConfig {
+            name: "gateway-model".to_string(),
+            context_window: 272_000,
+            max_context_window: 1_050_000,
+            max_output_tokens: 0,
+            reasoning_efforts: vec![],
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
+            display_name: Some("Gateway Model".to_string()),
+            group_windows: BTreeMap::from([("g-big".to_string(), (1_050_000, 1_050_000))]),
+            hidden: false,
+        };
+        // Saved and read back with its label and group windows.
+        let read = read_model_configs(&json!({ "models": [model_config_value(&model)] }), "jucode");
+        assert_eq!(read[0].display_name.as_deref(), Some("Gateway Model"));
+        assert_eq!(read[0].group_windows, model.group_windows);
+        assert!(!read[0].hidden);
+        // The hidden flag survives config.json; entries saved without it load as shown.
+        let hidden = ModelConfig {
+            hidden: true,
+            ..model.clone()
+        };
+        let saved = model_config_value(&hidden);
+        assert_eq!(saved["hidden"], json!(true));
+        assert!(model_config_value(&model).get("hidden").is_none());
+        assert!(read_model_configs(&json!({ "models": [saved] }), "jucode")[0].hidden);
+        // Pinned to the big group: its window. Unpinned or another group:
+        // the range over all groups.
+        let pinned = BTreeMap::from([("gateway-model".to_string(), "g-big".to_string())]);
+        assert_eq!(
+            apply_group_window(model.clone(), &pinned).context_window,
+            1_050_000
+        );
+        let other = BTreeMap::from([("gateway-model".to_string(), "g-other".to_string())]);
+        assert_eq!(
+            apply_group_window(model.clone(), &other).context_window,
+            272_000
+        );
+        assert_eq!(
+            apply_group_window(model, &BTreeMap::new()).context_window,
+            272_000
+        );
+    }
+
+    #[test]
+    fn context_window_overrides_round_trip_through_config_json() {
+        let value =
+            json!({ "context_window_overrides": { "gateway-model": 400000, " ": 1, "bad": 0 } });
+        let overrides = read_context_window_overrides(&value);
+        assert_eq!(
+            overrides,
+            BTreeMap::from([("gateway-model".to_string(), 400_000)])
+        );
+    }
+
+    #[test]
+    fn cost_for_prices_cached_input_separately() {
+        let model = ModelConfig {
+            name: "m".to_string(),
+            context_window: 1,
+            max_context_window: 0,
+            max_output_tokens: 1,
+            reasoning_efforts: vec![],
+            input_cost: 2.0,
+            cached_input_cost: 0.5,
+            output_cost: 8.0,
+            display_name: None,
+            group_windows: BTreeMap::new(),
+            hidden: false,
+        };
+        // 1M non-cached input @2 + 1M cached @0.5 + 1M output @8 = 10.5
+        let cost = model.cost_for(2_000_000, 1_000_000, 1_000_000);
+        assert!((cost - 10.5).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[test]
+    fn cost_for_zero_prices_is_free() {
+        let model = default_model_config("gpt-5.4");
+        assert_eq!(model.cost_for(1_000, 100, 1_000), 0.0);
+    }
+
+    #[test]
+    fn builtin_providers_expose_vendor_templates_with_models() {
+        // `jucode providers` prints this list: JuCode's own gateway first,
+        // then the vendored omp catalog's usable providers.
+        let providers = builtin_providers();
+        let ids: Vec<&str> = providers.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids[0], "jucode");
+        assert!(
+            ids.len() > 5,
+            "catalog providers should far exceed the old 5 templates"
+        );
+        for (id, base_url, protocol) in &providers {
+            assert!(
+                matches!(
+                    protocol.as_str(),
+                    "responses" | "azure" | "anthropic" | "chat"
+                ),
+                "{id}: {protocol}"
+            );
+            // Azure deployments live at a per-resource endpoint the catalog
+            // cannot know, and a JuCode server is self-hosted, its models
+            // listed by the server; every other provider ships defaults.
+            if id == "jucode" {
+                assert!(base_url.is_empty() && models_for_provider(id).is_empty());
+                continue;
+            }
+            if id != "azure" {
+                assert!(!base_url.is_empty(), "{id}");
+            }
+            assert!(!models_for_provider(id).is_empty(), "{id}");
+        }
+    }
+
+    #[test]
+    fn models_for_unknown_provider_are_empty() {
+        assert!(models_for_provider("some-custom-gateway").is_empty());
+    }
+
+    #[test]
+    fn a_new_config_has_no_provider_and_no_jucode_server() {
+        let config = Config::from_value("{}", PathBuf::from("config.json")).unwrap();
+        assert!(!config.has_provider());
+        assert_eq!(config.model, "");
+        assert!(config.models.is_empty());
+        assert_eq!(config.base_url, "");
+        assert_eq!(config.jucode_web_url, "");
+        assert_eq!(config.jucode_api_url, "");
+        assert_eq!(config.jucode_app_url, "");
+    }
+
+    #[test]
+    fn claude_thinking_disabled_entries_are_upgraded_on_load() {
+        // A persisted config whose Claude model only offers "none" must be
+        // upgraded to the thinking tiers without a re-login.
+        let value = json!({
+            "models": [{
+                "name": "claude-opus-4-8",
+                "context_window": 200_000,
+                "max_output_tokens": 8_192,
+                "reasoning_efforts": ["none"]
+            }]
+        });
+        let configs = read_model_configs(&value, "jucode");
+        let claude = configs
+            .iter()
+            .find(|m| m.name == "claude-opus-4-8")
+            .expect("claude entry present");
+        assert_eq!(
+            claude.reasoning_efforts,
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(claude.max_output_tokens >= CLAUDE_MIN_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn budget_tiers_written_before_adaptive_effort_are_upgraded() {
+        let value = json!({
+            "models": [
+                { "name": "claude-opus-5-5", "reasoning_efforts": ["none", "low", "medium", "high"] },
+                { "name": "claude-haiku-4-5-20251001", "reasoning_efforts": ["none", "low", "medium", "high"] }
+            ]
+        });
+        let configs = read_model_configs(&value, "jucode");
+        assert_eq!(
+            configs[0].reasoning_efforts,
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
+        );
+        // Haiku keeps budget thinking: its four tiers are still right.
+        assert_eq!(
+            configs[1].reasoning_efforts,
+            vec!["none", "low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn claude_entries_with_real_tiers_are_left_alone() {
+        let value = json!({
+            "models": [{
+                "name": "claude-sonnet-4-6",
+                "context_window": 200_000,
+                "max_output_tokens": 64_000,
+                "reasoning_efforts": ["low", "medium", "high"]
+            }]
+        });
+        let configs = read_model_configs(&value, "jucode");
+        let claude = configs
+            .iter()
+            .find(|m| m.name == "claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(claude.reasoning_efforts, vec!["low", "medium", "high"]);
+        assert_eq!(claude.max_output_tokens, 64_000);
+    }
+
+    #[test]
+    fn compact_model_config_uses_compact_model() {
+        let config = Config {
+            provider: "openai".to_string(),
+            protocol: String::new(),
+            model: "chat-model".to_string(),
+            reasoning_effort: "medium".to_string(),
+            compact_model: "compact-model".to_string(),
+            compact_reasoning_effort: "low".to_string(),
+            safety_model: "compact-model".to_string(),
+            safety_reasoning_effort: "low".to_string(),
+            title_model: String::new(),
+            image_model: String::new(),
+            subagent_models: Vec::new(),
+            models: vec![
+                ModelConfig {
+                    name: "chat-model".to_string(),
+                    context_window: 100,
+                    max_context_window: 0,
+                    max_output_tokens: 10,
+                    reasoning_efforts: vec!["medium".to_string()],
+                    input_cost: 0.0,
+                    cached_input_cost: 0.0,
+                    output_cost: 0.0,
+                    display_name: None,
+                    group_windows: BTreeMap::new(),
+                    hidden: false,
+                },
+                ModelConfig {
+                    name: "compact-model".to_string(),
+                    context_window: 200,
+                    max_context_window: 0,
+                    max_output_tokens: 20,
+                    reasoning_efforts: vec!["low".to_string()],
+                    input_cost: 0.0,
+                    cached_input_cost: 0.0,
+                    output_cost: 0.0,
+                    display_name: None,
+                    group_windows: BTreeMap::new(),
+                    hidden: false,
+                },
+            ],
+            base_url: "https://api.openai.com/v1".to_string(),
+            jucode_web_url: "https://jucode.example".to_string(),
+            jucode_api_url: "https://jucode.example".to_string(),
+            jucode_app_url: "https://app.jucode.example".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
+            compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+            include_project_instructions: true,
+            encrypt_secrets: false,
+            approval_mode: ApprovalMode::default(),
+            edit_tools: default_edit_tools(),
+            extra_skills_source: None,
+            mcp_servers: Vec::new(),
+            sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+            web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
+            web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
+            jucode_models: Vec::new(),
+            jucode_groups: BTreeMap::new(),
+            context_window_overrides: BTreeMap::new(),
+            path: PathBuf::from("config.json"),
+        };
+
+        assert_eq!(config.current_model_config().max_output_tokens, 10);
+        assert_eq!(config.compact_model_config().max_output_tokens, 20);
+    }
+
+    #[test]
+    fn approval_mode_parses_wire_names_and_rejects_unknown() {
+        assert_eq!(ApprovalMode::parse("manual").unwrap(), ApprovalMode::Manual);
+        assert_eq!(
+            ApprovalMode::parse("auto-edit").unwrap(),
+            ApprovalMode::AutoEdit
+        );
+        assert_eq!(ApprovalMode::parse("auto").unwrap(), ApprovalMode::Auto);
+        assert_eq!(
+            ApprovalMode::parse("full-access").unwrap(),
+            ApprovalMode::FullAccess
+        );
+        assert_eq!(
+            ApprovalMode::parse(" full-access ").unwrap().as_str(),
+            "full-access"
+        );
+        let error = ApprovalMode::parse("yolo").unwrap_err();
+        assert!(error.contains("yolo"));
+        assert!(error.contains("manual, auto-edit, auto, full-access, or plan"));
+        assert_eq!(ApprovalMode::parse("plan").unwrap(), ApprovalMode::Plan);
+        assert_eq!(ApprovalMode::Plan.as_str(), "plan");
+        let live = LiveApprovalMode::new(ApprovalMode::Plan);
+        assert_eq!(live.get(), ApprovalMode::Plan);
+    }
+
+    #[test]
+    fn approval_mode_gates_each_tool_class() {
+        let shell_tools = [
+            "bash",
+            "execute",
+            "exec_command",
+            "shell_command",
+            "write_stdin",
+        ];
+        let edit_tools = [
+            "write",
+            "edit",
+            "str_replace",
+            "hashline_edit",
+            "apply_patch",
+            "generate_image",
+        ];
+        let network_tools = ["web_fetch", "web_search"];
+        let free_tools = ["read", "ls", "ripgrep", "outline", "spawn_agent"];
+
+        for tool in shell_tools {
+            assert!(ApprovalMode::Manual.requires_approval(tool), "{tool}");
+            assert!(ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            // `auto` still gates shell at this layer; the classifier decides
+            // whether the call reaches the user.
+            assert!(ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
+        }
+        for tool in edit_tools {
+            assert!(ApprovalMode::Manual.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
+        }
+        for tool in network_tools {
+            assert!(ApprovalMode::Manual.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
+        }
+        for tool in free_tools {
+            assert!(!ApprovalMode::Manual.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn only_auto_mode_classifies_shell_commands() {
+        assert!(!ApprovalMode::Manual.classifies_shell());
+        assert!(!ApprovalMode::AutoEdit.classifies_shell());
+        assert!(ApprovalMode::Auto.classifies_shell());
+        assert!(!ApprovalMode::FullAccess.classifies_shell());
+    }
+
+    #[test]
+    fn mcp_approval_matrix_follows_read_only_hint() {
+        // Non-readOnlyHint MCP tools gate like shell tools; read-only-hinted
+        // tools run freely in the auto modes but still ask in manual.
+        assert!(ApprovalMode::Manual.requires_approval_for_mcp(false));
+        assert!(ApprovalMode::Manual.requires_approval_for_mcp(true));
+        assert!(ApprovalMode::AutoEdit.requires_approval_for_mcp(false));
+        assert!(!ApprovalMode::AutoEdit.requires_approval_for_mcp(true));
+        assert!(ApprovalMode::Auto.requires_approval_for_mcp(false));
+        assert!(!ApprovalMode::Auto.requires_approval_for_mcp(true));
+        assert!(!ApprovalMode::FullAccess.requires_approval_for_mcp(false));
+        assert!(!ApprovalMode::FullAccess.requires_approval_for_mcp(true));
+    }
+
+    #[test]
+    fn requires_approval_gates_mcp_names_conservatively() {
+        // Without the hint, the shared name-based check treats every MCP tool
+        // as mutating.
+        assert!(ApprovalMode::Manual.requires_approval("mcp__files__read"));
+        assert!(ApprovalMode::AutoEdit.requires_approval("mcp__files__read"));
+        assert!(!ApprovalMode::FullAccess.requires_approval("mcp__files__read"));
+    }
+
+    #[test]
+    fn mcp_server_entries_parse_and_validate() {
+        let stdio = parse_mcp_server_value(&json!({
+            "name": "files",
+            "command": "mcp-files",
+            "args": ["--root", "."],
+            "env": { "DEBUG": "1" },
+            "timeout_seconds": 5
+        }))
+        .unwrap();
+        assert_eq!(stdio.name, "files");
+        assert_eq!(stdio.transport, McpTransportKind::Stdio);
+        assert_eq!(stdio.args, vec!["--root", "."]);
+        assert_eq!(stdio.env.get("DEBUG").map(String::as_str), Some("1"));
+        assert!(stdio.enabled);
+        assert_eq!(stdio.timeout_seconds, 5);
+
+        let http = parse_mcp_server_value(&json!({
+            "name": "search",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer x" },
+            "oauth": {
+                "client_id": "client",
+                "token_url": "https://example.com/token",
+                "scope": "mcp"
+            },
+            "enabled": false
+        }))
+        .unwrap();
+        assert_eq!(http.transport, McpTransportKind::Http);
+        assert!(!http.enabled);
+        assert_eq!(http.timeout_seconds, DEFAULT_MCP_TIMEOUT_SECONDS);
+        assert_eq!(http.oauth.unwrap().client_id, "client");
+
+        // Invalid name, missing command/url, unknown transport.
+        assert!(parse_mcp_server_value(&json!({ "name": "bad name", "command": "x" })).is_err());
+        assert!(parse_mcp_server_value(&json!({ "name": "", "command": "x" })).is_err());
+        assert!(parse_mcp_server_value(&json!({ "name": "a" })).is_err());
+        assert!(parse_mcp_server_value(&json!({ "name": "a", "transport": "http" })).is_err());
+        assert!(
+            parse_mcp_server_value(&json!({ "name": "a", "transport": "ws", "url": "u" })).is_err()
+        );
+        assert!(parse_mcp_server_value(&json!({
+            "name": "a",
+            "transport": "http",
+            "url": "https://example.com",
+            "oauth": { "client_id": "only-one-field" }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn jucode_groups_skip_blank_entries() {
+        let config = Config::from_value(
+            r#"{"provider":"jucode","jucode_groups":{"claude-opus-5-5":"g1","gateway-model":" ","x":3}}"#,
+            PathBuf::from("config.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.jucode_groups,
+            BTreeMap::from([("claude-opus-5-5".to_string(), "g1".to_string())])
+        );
+    }
+
+    #[test]
+    fn image_model_defaults_empty_and_survives_a_save() {
+        let dir = std::env::temp_dir().join(format!("jucode-image-model-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let config = Config::from_value("{}", path.clone()).unwrap();
+        assert_eq!(config.image_model, "");
+        config.save().unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["image_model"], "");
+
+        fs::write(&path, r#"{"image_model":" gpt-image-2 "}"#).unwrap();
+        assert_eq!(read_image_model_at(&path).unwrap(), " gpt-image-2 ");
+        let mut config =
+            Config::from_value(&fs::read_to_string(&path).unwrap(), path.clone()).unwrap();
+        assert_eq!(config.image_model, " gpt-image-2 ");
+        config.image_model = "gpt-image-1.5".to_string();
+        config.save().unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["image_model"], "gpt-image-1.5");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subagent_models_skip_blank_and_duplicate_names() {
+        let config = Config::from_value(
+            r#"{"subagent_models":[{"name":" fast ","description":" search "},{"name":""},{"name":"fast"},{"name":"deep"}]}"#,
+            PathBuf::from("config.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.subagent_models,
+            vec![
+                SubagentModel {
+                    name: "fast".to_string(),
+                    description: "search".to_string(),
+                },
+                SubagentModel {
+                    name: "deep".to_string(),
+                    description: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_servers_round_trip_through_json() {
+        let original = McpServerConfig {
+            name: "files".to_string(),
+            transport: McpTransportKind::Http,
+            command: String::new(),
+            args: vec!["-v".to_string()],
+            env: BTreeMap::from([("A".to_string(), "1".to_string())]),
+            url: "https://example.com/mcp".to_string(),
+            headers: BTreeMap::from([("Authorization".to_string(), "Bearer t".to_string())]),
+            oauth: Some(McpOAuthConfig {
+                client_id: "client".to_string(),
+                token_url: "https://example.com/token".to_string(),
+                scope: "mcp:read".to_string(),
+            }),
+            enabled: false,
+            timeout_seconds: 30,
+        };
+        let value = json!({ "mcp_servers": [mcp_server_config_value(&original)] });
+        let parsed = read_mcp_servers(&value);
+        assert_eq!(parsed.len(), 1);
+        let parsed = &parsed[0];
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.transport, original.transport);
+        assert_eq!(parsed.args, original.args);
+        assert_eq!(parsed.env, original.env);
+        assert_eq!(parsed.url, original.url);
+        assert_eq!(parsed.headers, original.headers);
+        assert_eq!(parsed.oauth, original.oauth);
+        assert_eq!(parsed.enabled, original.enabled);
+        assert_eq!(parsed.timeout_seconds, original.timeout_seconds);
+    }
+
+    #[test]
+    fn invalid_and_duplicate_mcp_entries_are_skipped() {
+        let value = json!({ "mcp_servers": [
+            { "name": "ok", "command": "run" },
+            { "name": "ok", "command": "run-again" },
+            { "name": "no command" },
+            "not-an-object"
+        ]});
+        let parsed = read_mcp_servers(&value);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].command, "run");
+    }
+
+    #[test]
+    fn edit_tools_default_to_hashline_only() {
+        assert_eq!(read_edit_tools(&json!({})).unwrap(), vec!["hashline_edit"]);
+        assert_eq!(default_edit_tools(), vec!["hashline_edit"]);
+    }
+
+    #[test]
+    fn edit_tools_accept_known_names_and_canonicalize_the_edit_alias() {
+        let tools = read_edit_tools(&json!({
+            "edit_tools": ["hashline_edit", "edit", "write", "str_replace", "apply_patch"]
+        }))
+        .unwrap();
+        assert_eq!(
+            tools,
+            vec!["hashline_edit", "str_replace", "write", "apply_patch"]
+        );
+
+        // An explicit empty array disables all edit tools.
+        assert_eq!(
+            read_edit_tools(&json!({ "edit_tools": [] })).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn edit_tools_reject_unknown_names_and_non_arrays() {
+        let error = read_edit_tools(&json!({ "edit_tools": ["bash"] })).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("bash"));
+
+        let error = read_edit_tools(&json!({ "edit_tools": "write" })).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("array"));
+    }
+
+    #[test]
+    fn extra_skills_source_is_optional_and_trimmed() {
+        assert_eq!(
+            read_optional_string(&json!({}), "extra_skills_source"),
+            None
+        );
+        assert_eq!(
+            read_optional_string(
+                &json!({ "extra_skills_source": " anthropic " }),
+                "extra_skills_source"
+            )
+            .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            read_optional_string(&json!({ "extra_skills_source": "" }), "extra_skills_source"),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_edit_tool_name_covers_aliases_and_rejects_others() {
+        assert_eq!(canonical_edit_tool_name("edit"), Some("str_replace"));
+        assert_eq!(canonical_edit_tool_name("str_replace"), Some("str_replace"));
+        assert_eq!(
+            canonical_edit_tool_name("hashline_edit"),
+            Some("hashline_edit")
+        );
+        assert_eq!(canonical_edit_tool_name("write"), Some("write"));
+        assert_eq!(canonical_edit_tool_name("apply_patch"), Some("apply_patch"));
+        assert_eq!(canonical_edit_tool_name("read"), None);
+        assert_eq!(canonical_edit_tool_name("bash"), None);
+    }
+
+    #[test]
+    fn sandbox_settings_default_parse_and_validate() {
+        use crate::sandbox::{RuleAction, SandboxMode};
+        let default = read_sandbox(&json!({})).unwrap();
+        assert_eq!(
+            default.mode,
+            if cfg!(windows) {
+                SandboxMode::FullAccess
+            } else {
+                SandboxMode::WorkspaceWrite
+            }
+        );
+        assert!(default.network);
+        assert_eq!(default.rule_for("git push"), Some(RuleAction::Ask));
+
+        let dir = std::env::temp_dir();
+        let custom = read_sandbox(&json!({
+            "sandbox": "read-only",
+            "sandbox_network": false,
+            "sandbox_directories": [
+                { "path": dir, "mode": "rw" },
+                { "path": "/definitely/not/here", "mode": "ro" }
+            ],
+            "command_rules": []
+        }))
+        .unwrap();
+        assert_eq!(custom.mode, SandboxMode::ReadOnly);
+        assert!(!custom.network);
+        assert_eq!(custom.writable_dirs, vec![dir]);
+        // A directory that went away is dropped; an explicit empty rule list stays empty.
+        assert!(custom.readable_dirs.is_empty());
+        assert!(custom.rules.is_empty());
+
+        assert!(read_sandbox(&json!({ "sandbox": "wide-open" })).is_err());
+        assert!(
+            read_sandbox(&json!({ "command_rules": [{ "prefix": "", "action": "allow" }] }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn read_web_engine_defaults_and_validates() {
+        let engines = crate::web::FETCH_ENGINES;
+        assert_eq!(
+            read_web_engine(&json!({}), "web_fetch_engine", "local", engines).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            read_web_engine(
+                &json!({ "web_fetch_engine": " Jina " }),
+                "web_fetch_engine",
+                "local",
+                engines
+            )
+            .unwrap(),
+            "jina"
+        );
+        let error = read_web_engine(
+            &json!({ "web_fetch_engine": "brave" }),
+            "web_fetch_engine",
+            "local",
+            engines,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("web_fetch_engine"));
+    }
+
+    #[test]
+    fn read_approval_mode_defaults_and_validates() {
+        assert_eq!(
+            read_approval_mode(&json!({})).unwrap(),
+            ApprovalMode::Manual
+        );
+        assert_eq!(
+            read_approval_mode(&json!({ "approval_mode": "" })).unwrap(),
+            ApprovalMode::Manual
+        );
+        assert_eq!(
+            read_approval_mode(&json!({ "approval_mode": "auto-edit" })).unwrap(),
+            ApprovalMode::AutoEdit
+        );
+        let error = read_approval_mode(&json!({ "approval_mode": "bogus" })).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("approval_mode"));
+    }
+
+    #[test]
+    fn write_atomically_replaces_file_without_leaving_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-atomic-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        write_atomically(&path, "{\"a\":1}\n").unwrap();
+        write_atomically(&path, "{\"a\":2}\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":2}\n");
+        let entries = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["config.json".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_keeps_keys_it_does_not_know() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-config-keep-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            "{\"model\":\"gpt-5.5\",\"asr\":{\"engine\":\"whisper\"}}\n",
+        )
+        .unwrap();
+        let mut config =
+            Config::from_value(&fs::read_to_string(&path).unwrap(), path.clone()).unwrap();
+        config.model = "gateway-model".to_string();
+        config.save().unwrap();
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["model"], "gateway-model");
+        assert_eq!(saved["asr"]["engine"], "whisper");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_save_preserves_mcp_servers_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-auth-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(
+            &path,
+            "{\"providers\":{},\"mcp_servers\":{\"fs\":{\"access_token\":\"tok\"}}}\n",
+        )
+        .unwrap();
+
+        let store = AuthStore {
+            keys: BTreeMap::from([("openai".to_string(), "sk-test".to_string())]),
+            jucode: None,
+            encryption_key: None,
+            path: path.clone(),
+        };
+        store.save().unwrap();
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["providers"]["openai"], "sk-test");
+        assert_eq!(saved["mcp_servers"]["fs"]["access_token"], "tok");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

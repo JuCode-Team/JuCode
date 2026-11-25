@@ -1,0 +1,26 @@
+{
+  "name": "@jucode/cli",
+  "version": "0.4.30",
+  "description": "JuCode native CLI",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "jucode": "bin/jucode.cjs"
+  },
+  "files": [
+    "bin/jucode.cjs",
+    "NOTICE",
+    "THIRD-PARTY-NOTICES.txt"
+  ],
+  "optionalDependencies": {
+    "@jucode/cli-linux-x64": "0.4.30",
+    "@jucode/cli-win32-x64": "0.4.30",
+    "@jucode/cli-darwin-arm64": "0.4.30",
+    "@jucode/cli-darwin-x64": "0.4.30"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

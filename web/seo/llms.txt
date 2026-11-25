@@ -1,0 +1,21 @@
+# %SITE_NAME%
+
+> 统一 LLM 网关：为 Codex、Claude Code、Cursor 等编程客户端提供 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 三套协议的统一 base_url。
+
+## Endpoints
+
+- [OpenAI Responses](%PUBLIC_SITE_URL%/endpoints): `/v1` — Codex CLI / openai SDK (responses)
+- [OpenAI Chat Completions](%PUBLIC_SITE_URL%/endpoints): `/v1` — 经典 /chat/completions，兼容大多数 OpenAI SDK
+- [Anthropic Messages](%PUBLIC_SITE_URL%/endpoints): `/anthropic/v1` — Claude Code / anthropic SDK
+
+## Docs
+
+- [Home](%PUBLIC_SITE_URL%/): 接入说明
+- [Models](%PUBLIC_SITE_URL%/models): 可用模型与单价
+- [Endpoints](%PUBLIC_SITE_URL%/endpoints): 客户端配置示例 (Codex / Claude Code / openai-py)
+- [Status](%PUBLIC_SITE_URL%/status): 服务可用性
+
+## Optional
+
+- API key prefix: `sk-juc-`
+- Auth header: `Authorization: Bearer <key>` 或 `x-api-key: <key>`

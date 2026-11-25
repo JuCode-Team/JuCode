@@ -1,0 +1,776 @@
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+const TOOL_GUIDANCE_PREFIX: &str = "prefer read/ls/ripgrep/outline for targeted exploration; use bash or exec_command for shell commands and verification; when several read-only searches or inspections are independent, issue them together in the same assistant response; group dependent shell checks into one command when that reduces round trips; keep dependent edit-after-read and verify-after-edit steps ordered; read an existing file before changing it;";
+const TOOL_GUIDANCE_SUFFIX: &str =
+    "if a tool fails, correct the call or use another suitable tool and continue when feasible.";
+const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
+
+/// Tool guidance assembled from the enabled edit tools so the prompt only
+/// describes edit commands that are actually exposed to the model.
+fn tool_guidance(edit_tools: &[String]) -> String {
+    let enabled = |name: &str| edit_tools.iter().any(|tool| tool == name);
+    let edit_names: Vec<&str> = crate::config::EDIT_TOOL_NAMES
+        .into_iter()
+        .filter(|name| enabled(name))
+        .collect();
+    let mut guidance = TOOL_GUIDANCE_PREFIX.to_string();
+    if enabled("write") {
+        guidance.push_str(" write can create new files without a prior read;");
+    } else if enabled("apply_patch") {
+        guidance.push_str(" apply_patch can create new files;");
+    } else if !edit_names.is_empty() {
+        guidance.push_str(" create new files with bash (e.g. a heredoc);");
+    }
+    match edit_names.as_slice() {
+        [] => {
+            guidance.push_str(" no file-edit tools are enabled; describe needed changes instead;")
+        }
+        [name] => guidance.push_str(&format!(" use {name} for file edits;")),
+        names => guidance.push_str(&format!(" use {} for file edits;", names.join(", "))),
+    }
+    guidance.push(' ');
+    guidance.push_str(TOOL_GUIDANCE_SUFFIX);
+    guidance
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptContext {
+    pub date: String,
+    pub cwd: PathBuf,
+    pub tools: Vec<&'static str>,
+    pub edit_tools: Vec<String>,
+    pub project_instructions: Vec<ProjectInstruction>,
+    pub skills: Vec<SkillPromptItem>,
+    /// A chat session gets research guidance instead of coding guidance.
+    pub chat: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInstruction {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPromptItem {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCommand {
+    pub command: String,
+    pub skill: SkillPromptItem,
+}
+
+/// The whole prompt, as a turn joins its parts (core::TurnPrompt).
+#[cfg(test)]
+pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
+    let mut prompt = runtime_prompt(base, context);
+    prompt.push_str(&project_section(&context.project_instructions));
+    prompt.push_str(&skills_section(&context.skills));
+    prompt
+}
+
+/// The base prompt and the runtime context (date, directory, tools): the
+/// system prompt without the project's instructions and the skills list.
+pub fn runtime_prompt(base: &str, context: &PromptContext) -> String {
+    let mut prompt = base.trim_end().to_string();
+    prompt.push_str("\n\n<runtime_context>\n");
+    prompt.push_str(&format!("Current date: {}\n", context.date));
+    prompt.push_str(&format!(
+        "Current working directory: {}\n",
+        context.cwd.display()
+    ));
+    prompt.push_str(&format!("Available tools: {}\n", context.tools.join(", ")));
+    let guidance = if context.chat {
+        crate::chat::CHAT_TOOL_GUIDANCE.to_string()
+    } else {
+        tool_guidance(&context.edit_tools)
+    };
+    prompt.push_str(&format!("Tool guidance: {guidance}\n"));
+    prompt.push_str("</runtime_context>");
+    prompt
+}
+
+/// The project's instruction files (AGENTS.md, CLAUDE.md …) as the system
+/// prompt carries them; empty without any.
+pub fn project_section(instructions: &[ProjectInstruction]) -> String {
+    if instructions.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n\n<project_context>\n");
+    section.push_str("Project-specific instructions and guidelines:\n\n");
+    for instruction in instructions {
+        section.push_str(&format!(
+            "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
+            escape_xml(&instruction.path.display().to_string()),
+            instruction.content.trim_end()
+        ));
+    }
+    section.push_str("</project_context>");
+    section
+}
+
+/// The skills list as the system prompt carries it; empty without any.
+pub fn skills_section(skills: &[SkillPromptItem]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n\nThe following skills provide specialized instructions for specific tasks.\n",
+    );
+    section.push_str("Read the full skill file when the task matches its description.\n");
+    section.push_str(
+        "When a skill file references a relative path, resolve it against the skill directory.\n\n",
+    );
+    section.push_str("<available_skills>\n");
+    for skill in skills {
+        section.push_str("  <skill>\n");
+        section.push_str(&format!("    <name>{}</name>\n", escape_xml(&skill.name)));
+        section.push_str(&format!(
+            "    <description>{}</description>\n",
+            escape_xml(&skill.description)
+        ));
+        section.push_str(&format!(
+            "    <location>{}</location>\n",
+            escape_xml(&skill.path.display().to_string())
+        ));
+        section.push_str("  </skill>\n");
+    }
+    section.push_str("</available_skills>");
+    section
+}
+
+pub fn discover_skills(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+) -> io::Result<Vec<SkillPromptItem>> {
+    discover_skills_from(
+        profile_dir,
+        cwd,
+        project_trusted,
+        crate::secrets::home_dir().map(|home| home.join(".agents").join("skills")),
+    )
+}
+
+fn discover_skills_from(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    user_agents_dir: Option<PathBuf>,
+) -> io::Result<Vec<SkillPromptItem>> {
+    let mut skills = Vec::new();
+    let mut global_skills = Vec::new();
+    read_skills_dir(&profile_dir.join("skills"), &mut global_skills)?;
+    for skill in global_skills {
+        if crate::skills::is_skill_path_enabled(profile_dir, &skill.path)? {
+            skills.push(skill);
+        }
+    }
+    // `~/.agents/skills/` is the cross-tool convention for user-level skills.
+    if let Some(dir) = user_agents_dir {
+        read_skills_dir(&dir, &mut skills)?;
+    }
+    if project_trusted {
+        read_skills_dir(&cwd.join(".jucode").join("skills"), &mut skills)?;
+        // `.agents/skills/` is the cross-tool convention for project skills.
+        read_skills_dir(&cwd.join(".agents").join("skills"), &mut skills)?;
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    skills.dedup_by(|left, right| left.name == right.name && left.path == right.path);
+    Ok(skills)
+}
+
+pub fn skill_commands(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+) -> io::Result<Vec<SkillCommand>> {
+    skill_commands_from(
+        profile_dir,
+        cwd,
+        project_trusted,
+        crate::secrets::home_dir().map(|home| home.join(".agents").join("skills")),
+    )
+}
+
+fn skill_commands_from(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    user_agents_dir: Option<PathBuf>,
+) -> io::Result<Vec<SkillCommand>> {
+    let mut commands = discover_skills_from(profile_dir, cwd, project_trusted, user_agents_dir)?
+        .into_iter()
+        .map(|skill| SkillCommand {
+            command: format!("/{}", skill_command_name(&skill.name)),
+            skill,
+        })
+        .collect::<Vec<_>>();
+    commands.retain(|entry| entry.command != "/");
+    commands.sort_by(|left, right| left.command.cmp(&right.command));
+    Ok(commands)
+}
+
+/// Directories read-only file tools may read outside the workspace: the
+/// directory each discovered skill lives in, so the model can read SKILL.md
+/// and follow its relative references. Mutating tools stay confined.
+pub fn skill_read_roots(skills: &[SkillPromptItem]) -> Vec<PathBuf> {
+    let mut roots = skills
+        .iter()
+        .filter_map(|skill| skill.path.parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+pub fn skill_message(skill: &SkillPromptItem, request: &str) -> io::Result<String> {
+    let content = fs::read_to_string(&skill.path)?;
+    let mut message = format!(
+        "Use the following skill instructions for this request.\n\n<skill name=\"{}\" path=\"{}\">\n{}\n</skill>",
+        escape_xml(&skill.name),
+        escape_xml(&skill.path.display().to_string()),
+        content.trim_end()
+    );
+    if !request.trim().is_empty() {
+        message.push_str("\n\nUser request:\n");
+        message.push_str(request.trim());
+    }
+    Ok(message)
+}
+
+pub fn skill_pin_message(skill: &SkillPromptItem) -> io::Result<String> {
+    let content = fs::read_to_string(&skill.path)?;
+    Ok(format!(
+        "<skill name=\"{}\" path=\"{}\">\n{}\n</skill>",
+        escape_xml(&skill.name),
+        escape_xml(&skill.path.display().to_string()),
+        content.trim_end()
+    ))
+}
+
+pub fn discover_project_instructions(cwd: &Path) -> io::Result<Vec<ProjectInstruction>> {
+    let dirs = project_instruction_dirs(cwd);
+
+    let mut instructions = Vec::new();
+    let mut remaining = PROJECT_INSTRUCTIONS_MAX_BYTES;
+    for dir in dirs {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let path = dir.join(name);
+            if path.exists() {
+                if remaining == 0 {
+                    return Ok(instructions);
+                }
+                let (content, bytes_read) = read_limited_utf8(&path, remaining)?;
+                remaining = remaining.saturating_sub(bytes_read);
+                instructions.push(ProjectInstruction {
+                    path: path.clone(),
+                    content,
+                });
+            }
+        }
+    }
+    Ok(instructions)
+}
+
+fn project_instruction_dirs(cwd: &Path) -> Vec<&Path> {
+    let mut dirs = cwd.ancestors().collect::<Vec<_>>();
+    dirs.reverse();
+    if let Some(index) = dirs.iter().position(|dir| dir.join(".git").exists()) {
+        return dirs[index..].to_vec();
+    }
+    if let Some(index) = dirs
+        .iter()
+        .position(|dir| dir.join("AGENTS.md").exists() || dir.join("CLAUDE.md").exists())
+    {
+        return dirs[index..].to_vec();
+    }
+    vec![cwd]
+}
+
+fn read_limited_utf8(path: &Path, max_bytes: usize) -> io::Result<(String, usize)> {
+    let bytes = fs::read(path)?;
+    let truncated = bytes.len() > max_bytes;
+    let mut end = bytes.len().min(max_bytes);
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    let mut content = String::from_utf8_lossy(&bytes[..end]).to_string();
+    if truncated {
+        content.push_str("\n\n[project instructions truncated by JuCode budget]\n");
+    }
+    Ok((content, end))
+}
+
+fn skill_command_name(name: &str) -> String {
+    let mut output = String::new();
+    let mut previous_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash {
+            output.push('-');
+            previous_dash = true;
+        }
+    }
+    output.trim_matches('-').to_string()
+}
+
+fn read_skills_dir(dir: &Path, skills: &mut Vec<SkillPromptItem>) -> io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            let skill_path = path.join("SKILL.md");
+            if skill_path.exists() {
+                if let Some(skill) = read_skill_file(&skill_path)? {
+                    skills.push(skill);
+                }
+            } else {
+                read_skills_dir(&path, skills)?;
+            }
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            if let Some(skill) = read_skill_file(&path)? {
+                skills.push(skill);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_skill_file(path: &Path) -> io::Result<Option<SkillPromptItem>> {
+    let content = fs::read_to_string(path)?;
+    let name = read_frontmatter_field(&content, "name")
+        .or_else(|| {
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "skill".to_string());
+    let description = read_frontmatter_field(&content, "description")
+        .or_else(|| first_non_empty_body_line(&content))
+        .unwrap_or_default();
+    if description.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SkillPromptItem {
+        name,
+        description,
+        path: path.to_path_buf(),
+    }))
+}
+
+pub(crate) fn read_frontmatter_field(content: &str, key: &str) -> Option<String> {
+    let mut lines = content.lines().peekable();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    while let Some(line) = lines.next() {
+        if line.trim_end() == "---" {
+            return None;
+        }
+        // An indented line, or one without a colon, continues another field.
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        if field.trim() != key {
+            continue;
+        }
+        let value = value.trim();
+        // A block scalar (`>`, `|`, `>-`, `|+`…): the indented lines below.
+        if value.starts_with(['>', '|']) && value.len() <= 2 {
+            let mut parts = Vec::new();
+            while let Some(next) =
+                lines.next_if(|next| next.trim().is_empty() || next.starts_with([' ', '\t']))
+            {
+                parts.push(next.trim());
+            }
+            let separator = if value.starts_with('>') { " " } else { "\n" };
+            return Some(parts.join(separator).trim().to_string());
+        }
+        return Some(value.trim_matches('"').trim_matches('\'').to_string());
+    }
+    None
+}
+
+fn first_non_empty_body_line(content: &str) -> Option<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "---")
+        .map(|line| line.trim_start_matches('#').trim().to_string())
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn chat_prompt_uses_research_guidance() {
+        let prompt = build_system_prompt(
+            "Chat prompt",
+            &PromptContext {
+                date: "2026-09-29".to_string(),
+                cwd: PathBuf::from("/home/u/.jucode/chats/c1"),
+                tools: vec!["web_search", "web_fetch"],
+                edit_tools: crate::config::default_edit_tools(),
+                project_instructions: Vec::new(),
+                skills: Vec::new(),
+                chat: true,
+            },
+        );
+        assert!(prompt.contains(crate::chat::CHAT_TOOL_GUIDANCE));
+        assert!(!prompt.contains(TOOL_GUIDANCE_PREFIX));
+    }
+
+    #[test]
+    fn prompt_includes_runtime_context_and_skills() {
+        let prompt = build_system_prompt(
+            "Base prompt",
+            &PromptContext {
+                date: "2026-05-27".to_string(),
+                cwd: PathBuf::from("C:/repo"),
+                tools: vec!["read", "bash"],
+                edit_tools: crate::config::default_edit_tools(),
+                project_instructions: vec![ProjectInstruction {
+                    path: PathBuf::from("C:/repo/AGENTS.md"),
+                    content: "Follow project rules.".to_string(),
+                }],
+                skills: vec![SkillPromptItem {
+                    name: "review".to_string(),
+                    description: "Review <code> & tests".to_string(),
+                    path: PathBuf::from("C:/skills/review/SKILL.md"),
+                }],
+                chat: false,
+            },
+        );
+
+        assert!(prompt.contains("<runtime_context>"));
+        assert!(prompt.contains("Current date: 2026-05-27"));
+        assert!(prompt.contains("Available tools: read, bash"));
+        assert!(prompt.contains("<project_context>"));
+        assert!(prompt.contains("Follow project rules."));
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("Review &lt;code&gt; &amp; tests"));
+    }
+
+    #[test]
+    fn default_prompt_advertises_only_hashline_edit() {
+        let edit_tools = crate::config::default_edit_tools();
+        let prompt = build_system_prompt(
+            "Base",
+            &PromptContext {
+                date: "2026-05-27".to_string(),
+                cwd: PathBuf::from("/repo"),
+                tools: crate::tools::prompt_tool_names(&edit_tools, true, false, false),
+                edit_tools,
+                project_instructions: Vec::new(),
+                skills: Vec::new(),
+                chat: false,
+            },
+        );
+        let tools_line = prompt
+            .lines()
+            .find(|line| line.starts_with("Available tools:"))
+            .expect("tools line");
+        let listed: Vec<&str> = tools_line
+            .trim_start_matches("Available tools: ")
+            .split(", ")
+            .collect();
+        assert!(listed.contains(&"hashline_edit"));
+        for disabled in ["str_replace", "write", "apply_patch"] {
+            assert!(
+                !listed.contains(&disabled),
+                "tools list advertises {disabled}"
+            );
+        }
+        let guidance = prompt
+            .lines()
+            .find(|line| line.starts_with("Tool guidance:"))
+            .expect("guidance line");
+        assert!(guidance.contains("use hashline_edit for file edits"));
+        assert!(!guidance.contains("str_replace"));
+        assert!(!guidance.contains("apply_patch"));
+        assert!(!guidance.contains(" write"));
+    }
+
+    #[test]
+    fn prompt_lists_enabled_edit_tools_and_new_file_rule() {
+        let edit_tools = vec![
+            "hashline_edit".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ];
+        let prompt = build_system_prompt(
+            "Base",
+            &PromptContext {
+                date: "2026-05-27".to_string(),
+                cwd: PathBuf::from("/repo"),
+                tools: crate::tools::prompt_tool_names(&edit_tools, false, false, false),
+                edit_tools,
+                project_instructions: Vec::new(),
+                skills: Vec::new(),
+                chat: false,
+            },
+        );
+        assert!(prompt.contains("Available tools: read, hashline_edit, write, apply_patch"));
+        assert!(prompt.contains("use hashline_edit, write, apply_patch for file edits"));
+        assert!(prompt.contains("write can create new files without a prior read"));
+        assert!(!prompt.contains("spawn_agent"));
+    }
+
+    #[test]
+    fn discovers_project_instructions_from_root_to_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "jucode-instruction-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("repo");
+        let nested = project.join("crates").join("cli");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(project.join("AGENTS.md"), "root agents").unwrap();
+        fs::write(nested.join("CLAUDE.md"), "nested claude").unwrap();
+
+        let instructions = discover_project_instructions(&nested).unwrap();
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(
+            instructions[0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("AGENTS.md")
+        );
+        assert_eq!(
+            instructions[1]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("CLAUDE.md")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn frontmatter_reads_block_scalars_and_skips_continuations() {
+        let text = "---\nname: finetone\ndescription: >-\n  Tune the voice\n  of prose.\nlicense: MIT\n---\nbody";
+        assert_eq!(
+            read_frontmatter_field(text, "description").unwrap(),
+            "Tune the voice of prose."
+        );
+        assert_eq!(read_frontmatter_field(text, "license").unwrap(), "MIT");
+        let quoted = "---\nother: |\n  a: b\nname: 'Code Review'\n---\n";
+        assert_eq!(
+            read_frontmatter_field(quoted, "name").unwrap(),
+            "Code Review"
+        );
+    }
+
+    #[test]
+    fn discovers_frontmatter_skill_files() {
+        let root = std::env::temp_dir().join(format!(
+            "jucode-skill-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let skill_dir = root.join("profile").join("skills").join("review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code carefully\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills =
+            discover_skills_from(&root.join("profile"), &root.join("cwd"), true, None).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "review");
+        assert_eq!(skills[0].description, "Review code carefully");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_nested_skill_files() {
+        let root = std::env::temp_dir().join(format!(
+            "jucode-nested-skill-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let skill_dir = root
+            .join("profile")
+            .join("skills")
+            .join("bundle")
+            .join("review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: nested-review\ndescription: Review nested code\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills =
+            discover_skills_from(&root.join("profile"), &root.join("cwd"), true, None).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "nested-review");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_commands_slugify_names() {
+        let root = std::env::temp_dir().join(format!(
+            "jucode-skill-command-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let skill_dir = root.join("profile").join("skills").join("code-review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Code Review\ndescription: Review code\n---\nbody\n",
+        )
+        .unwrap();
+
+        let commands =
+            skill_commands_from(&root.join("profile"), &root.join("cwd"), true, None).unwrap();
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, "/code-review");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabled_global_skills_are_hidden_but_trusted_project_skills_load() {
+        let root = std::env::temp_dir().join(format!(
+            "jucode-skill-sources-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        let global = profile.join("skills/global");
+        let user_agents = root.join("home/.agents/skills");
+        let user_agents_skill = user_agents.join("home-skill");
+        let project = cwd.join(".jucode/skills/project");
+        let agents = cwd.join(".agents/skills/agents-skill");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&user_agents_skill).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            global.join("SKILL.md"),
+            "---\nname: global\ndescription: Global\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            user_agents_skill.join("SKILL.md"),
+            "---\nname: home-agents\ndescription: Home agents dir\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("SKILL.md"),
+            "---\nname: project\ndescription: Project\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: agents\ndescription: Agents dir\n---\n",
+        )
+        .unwrap();
+        crate::skills::set_skill_enabled(&profile, "global", false).unwrap();
+
+        let trusted =
+            discover_skills_from(&profile, &cwd, true, Some(user_agents.clone())).unwrap();
+        let untrusted = discover_skills_from(&profile, &cwd, false, Some(user_agents)).unwrap();
+
+        assert_eq!(
+            trusted
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["agents", "home-agents", "project"]
+        );
+        // Project trust only gates project dirs; user-level sources always load.
+        assert_eq!(
+            untrusted
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["home-agents"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_prompt_is_its_sections_joined() {
+        let context = PromptContext {
+            date: "2026-10-09".to_string(),
+            cwd: PathBuf::from("/p"),
+            tools: vec!["shell"],
+            edit_tools: Vec::new(),
+            project_instructions: vec![ProjectInstruction {
+                path: PathBuf::from("/p/AGENTS.md"),
+                content: "Be brief.".to_string(),
+            }],
+            skills: vec![SkillPromptItem {
+                name: "pdf".to_string(),
+                description: "PDFs".to_string(),
+                path: PathBuf::from("/s/pdf/SKILL.md"),
+            }],
+            chat: false,
+        };
+        let project = project_section(&context.project_instructions);
+        assert!(project.contains("Be brief."));
+        assert!(skills_section(&context.skills).contains("<name>pdf</name>"));
+        assert_eq!(
+            build_system_prompt("Base.", &context),
+            format!(
+                "{}{}{}",
+                runtime_prompt("Base.", &context),
+                project,
+                skills_section(&context.skills)
+            )
+        );
+        assert_eq!(project_section(&[]), "");
+    }
+}

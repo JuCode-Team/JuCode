@@ -1,0 +1,5727 @@
+//! Claude Code in stream-json print mode:
+//! `claude --print --input-format stream-json --output-format stream-json
+//!  --include-partial-messages --verbose --replay-user-messages
+//!  --permission-prompt-tool stdio`.
+//!
+//! Frames (verified against claude 2.1.208):
+//! - `system/init` at every turn start; `system/status` (requesting,
+//!   compacting, permissionMode changes); `system/compact_boundary`.
+//! - `stream_event` wraps raw Anthropic stream events; `assistant` carries each
+//!   completed block; `user` carries tool results and, with isReplay, the
+//!   echo of a message written to stdin; `result` ends a turn.
+//! - Permission prompts are `control_request` can_use_tool frames, answered
+//!   with `control_response`. Client requests (set_permission_mode,
+//!   list_models, set_model, interrupt, get_settings, apply_flag_settings)
+//!   are `control_request`s we send.
+//! - Session settings are flag settings (`apply_flag_settings`: effortLevel,
+//!   ultracode, fastMode); `get_settings` reports what took effect, a
+//!   repeated `initialize` the fast-mode state. Thinking summaries are
+//!   `set_max_thinking_tokens` thinking_display.
+//! - Background work (Workflow, background Bash/Agent, Monitor) and Task
+//!   subagents report through `system/task_*` and
+//!   `background_tasks_changed`; a finished background task also comes back
+//!   as a `<task-notification>` user message that starts a turn.
+//! - A user message sent mid-turn waits here (`pending_messages`, where it
+//!   can be taken back with `unqueue`) and starts the next turn when this one
+//!   ends. `steer` writes it to the CLI now with priority `now`, which stops
+//!   the running turn's generation and tool calls and takes the message in at
+//!   once (as T3 Code does). A subagent the turn runs in the foreground would
+//!   be one of those calls, so it is moved to the background first
+//!   (`background_tasks`) and reports back as a task notification. Until the
+//!   CLI replays the message it stays listed, first and `fixed` (it can no
+//!   longer be taken back). Claude saves it only as a `queued_command`
+//!   attachment row.
+//! - Full access (`bypassPermissions`) is only honored when the CLI starts
+//!   with `--dangerously-skip-permissions`, so switching into or out of it
+//!   restarts the engine on the same conversation.
+//!
+//! Translated into the jucode event dialect (`docs/serve-protocol.md`) plus
+//! the Desktop's extras (`assistant_uuid`, `rate_limit`, `resume_failed`,
+//! `model_label`, approval `questions`).
+
+mod runs;
+
+use super::{home, op_files, resolve, set_files, Adapter, HostCall, Line, Options, Output};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use jucode_agent_core::{attachments, queue_index, queue_move_target, user_tools};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{BufRead, BufReader, Read},
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
+};
+
+pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const DEFAULT_EFFORT: &str = "medium";
+const SUMMARY_CAP: usize = 4000;
+/// How often an edit whose input is still streaming reports its line counts.
+const EDIT_PREVIEW_EVERY: Duration = Duration::from_millis(200);
+/// The API takes an image of at most 5 MB base64 (3.75 MB raw); larger ones
+/// stay files the model opens with Read, which downsizes them.
+const IMAGE_CAP: u64 = 3_750_000;
+
+/// A message sent mid-turn, waiting to be written to the CLI.
+struct Held {
+    text: String,
+    /// As sent (`images` of the op), for a message taken back.
+    images: Value,
+    /// As sent (`files` of the op), for a message taken back.
+    files: Vec<String>,
+    /// The stdin line that sends it.
+    frame: String,
+}
+
+/// How long a steer waits for its subagents to move to the background
+/// before it is sent anyway (T3 Code waits as long).
+const STEER_MOVE_WAIT: Duration = Duration::from_secs(5);
+
+/// Steered messages waiting for the foreground subagents to move to the
+/// background (`background_tasks` answers) before they go to the CLI.
+struct Steering {
+    frames: Vec<String>,
+    waiting: usize,
+    deadline: Instant,
+}
+
+/// The in-process MCP server carrying `user_tools` (see `command`).
+const MCP_SERVER: &str = "jucode";
+
+/// Settings files written for gateway keys (see `use_gateway`).
+static GATEWAY_FILES: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// This session talks to the JuCode gateway through the daemon's local
+/// gateway (`base`, see crate::gateway): a settings file (owner-only) that
+/// overrides the endpoint and credential for this process alone. The
+/// credential is the local `key`, never the JuCode token; the file is named
+/// by the session (`id`), not the key, since its path is in the engine's argv
+/// for anyone on the machine to read. An empty ANTHROPIC_API_KEY masks one
+/// the user's own settings set. A custom provider (`tool_providers`) serves
+/// its one `model`: Claude Code's background and subagent requests, which
+/// name Claude models, go to it too.
+pub fn use_gateway(
+    command: &mut Command,
+    id: &str,
+    base: &str,
+    key: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let mut settings = json!({ "env": {
+        "ANTHROPIC_BASE_URL": base,
+        "ANTHROPIC_AUTH_TOKEN": key,
+        "ANTHROPIC_API_KEY": "",
+    } });
+    if let Some(model) = model {
+        for name in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            settings["env"][name] = json!(model);
+        }
+    }
+    let dir = home().join(".jucode").join("daemon");
+    // Older daemons wrote the JuCode token itself here.
+    let _ = std::fs::remove_file(dir.join("claude-gateway.json"));
+    let mut name: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if name.is_empty() {
+        // No id yet: any name unrelated to the key.
+        let mut bytes = [0u8; 8];
+        getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
+        name = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let path = dir.join(format!("claude-gateway-{name}.json"));
+    // A fresh install has no daemon directory before its first gateway session.
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    crate::store::write_private(&path, settings.to_string().as_bytes())
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    GATEWAY_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((key.to_string(), path.clone()));
+    command.arg("--settings").arg(path);
+    Ok(())
+}
+
+/// The engine holding `key` is gone: its settings file goes too.
+pub fn forget_gateway(key: &str) {
+    let mut files = GATEWAY_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    files.retain(|(k, path)| {
+        if k == key {
+            let _ = std::fs::remove_file(path);
+        }
+        k != key
+    });
+}
+
+pub fn command(id: &str, options: &Options) -> Command {
+    let program = match &options.bin {
+        Some(bin) => PathBuf::from(bin),
+        None => resolve(
+            "claude",
+            "CLAUDE_BIN",
+            &[home().join(".claude").join("local").join("claude")],
+        ),
+    };
+    let mut command = Command::new(program);
+    command.args([
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+        "--replay-user-messages",
+    ]);
+    // Without a prompt tool the CLI drops AskUserQuestion, even in full access.
+    command.args(["--permission-prompt-tool", "stdio"]);
+    // The daemon's own tools, served in-process over the control channel
+    // (`mcp_message`); they only show the user something, so they never ask.
+    // With all of them off there is no server.
+    let allowed: Vec<String> = user_tools::NAMES
+        .iter()
+        .filter(|name| !options.app_tools_off.contains(name))
+        .map(|name| format!("mcp__{MCP_SERVER}__{name}"))
+        .collect();
+    if !allowed.is_empty() {
+        command.arg("--mcp-config").arg(
+            json!({ "mcpServers": { MCP_SERVER: { "type": "sdk", "name": MCP_SERVER } } })
+                .to_string(),
+        );
+        command.args(["--allowedTools", &allowed.join(",")]);
+    }
+    let mode = to_claude_mode(options.approval_mode.as_deref().unwrap_or_default());
+    if mode == "bypassPermissions" {
+        command.arg("--dangerously-skip-permissions");
+    } else {
+        command.args(["--permission-mode", mode]);
+    }
+    match (&options.resume, &options.fork_from) {
+        (Some(resume), _) => {
+            command.args(["--resume", resume]);
+        }
+        // A fork: the conversation so far (to `resume_at`), as a new one
+        // under the id the daemon picked.
+        (None, Some(from)) => {
+            command.args(["--resume", from, "--fork-session", "--session-id", id]);
+        }
+        (None, None) => {
+            command.args(["--session-id", id]);
+        }
+    }
+    if let Some(at) = &options.resume_at {
+        command.args(["--resume-session-at", at]);
+    }
+    if let Some(model) = &options.model {
+        command.args(["--model", model]);
+    }
+    if let Some(effort) = options
+        .effort
+        .as_deref()
+        .filter(|e| EFFORT_LEVELS.contains(e))
+    {
+        command.args(["--effort", effort]);
+    }
+    add_dirs(&mut command, options);
+    command
+}
+
+/// The project's extra directories, which Claude Code may work in too.
+fn add_dirs(command: &mut Command, options: &Options) {
+    for dir in &options.dirs {
+        command.arg("--add-dir").arg(dir);
+    }
+}
+
+/// Claude Code's own TUI resuming conversation `id`, in the session's
+/// permission mode and model (for the GUI ⇄ TUI handoff).
+pub fn tui(id: &str, options: &Options, saved: bool) -> Command {
+    let program = match &options.bin {
+        Some(bin) => PathBuf::from(bin),
+        None => resolve(
+            "claude",
+            "CLAUDE_BIN",
+            &[home().join(".claude").join("local").join("claude")],
+        ),
+    };
+    let mut command = Command::new(program);
+    // A conversation not saved yet starts in the TUI, under its id.
+    command.args([if saved { "--resume" } else { "--session-id" }, id]);
+    match to_claude_mode(options.approval_mode.as_deref().unwrap_or_default()) {
+        "bypassPermissions" => {
+            command.arg("--dangerously-skip-permissions");
+        }
+        mode => {
+            command.args(["--permission-mode", mode]);
+        }
+    }
+    if let Some(model) = &options.model {
+        command.args(["--model", model]);
+    }
+    add_dirs(&mut command, options);
+    // A daemon started from inside Claude Code inherits that session's
+    // markers; with them the TUI counts as a nested child and does not save
+    // its transcript, so turns typed there would be lost on the way back.
+    for name in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_PID",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Client approval mode (jucode or Desktop names) → claude permission mode.
+pub fn to_claude_mode(mode: &str) -> &'static str {
+    match mode {
+        "plan" => "plan",
+        "auto" => "auto",
+        "auto-edit" | "acceptEdits" => "acceptEdits",
+        "full-auto" | "full-access" | "bypassPermissions" => "bypassPermissions",
+        _ => "default",
+    }
+}
+
+/// Claude permission mode → the Desktop's engine mode name.
+fn from_claude_mode(mode: &str) -> &'static str {
+    match mode {
+        "plan" => "plan",
+        "auto" => "auto",
+        "acceptEdits" => "auto-edit",
+        "bypassPermissions" | "dontAsk" => "full-auto",
+        _ => "read-only",
+    }
+}
+
+/// Claude tool name → the jucode tool-card name.
+fn tool_name(name: &str) -> &str {
+    match name {
+        "Bash" => "bash",
+        "Write" => "write",
+        "Edit" | "MultiEdit" | "NotebookEdit" => "str_replace",
+        "Read" => "read",
+        "Grep" | "Glob" => "ripgrep",
+        "WebSearch" => "web_search",
+        "WebFetch" => "web_fetch",
+        other => other
+            .strip_prefix("mcp__jucode__")
+            .filter(|name| user_tools::NAMES.contains(name))
+            .unwrap_or(other),
+    }
+}
+
+fn text(value: &Value) -> &str {
+    value.as_str().unwrap_or_default()
+}
+
+fn is_tool_use(block: &Value) -> bool {
+    matches!(
+        text(&block["type"]),
+        "tool_use" | "server_tool_use" | "mcp_tool_use"
+    )
+}
+
+fn object(value: &Value) -> Value {
+    if value.is_object() {
+        value.clone()
+    } else {
+        json!({})
+    }
+}
+
+fn prefix_lines(text: &str, prefix: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    text.split('\n')
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn pair(old: &str, new: &str) -> String {
+    [prefix_lines(old, "-"), prefix_lines(new, "+")]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Lines a diff adds and removes.
+fn diff_stat(diff: &str) -> (usize, usize) {
+    diff.split('\n')
+        .fold((0, 0), |(add, del), line| match line.as_bytes().first() {
+            Some(b'+') => (add + 1, del),
+            Some(b'-') => (add, del + 1),
+            _ => (add, del),
+        })
+}
+
+/// Closes a streamed JSON prefix so it parses: the open string, then the open
+/// objects and arrays. None when the prefix stops where no value can end.
+fn close_partial_json(partial: &str) -> Option<Value> {
+    let mut stack = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for c in partial.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut closed = partial.trim_end().to_string();
+    if in_string {
+        if escaped {
+            closed.pop();
+        }
+        // A \uXXXX escape cut short.
+        let tail = closed.len().saturating_sub(5);
+        if let Some(i) = closed.as_bytes()[tail..]
+            .windows(2)
+            .rposition(|w| w == b"\\u")
+        {
+            closed.truncate(tail + i);
+        }
+        closed.push('"');
+    } else if closed.ends_with(',') {
+        closed.pop();
+    } else if closed.ends_with(':') {
+        closed.push_str("null");
+    }
+    closed.extend(stack.iter().rev());
+    serde_json::from_str(&closed).ok()
+}
+
+/// Unified-diff-ish rendering of an edit tool's input.
+fn edit_diff(name: &str, input: &Value) -> String {
+    match name {
+        "Write" => prefix_lines(text(&input["content"]), "+"),
+        "NotebookEdit" => prefix_lines(text(&input["new_source"]), "+"),
+        "MultiEdit" => input["edits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|edit| pair(text(&edit["old_string"]), text(&edit["new_string"])))
+            .filter(|diff| !diff.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => pair(text(&input["old_string"]), text(&input["new_string"])),
+    }
+}
+
+fn edit_path(input: &Value) -> &str {
+    let path = text(&input["file_path"]);
+    if path.is_empty() {
+        text(&input["notebook_path"])
+    } else {
+        path
+    }
+}
+
+/// One selectable hunk per MultiEdit replacement (two or more).
+fn edit_hunks(name: &str, input: &Value) -> Value {
+    let edits = input["edits"].as_array().cloned().unwrap_or_default();
+    if name != "MultiEdit" || edits.len() < 2 {
+        return Value::Null;
+    }
+    let file = edit_path(input);
+    let hunks: Vec<Value> = edits
+        .iter()
+        .enumerate()
+        .map(|(i, edit)| {
+            let lines: Vec<String> = pair(text(&edit["old_string"]), text(&edit["new_string"]))
+                .split('\n')
+                .map(str::to_string)
+                .collect();
+            json!({ "id": format!("e{i}"), "file": file, "header": format!("edit {}/{}", i + 1, edits.len()), "lines": lines })
+        })
+        .collect();
+    json!(hunks)
+}
+
+/// The tool-card JSON of a call's result (`structured`: the frame's
+/// `tool_use_result`, a saved row's `toolUseResult`).
+fn result_card(meta: &ToolMeta, block: &Value, structured: &Value) -> String {
+    let is_error = block["is_error"] == true;
+    let body = result_text(&block["content"]);
+    let failed = || {
+        if body.is_empty() {
+            "failed".to_string()
+        } else {
+            body.clone()
+        }
+    };
+    match meta.name.as_str() {
+        "bash" => {
+            let mut card = json!({ "command": text(&meta.input["command"]) });
+            if is_error {
+                let stderr = text(&structured["stderr"]);
+                card["error"] = json!(if !body.is_empty() {
+                    body.clone()
+                } else if !stderr.is_empty() {
+                    stderr.to_string()
+                } else {
+                    "failed".to_string()
+                });
+            } else {
+                card["stdout"] = match structured["stdout"].as_str() {
+                    Some(stdout) => json!(stdout),
+                    None => json!(body),
+                };
+                if !text(&structured["stderr"]).is_empty() {
+                    card["stderr"] = structured["stderr"].clone();
+                }
+            }
+            card.to_string()
+        }
+        "write" | "str_replace" => {
+            let path = edit_path(&meta.input);
+            if is_error {
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+                json!({ "path": path, "paths": paths, "diff": edit_diff(&meta.claude_name, &meta.input) }).to_string()
+            }
+        }
+        "read" => {
+            if is_error {
+                let path = text(&meta.input["file_path"]);
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                read_card(&meta.input).to_string()
+            }
+        }
+        "ripgrep" => {
+            let mut card = json!({ "pattern": text(&meta.input["pattern"]) });
+            if is_error {
+                card["error"] = json!(failed());
+            } else {
+                card["stdout"] = json!(body);
+            }
+            card.to_string()
+        }
+        _ => body.clone(),
+    }
+}
+
+/// A Read card: the file, and the line the reading started at (`offset`,
+/// 1-based) when not the first, where the card opens it.
+fn read_card(input: &Value) -> Value {
+    let mut card = json!({ "path": text(&input["file_path"]) });
+    if let Some(line) = input["offset"].as_u64().filter(|line| *line > 1) {
+        card["line"] = json!(line);
+    }
+    card
+}
+
+/// The tool-card JSON Desktop's cards understand, from a tool input.
+fn card_json(name: &str, input: &Value) -> String {
+    let card = match tool_name(name) {
+        "bash" => json!({ "command": text(&input["command"]) }),
+        "write" | "str_replace" => {
+            let path = edit_path(input);
+            let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+            json!({ "path": path, "paths": paths, "diff": edit_diff(name, input) })
+        }
+        "read" => read_card(input),
+        "ripgrep" => {
+            let mut card = json!({ "pattern": text(&input["pattern"]) });
+            if !text(&input["path"]).is_empty() {
+                card["path"] = input["path"].clone();
+            }
+            card
+        }
+        "web_search" => json!({ "query": text(&input["query"]) }),
+        "web_fetch" => json!({ "url": text(&input["url"]) }),
+        _ => input.clone(),
+    };
+    card.to_string()
+}
+
+fn cap(text: String) -> String {
+    if text.chars().count() > SUMMARY_CAP {
+        format!("{}…", text.chars().take(SUMMARY_CAP).collect::<String>())
+    } else {
+        text
+    }
+}
+
+/// TodoWrite input → a `plan` event.
+fn plan_events(input: &Value) -> Vec<Value> {
+    let plan: Vec<Value> = input["todos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|todo| {
+            let step = [text(&todo["content"]), text(&todo["activeForm"])]
+                .into_iter()
+                .find(|step| !step.is_empty())?;
+            let status = text(&todo["status"]);
+            Some(json!({ "step": step, "status": if status.is_empty() { "pending" } else { status } }))
+        })
+        .collect();
+    if plan.is_empty() {
+        vec![]
+    } else {
+        vec![json!({ "type": "plan", "plan": plan })]
+    }
+}
+
+fn approval_summary(request: &Value) -> String {
+    let input = object(&request["input"]);
+    let name = text(&request["tool_name"]);
+    match name {
+        "Bash" => {
+            let command = text(&input["command"]);
+            let description = text(&input["description"]);
+            cap(if !description.is_empty() && description != command {
+                format!("{command}\n{description}")
+            } else {
+                command.to_string()
+            })
+        }
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
+            cap([edit_path(&input).to_string(), edit_diff(name, &input)]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "Read" => text(&input["file_path"]).to_string(),
+        // The plan in full, so the plan card can copy all of it.
+        "ExitPlanMode" => match text(&input["plan"]) {
+            "" => request["input"].to_string(),
+            plan => plan.to_string(),
+        },
+        "Task" => {
+            let what = [text(&input["description"]), text(&input["prompt"])]
+                .into_iter()
+                .find(|what| !what.is_empty())
+                .unwrap_or_default();
+            let summary = [text(&input["subagent_type"]), what]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(": ");
+            cap(if summary.is_empty() {
+                request["input"].to_string()
+            } else {
+                summary
+            })
+        }
+        "AskUserQuestion" => {
+            let questions: Vec<String> = input["questions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|question| {
+                    let options: Vec<String> = question["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|option| match text(&option["description"]) {
+                            "" => format!("  • {}", text(&option["label"])),
+                            detail => format!("  • {} — {detail}", text(&option["label"])),
+                        })
+                        .collect();
+                    [text(&question["question"]).to_string(), options.join("\n")]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|question| !question.is_empty())
+                .collect();
+            cap(if questions.is_empty() {
+                request["input"].to_string()
+            } else {
+                questions.join("\n\n")
+            })
+        }
+        _ => {
+            let detail = match text(&request["description"]) {
+                "" => request["input"].to_string(),
+                detail => detail.to_string(),
+            };
+            cap(format!("{name}: {detail}"))
+        }
+    }
+}
+
+/// A tool_result's content (string or blocks) as text.
+fn result_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "text")
+        .map(|block| text(&block["text"]))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn error_event(message: &str) -> Value {
+    let lower = message.to_lowercase();
+    let auth = [
+        "invalid api key",
+        "/login",
+        "authentication_error",
+        "authentication error",
+        "401",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || (lower.contains("oauth") && (lower.contains("expired") || lower.contains("revoked")));
+    let hint = if auth {
+        " (Claude Code needs to sign in again: run `claude` in a terminal and log in.)"
+    } else {
+        ""
+    };
+    json!({ "type": "error", "message": format!("{message}{hint}") })
+}
+
+fn context_tokens(usage: &Value) -> u64 {
+    [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .map(|key| usage[*key].as_u64().unwrap_or(0))
+    .sum()
+}
+
+/// "claude-opus-4-8[1m]" → "Opus 4.8 (1M)", "claude-haiku-4-5-20251001" →
+/// "Haiku 4.5".
+pub fn compact_model(resolved: &str, raw: &str) -> String {
+    let id = if resolved.is_empty() { raw } else { resolved };
+    let long = raw.to_lowercase().contains("[1m]") || id.to_lowercase().contains("[1m]");
+    let stripped = id.strip_prefix("claude-").unwrap_or(id);
+    let stripped = stripped
+        .strip_suffix("[1m]")
+        .or_else(|| stripped.strip_suffix("[1M]"))
+        .unwrap_or(stripped);
+    if stripped.is_empty() {
+        return raw.to_string();
+    }
+    let mut parts = stripped.split('-');
+    let family = parts.next().unwrap_or_default();
+    let family = family
+        .chars()
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + &family[first.len_utf8()..])
+        .unwrap_or_default();
+    let version: Vec<&str> = parts
+        .take_while(|part| {
+            !part.is_empty() && part.len() != 8 && part.chars().all(|c| c.is_ascii_digit())
+        })
+        .collect();
+    let base = if version.is_empty() {
+        family
+    } else {
+        format!("{family} {}", version.join("."))
+    };
+    if long {
+        format!("{base} (1M)")
+    } else {
+        base
+    }
+}
+
+/// `/effort <level>` and its confirmation are bookkeeping, not conversation.
+fn is_effort_echo(text: &str) -> bool {
+    let text = text.trim();
+    text == "/effort"
+        || text.starts_with("/effort ")
+        || text.to_lowercase().starts_with("set effort level to ")
+}
+
+struct Task {
+    kind: String,
+    description: String,
+    /// Runs in the background: its end is news. A foreground subagent's
+    /// result is its Agent call's card.
+    background: bool,
+    /// The tool call that started it.
+    tool_use_id: String,
+    /// The subagent that launched it (empty: the main loop).
+    parent: String,
+}
+
+struct ToolMeta {
+    claude_name: String,
+    name: String,
+    input: Value,
+}
+
+#[derive(Default)]
+struct Block {
+    streamed: usize,
+    tool: Option<String>,
+    partial: String,
+    /// When the streaming edit last reported its line counts.
+    previewed: Option<Instant>,
+}
+
+pub struct Claude {
+    /// The claude permission mode the client asked for.
+    mode: &'static str,
+    requested_model: Option<String>,
+    request_seq: u64,
+    /// Our outstanding control requests: id → (subtype, tag).
+    pending: HashMap<String, (String, String)>,
+    started: bool,
+    conversation: String,
+    model: String,
+    effort: String,
+    /// Ultracode is on (asked for, until get_settings reports it) and
+    /// offered for this model.
+    ultracode: bool,
+    ultracode_available: bool,
+    /// Fast mode: asked for, the CLI's state (on/off/cooldown) and why it
+    /// can't serve ("" when nothing blocks it).
+    fast_wanted: bool,
+    fast: String,
+    fast_blocked: String,
+    /// Thinking summaries are shown.
+    thinking: bool,
+    /// Running tasks (subagents, background work) by task id.
+    tasks: HashMap<String, Task>,
+    /// The last usage-limit notice that was not "ok" (a `rate_limit` event):
+    /// what a turn stopped by the limit reports.
+    limit: Value,
+    /// This turn was stopped by a usage limit: its error is that notice.
+    limit_hit: bool,
+    /// Messages sent with images, oldest first: (text, image paths). The
+    /// echo carries the images inline; the clients show them by path.
+    sent_images: Vec<(String, Value)>,
+    /// Workflows and Task subagents, for the agent trace.
+    runs: runs::Runs,
+    /// The project directory, where Claude Code keeps the conversation.
+    cwd: PathBuf,
+    engine_mode: String,
+    context_window: u64,
+    catalog: Vec<Value>,
+    pending_model: String,
+    model_windows: HashMap<String, u64>,
+    /// Synthetic call id → (control request id, the can_use_tool request).
+    approvals: HashMap<String, (String, Value)>,
+    approval_seq: u64,
+    tools: HashMap<String, ToolMeta>,
+    blocks: HashMap<u64, Block>,
+    completed_blocks: u64,
+    last_context: u64,
+    /// The input counts of the message streaming now, from its start: a
+    /// `message_delta` may leave them out.
+    start_usage: Value,
+    /// The CLI's running per-model totals (`modelUsage`) as of the last
+    /// result; unknown for a resumed conversation until `get_usage` says.
+    model_totals: Option<HashMap<String, Tokens>>,
+    /// Main-loop usage already reported since then, by model.
+    streamed: HashMap<String, Tokens>,
+    active_turn: bool,
+    interrupting: bool,
+    /// Messages written to the CLI that it has not taken in (replayed) yet.
+    queued: Vec<String>,
+    /// Messages sent mid-turn, waiting here for the turn to end (or a steer).
+    held: Vec<Held>,
+    /// A steer waiting for its subagents to move to the background.
+    steering: Option<Steering>,
+    /// A steer went to the CLI during this turn: priority `now` ends it
+    /// as `error_during_execution`, which is no error to report.
+    steered: bool,
+    /// The composer's slash commands: the CLI's `initialize` reply (with
+    /// descriptions and argument hints), plus names only `system/init` lists.
+    commands: Vec<Value>,
+    /// `user_tools` calls waiting for the daemon.
+    calls: Vec<HostCall>,
+    /// The `user_tools` the user turned off.
+    app_tools_off: Vec<&'static str>,
+    /// The CLI's config directory (`config_dir_in`).
+    config: PathBuf,
+}
+
+impl Claude {
+    pub fn new(options: &Options) -> Self {
+        Self {
+            mode: to_claude_mode(options.approval_mode.as_deref().unwrap_or_default()),
+            requested_model: options.model.clone(),
+            request_seq: 0,
+            pending: HashMap::new(),
+            started: false,
+            conversation: options.resume.clone().unwrap_or_default(),
+            model: String::new(),
+            effort: options
+                .effort
+                .clone()
+                .filter(|e| EFFORT_LEVELS.contains(&e.as_str()))
+                .unwrap_or_else(|| DEFAULT_EFFORT.to_string()),
+            ultracode: options.ultracode,
+            ultracode_available: false,
+            fast_wanted: options.fast,
+            fast: "off".to_string(),
+            fast_blocked: String::new(),
+            thinking: options.thinking.unwrap_or(true),
+            tasks: HashMap::new(),
+            sent_images: Vec::new(),
+            limit: Value::Null,
+            limit_hit: false,
+            runs: runs::Runs::default(),
+            cwd: PathBuf::new(),
+            engine_mode: String::new(),
+            context_window: 0,
+            catalog: Vec::new(),
+            pending_model: String::new(),
+            model_windows: HashMap::new(),
+            approvals: HashMap::new(),
+            approval_seq: 0,
+            tools: HashMap::new(),
+            blocks: HashMap::new(),
+            completed_blocks: 0,
+            last_context: 0,
+            start_usage: Value::Null,
+            model_totals: options.resume.is_none().then(HashMap::new),
+            streamed: HashMap::new(),
+            active_turn: false,
+            interrupting: false,
+            queued: Vec::new(),
+            held: Vec::new(),
+            steering: None,
+            steered: false,
+            commands: Vec::new(),
+            calls: Vec::new(),
+            app_tools_off: options.app_tools_off.clone(),
+            config: known_config(options).unwrap_or_else(|| config_dir_in(&options.env)),
+        }
+    }
+
+    pub fn at(mut self, cwd: &Path) -> Self {
+        self.cwd = cwd.to_path_buf();
+        self
+    }
+
+    /// Where Claude Code keeps this conversation's Workflows and subagents.
+    fn session_dir(&self) -> PathBuf {
+        project_dir(&self.config, &self.cwd).join(&self.conversation)
+    }
+
+    fn control_request(&mut self, request: Value, tag: &str) -> String {
+        self.request_seq += 1;
+        let id = format!("jucode-{}", self.request_seq);
+        self.pending.insert(
+            id.clone(),
+            (text(&request["subtype"]).to_string(), tag.to_string()),
+        );
+        json!({ "type": "control_request", "request_id": id, "request": request }).to_string()
+    }
+
+    /// What took effect follows the model (ultracode needs one that offers
+    /// it), so a flag change and a model switch are each followed by
+    /// `get_settings`.
+    fn flag_settings(&mut self, settings: Value) -> Vec<String> {
+        vec![
+            self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": settings }),
+                "",
+            ),
+            self.control_request(json!({ "subtype": "get_settings" }), ""),
+        ]
+    }
+
+    /// Fast mode's state comes with an `initialize` reply.
+    fn fast_request(&mut self, on: bool) -> Vec<String> {
+        self.fast_wanted = on;
+        vec![
+            self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": { "fastMode": on } }),
+                "",
+            ),
+            self.control_request(json!({ "subtype": "initialize" }), "fast"),
+        ]
+    }
+
+    fn thinking_request(&mut self, on: bool) -> String {
+        self.thinking = on;
+        self.control_request(
+            json!({ "subtype": "set_max_thinking_tokens", "thinking_display": if on { "summarized" } else { "omitted" } }),
+            "",
+        )
+    }
+
+    /// The user's message: text, then each attached image as an image block
+    /// (a file the API would refuse stays a path the model opens with Read),
+    /// then a text block naming each other attached file.
+    fn user_content(op: &Value) -> Vec<Value> {
+        let mut content = vec![json!({ "type": "text", "text": op["content"] })];
+        for image in op["images"].as_array().into_iter().flatten() {
+            let path = text(image);
+            let media = match Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_lowercase)
+                .as_deref()
+            {
+                Some("png") => Some("image/png"),
+                Some("jpg" | "jpeg") => Some("image/jpeg"),
+                Some("gif") => Some("image/gif"),
+                Some("webp") => Some("image/webp"),
+                _ => None,
+            };
+            let data = media
+                .filter(|_| fs::metadata(path).is_ok_and(|m| m.len() <= IMAGE_CAP))
+                .and_then(|media| Some((media, fs::read(path).ok()?)));
+            content.push(match data {
+                Some((media, bytes)) => json!({ "type": "image", "source": { "type": "base64", "media_type": media, "data": STANDARD.encode(bytes) } }),
+                None => json!({ "type": "text", "text": format!("[Attached image: {path} — open it with the Read tool]") }),
+            });
+        }
+        for file in op_files(op) {
+            content.push(json!({ "type": "text", "text": attachments::file_line(&file) }));
+        }
+        content
+    }
+
+    /// What waits: the messages the CLI has (`fixed`, first), then those held.
+    fn queued_event(&self) -> Value {
+        let messages: Vec<&str> = self
+            .queued
+            .iter()
+            .map(String::as_str)
+            .chain(self.held.iter().map(|h| h.text.as_str()))
+            .collect();
+        json!({ "type": "pending_messages", "messages": messages, "fixed": self.queued.len() })
+    }
+
+    /// The steered messages, once their subagents are in the background,
+    /// the wait is over or the turn has ended (they start the next one).
+    fn steer_ready(&mut self) -> Vec<String> {
+        let ready = self
+            .steering
+            .as_ref()
+            .is_some_and(|s| s.waiting == 0 || !self.active_turn || Instant::now() >= s.deadline);
+        if !ready {
+            return Vec::new();
+        }
+        self.steered |= self.active_turn;
+        self.steering.take().map(|s| s.frames).unwrap_or_default()
+    }
+
+    /// The tool calls of the subagents the main loop runs in the foreground.
+    fn foreground_subagents(&self) -> Vec<String> {
+        self.tasks
+            .values()
+            .filter(|t| t.kind == "local_agent" && !t.background && t.parent.is_empty())
+            .map(|t| t.tool_use_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// Hands held message `i` to the CLI.
+    fn release(&mut self, i: usize) -> String {
+        let held = self.held.remove(i);
+        self.queued.push(held.text);
+        held.frame
+    }
+
+    fn user_text(text: &str) -> String {
+        json!({ "type": "user", "message": { "role": "user", "content": [{ "type": "text", "text": text }] } })
+            .to_string()
+    }
+
+    fn model_status(&self) -> Value {
+        json!({
+            "type": "model_status",
+            "provider": "anthropic",
+            "model": self.model,
+            "model_label": if self.model.is_empty() { String::new() } else { compact_model(&self.model, &self.model) },
+            "reasoning_effort": self.effort,
+            "reasoning_efforts": EFFORT_LEVELS,
+            "ultracode": self.ultracode,
+            "ultracode_available": self.ultracode_available,
+            "fast": self.fast == "on",
+            "fast_state": self.fast,
+            // Fast mode can be asked for: nothing blocks it but the SDK's
+            // opt-in (asking is the opt-in).
+            "fast_available": self.fast == "on" || matches!(self.fast_blocked.as_str(), "" | "sdk_opt_in_required"),
+            "thinking_summaries": self.thinking,
+            "context_window": self.context_window,
+            "context_limit": 0,
+            "state": if self.active_turn { "streaming" } else { "ready" },
+        })
+    }
+
+    /// `/model` and `/resume` are the desktop's own pickers and `/btw` our
+    /// side question, so they lead even when the CLI does not list them.
+    fn command_list(&self) -> Value {
+        let mut commands: Vec<Value> = [
+            ("model", "", ""),
+            ("resume", "", ""),
+            (
+                "btw",
+                "<question>",
+                "Ask a side question without adding it to the conversation",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, args, description)| {
+            let command = format!("/{name}");
+            self.commands
+                .iter()
+                .find(|c| c["command"] == command.as_str())
+                .cloned()
+                .unwrap_or_else(|| command_entry(name, args, description))
+        })
+        .collect();
+        for entry in &self.commands {
+            if !commands.iter().any(|c| c["command"] == entry["command"]) {
+                commands.push(entry.clone());
+            }
+        }
+        json!({ "type": "command_list", "commands": commands })
+    }
+
+    /// The CLI's own commands from its `initialize` reply: built-ins first,
+    /// then the user's skills and custom commands.
+    fn set_commands(&mut self, reply: &[Value]) {
+        let (builtin, others): (Vec<&Value>, Vec<&Value>) = reply
+            .iter()
+            .filter(|c| !text(&c["name"]).is_empty())
+            .partition(|c| c["builtin"] == true);
+        self.commands = builtin
+            .into_iter()
+            .chain(others)
+            .map(|c| {
+                command_entry(
+                    text(&c["name"]),
+                    text(&c["argumentHint"]),
+                    text(&c["description"]),
+                )
+            })
+            .collect();
+    }
+
+    fn model_view(&self) -> Value {
+        let visible: Vec<&Value> = self
+            .catalog
+            .iter()
+            .filter(|m| {
+                let name = match text(&m["displayName"]) {
+                    "" => text(&m["value"]),
+                    name => name,
+                }
+                .to_lowercase();
+                !name.contains("default") && !name.contains("recommended")
+            })
+            .collect();
+        let concrete = |m: &Value| -> String {
+            match text(&m["resolvedModel"]) {
+                "" => text(&m["value"]).to_string(),
+                resolved => resolved.to_string(),
+            }
+        };
+        let mut rows: Vec<Value> = visible
+            .iter()
+            .map(|m| {
+                let id = concrete(m);
+                json!({
+                    "model": m["value"],
+                    "label": compact_model(&id, text(&m["value"])),
+                    "vendor": id,
+                    "active": false,
+                    "context_window": self.model_windows.get(&id).copied().unwrap_or(0),
+                    "max_output_tokens": 0,
+                    "reasoning_efforts": [],
+                })
+            })
+            .collect();
+        match visible.iter().position(|m| {
+            text(&m["value"]) == self.model || text(&m["resolvedModel"]) == self.model
+        }) {
+            Some(active) => {
+                rows[active]["active"] = json!(true);
+                if rows[active]["context_window"] == 0 {
+                    rows[active]["context_window"] = json!(self.context_window);
+                }
+            }
+            None if !self.model.is_empty() => rows.insert(
+                0,
+                json!({
+                    "model": self.model,
+                    "label": compact_model(&self.model, &self.model),
+                    "vendor": self.model,
+                    "active": true,
+                    "context_window": self.context_window,
+                    "max_output_tokens": 0,
+                    "reasoning_efforts": [],
+                    "listed": false,
+                }),
+            ),
+            None => {}
+        }
+        json!({ "type": "model_view", "models": rows, "active_effort": "" })
+    }
+
+    // --- tools ---
+
+    fn tool_use_events(&mut self, block: &Value, authoritative: bool) -> Vec<Value> {
+        let id = text(&block["id"]).to_string();
+        if id.is_empty() {
+            return vec![];
+        }
+        let claude_name = text(&block["name"]).to_string();
+        let input = object(&block["input"]);
+        if claude_name == "TodoWrite" {
+            let events = plan_events(&input);
+            self.tools.insert(
+                id,
+                ToolMeta {
+                    claude_name,
+                    name: "todo".into(),
+                    input,
+                },
+            );
+            return events;
+        }
+        if claude_name == "ExitPlanMode" {
+            self.tools.insert(
+                id,
+                ToolMeta {
+                    claude_name: claude_name.clone(),
+                    name: claude_name,
+                    input,
+                },
+            );
+            return vec![];
+        }
+        let known = self.tools.contains_key(&id);
+        if known && !authoritative {
+            return vec![];
+        }
+        let name = tool_name(&claude_name).to_string();
+        let update = json!({ "type": "tool_update", "call_id": id, "output": card_json(&claude_name, &input) });
+        self.tools.insert(
+            id.clone(),
+            ToolMeta {
+                claude_name,
+                name: name.clone(),
+                input,
+            },
+        );
+        if known {
+            vec![update]
+        } else {
+            vec![
+                json!({ "type": "tool_start", "call_id": id, "name": name }),
+                update,
+            ]
+        }
+    }
+
+    fn tool_block_start(&mut self, block: &Value, index: u64) -> Vec<Value> {
+        self.blocks.insert(
+            index,
+            Block {
+                streamed: 0,
+                tool: Some(text(&block["id"]).to_string()),
+                partial: String::new(),
+                previewed: None,
+            },
+        );
+        self.tool_use_events(block, false)
+    }
+
+    fn tool_input_delta(&mut self, index: u64, partial: &str) -> Vec<Value> {
+        let Some(track) = self.blocks.get_mut(&index) else {
+            return vec![];
+        };
+        let Some(tool) = track.tool.clone() else {
+            return vec![];
+        };
+        track.partial.push_str(partial);
+        let Some(meta) = self.tools.get_mut(&tool) else {
+            return vec![];
+        };
+        let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&track.partial) else {
+            // An edit still streaming its input (a long Write can take a
+            // minute): its file and line counts so far, without the diff.
+            if !matches!(meta.name.as_str(), "write" | "str_replace")
+                || track
+                    .previewed
+                    .is_some_and(|at| at.elapsed() < EDIT_PREVIEW_EVERY)
+            {
+                return vec![];
+            }
+            let Some(input) = close_partial_json(&track.partial) else {
+                return vec![];
+            };
+            track.previewed = Some(Instant::now());
+            let path = edit_path(&input);
+            let (add, del) = diff_stat(&edit_diff(&meta.claude_name, &input));
+            let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+            let card = json!({ "path": path, "paths": paths, "add": add, "del": del });
+            return vec![
+                json!({ "type": "tool_update", "call_id": tool, "output": card.to_string() }),
+            ];
+        };
+        meta.input = input.clone();
+        match meta.claude_name.as_str() {
+            "TodoWrite" => plan_events(&input),
+            "ExitPlanMode" => vec![],
+            name => vec![
+                json!({ "type": "tool_update", "call_id": tool, "output": card_json(name, &input) }),
+            ],
+        }
+    }
+
+    fn tool_result_events(&mut self, block: &Value, structured: &Value) -> Vec<Value> {
+        let id = text(&block["tool_use_id"]).to_string();
+        let Some(meta) = self.tools.remove(&id) else {
+            return vec![];
+        };
+        if meta.claude_name == "ExitPlanMode" {
+            return vec![];
+        }
+        let is_error = block["is_error"] == true;
+        let output = result_card(&meta, block, structured);
+        vec![
+            json!({ "type": "tool_output", "call_id": id, "name": meta.name, "output": output, "is_error": is_error }),
+        ]
+    }
+
+    /// A Task subagent's inner stream: only its tool activity, so the card
+    /// that started it fills and completes.
+    fn subagent_frame(&mut self, frame: &Value) -> Vec<Value> {
+        match text(&frame["type"]) {
+            "stream_event" => {
+                let event = &frame["event"];
+                let index = event["index"].as_u64().unwrap_or(0);
+                if event["type"] == "content_block_start" && is_tool_use(&event["content_block"]) {
+                    return self.tool_block_start(&event["content_block"], index);
+                }
+                if event["type"] == "content_block_delta"
+                    && event["delta"]["type"] == "input_json_delta"
+                {
+                    return self.tool_input_delta(index, text(&event["delta"]["partial_json"]));
+                }
+                vec![]
+            }
+            "assistant" => frame["message"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter(|block| is_tool_use(block))
+                .flat_map(|block| self.tool_use_events(block, true))
+                .collect(),
+            "user" => frame["message"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter(|block| block["type"] == "tool_result")
+                .flat_map(|block| self.tool_result_events(block, &frame["tool_use_result"]))
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    // --- frames ---
+
+    fn on_init(&mut self, frame: &Value) -> Vec<Value> {
+        self.conversation = text(&frame["session_id"]).to_string();
+        let model = text(&frame["model"]).to_string();
+        let engine_mode = text(&frame["permissionMode"]).to_string();
+        if self.started {
+            let mut events = Vec::new();
+            if !model.is_empty() && model != self.model {
+                let from = std::mem::replace(&mut self.model, model.clone());
+                self.context_window = self
+                    .model_windows
+                    .get(&model)
+                    .copied()
+                    .unwrap_or(self.context_window);
+                events.push(self.model_status());
+                let from = if from.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} → ", compact_model(&from, &from))
+                };
+                events.push(json!({ "type": "info", "message": format!("[claude] model rerouted: {from}{}", compact_model(&model, &model)) }));
+            }
+            if !engine_mode.is_empty() && engine_mode != self.engine_mode {
+                events.push(
+                    json!({ "type": "approval_mode", "mode": from_claude_mode(&engine_mode) }),
+                );
+                self.engine_mode = engine_mode;
+            }
+            return events;
+        }
+        self.started = true;
+        self.model = model;
+        self.engine_mode = engine_mode;
+        for name in frame["slash_commands"].as_array().into_iter().flatten() {
+            let name = text(name).trim_start_matches('/').trim();
+            let command = format!("/{name}");
+            if !name.is_empty()
+                && !self
+                    .commands
+                    .iter()
+                    .any(|c| c["command"] == command.as_str())
+            {
+                self.commands.push(command_entry(name, "", ""));
+            }
+        }
+        let mut events = vec![
+            json!({
+                "type": "startup",
+                "model": self.model,
+                "cwd": frame["cwd"],
+                "session_id": self.conversation,
+                "context_window": self.context_window,
+            }),
+            self.model_status(),
+            self.command_list(),
+            json!({ "type": "approval_mode", "mode": from_claude_mode(&self.engine_mode) }),
+        ];
+        if frame["mcp_servers"]
+            .as_array()
+            .is_some_and(|servers| !servers.is_empty())
+        {
+            events.push(mcp_servers(&frame["mcp_servers"]));
+        }
+        events.push(json!({ "type": "status", "message": "ready" }));
+        events
+    }
+
+    fn on_status(&mut self, frame: &Value) -> Vec<Value> {
+        let mut events = Vec::new();
+        let engine_mode = text(&frame["permissionMode"]);
+        if !engine_mode.is_empty() && engine_mode != self.engine_mode {
+            self.engine_mode = engine_mode.to_string();
+            events.push(json!({ "type": "approval_mode", "mode": from_claude_mode(engine_mode) }));
+        }
+        match text(&frame["status"]) {
+            "requesting" => {
+                self.active_turn = true;
+                events.push(json!({ "type": "connecting" }));
+            }
+            "compacting" => {
+                self.active_turn = true;
+                events.push(json!({ "type": "compaction_start" }));
+            }
+            _ => {}
+        }
+        let result = text(&frame["compact_result"]);
+        if !result.is_empty() && result != "success" {
+            events.push(json!({ "type": "compaction_failed", "error": result }));
+        }
+        events
+    }
+
+    fn on_stream_event(&mut self, frame: &Value) -> Vec<Value> {
+        let event = &frame["event"];
+        let index = event["index"].as_u64().unwrap_or(0);
+        match text(&event["type"]) {
+            "message_start" => {
+                self.active_turn = true;
+                self.blocks.clear();
+                self.completed_blocks = 0;
+                self.start_usage = event["message"]["usage"].clone();
+                self.last_context = context_tokens(&self.start_usage);
+                // The model answered: the client stops "connecting" and
+                // waits for the first token (as jucode's `thinking_start`).
+                vec![
+                    json!({ "type": "thinking_start" }),
+                    json!({ "type": "context_usage", "tokens": self.last_context }),
+                ]
+            }
+            "content_block_start" => {
+                let block = &event["content_block"];
+                if block["type"] == "text" {
+                    self.blocks.insert(index, Block::default());
+                    return vec![json!({ "type": "assistant_start" })];
+                }
+                if is_tool_use(block) {
+                    return self.tool_block_start(block, index);
+                }
+                self.blocks.insert(index, Block::default());
+                vec![]
+            }
+            "content_block_delta" => {
+                let delta = &event["delta"];
+                match text(&delta["type"]) {
+                    "text_delta" => {
+                        let chunk = text(&delta["text"]);
+                        if let Some(track) = self.blocks.get_mut(&index) {
+                            track.streamed += chunk.len();
+                        }
+                        if chunk.is_empty() {
+                            vec![]
+                        } else {
+                            vec![json!({ "type": "assistant_delta", "delta": chunk })]
+                        }
+                    }
+                    "thinking_delta" => {
+                        let chunk = text(&delta["thinking"]);
+                        if let Some(track) = self.blocks.get_mut(&index) {
+                            track.streamed += chunk.len();
+                        }
+                        if chunk.is_empty() {
+                            vec![]
+                        } else {
+                            vec![json!({ "type": "reasoning_delta", "delta": chunk })]
+                        }
+                    }
+                    "input_json_delta" => {
+                        self.tool_input_delta(index, text(&delta["partial_json"]))
+                    }
+                    _ => vec![],
+                }
+            }
+            "message_delta" => {
+                let usage = &event["usage"];
+                if !usage.is_object() {
+                    return vec![];
+                }
+                let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                let input = if context_tokens(usage) > 0 {
+                    usage
+                } else {
+                    &self.start_usage
+                };
+                let count = |key: &str| input[key].as_u64().unwrap_or(0);
+                self.last_context = context_tokens(input) + output;
+                let streamed = self.streamed.entry(self.model.clone()).or_default();
+                for (sum, n) in streamed.iter_mut().zip([
+                    count("input_tokens"),
+                    count("cache_read_input_tokens"),
+                    count("cache_creation_input_tokens"),
+                    output,
+                ]) {
+                    *sum += n;
+                }
+                vec![
+                    json!({
+                        "type": "usage",
+                        "input_tokens": context_tokens(input),
+                        "cached_input_tokens": count("cache_read_input_tokens"),
+                        "cache_write_tokens": count("cache_creation_input_tokens"),
+                        "cache_write_1h_tokens": input["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0),
+                        "output_tokens": output,
+                    }),
+                    json!({ "type": "context_usage", "tokens": self.last_context }),
+                ]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn on_assistant(&mut self, frame: &Value) -> Vec<Value> {
+        // Claude Code's own "You've hit your limit · resets …" is no reply:
+        // it is the usage limit, with what the last rate-limit event said.
+        if frame["error"] == "rate_limit" {
+            self.limit_hit = true;
+            let mut limit = match &self.limit {
+                Value::Null => {
+                    json!({ "type": "rate_limit", "window": null, "used": null, "resets_at": null })
+                }
+                known => known.clone(),
+            };
+            limit["level"] = json!("limited");
+            limit["message"] =
+                json!(content_text(&frame["message"]["content"]).unwrap_or_default());
+            return vec![limit];
+        }
+        let mut events = Vec::new();
+        for block in frame["message"]["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            // The k-th completed block is stream index k.
+            let streamed = self
+                .blocks
+                .get(&self.completed_blocks)
+                .map_or(0, |b| b.streamed);
+            self.completed_blocks += 1;
+            match text(&block["type"]) {
+                "text" => {
+                    let full = text(&block["text"]);
+                    let tail = full.get(streamed..).unwrap_or_default();
+                    if tail.is_empty() || is_effort_echo(full) {
+                        continue;
+                    }
+                    if streamed == 0 {
+                        events.push(json!({ "type": "assistant_start" }));
+                    }
+                    events.push(json!({ "type": "assistant_delta", "delta": tail }));
+                }
+                "thinking" => {
+                    let tail = text(&block["thinking"]).get(streamed..).unwrap_or_default();
+                    if !tail.is_empty() {
+                        events.push(json!({ "type": "reasoning_delta", "delta": tail }));
+                    }
+                }
+                _ if is_tool_use(&block) => events.extend(self.tool_use_events(&block, true)),
+                _ => {}
+            }
+        }
+        let uuid = text(&frame["uuid"]);
+        if !uuid.is_empty() {
+            events.push(json!({ "type": "assistant_uuid", "uuid": uuid }));
+        }
+        events
+    }
+
+    fn on_user(&mut self, frame: &Value) -> Vec<Value> {
+        let content = &frame["message"]["content"];
+        if frame["isReplay"] == true {
+            // Messages queued during a turn are taken in together, one text
+            // block each (claude 2.1.296): each is the user's own message.
+            // A file line belongs to the message before it.
+            let mut texts: Vec<(&str, Vec<String>)> = Vec::new();
+            for block in content.as_array().into_iter().flatten() {
+                if block["type"] != "text" {
+                    continue;
+                }
+                let t = text(&block["text"]).trim();
+                match (attachments::line_path(t), texts.last_mut()) {
+                    (Some(path), Some((_, files))) => files.push(path),
+                    _ => texts.push((t, Vec::new())),
+                }
+            }
+            if texts.len() > 1
+                && texts
+                    .iter()
+                    .all(|(t, _)| self.queued.iter().any(|q| q == t))
+            {
+                let mut events = Vec::new();
+                for (t, files) in &texts {
+                    if let Some(i) = self.queued.iter().position(|q| q == t) {
+                        self.queued.remove(i);
+                    }
+                    let mut echo = json!({ "type": "user_message", "content": t });
+                    set_files(&mut echo, files);
+                    events.push(echo);
+                }
+                events.insert(0, self.queued_event());
+                return events;
+            }
+            // Attached files: text blocks of their own after the text, as
+            // sent (`user_content`), or lines after a text sent as a string.
+            let (message, files) = match content.as_str() {
+                Some(message) => attachments::split_files(message),
+                None => split_blocks(content),
+            };
+            let trimmed = message.trim();
+            let mut events = Vec::new();
+            if let Some(i) = self.queued.iter().position(|q| q == trimmed) {
+                self.queued.remove(i);
+                events.push(self.queued_event());
+            }
+            if let Some(command) = shown_command(trimmed) {
+                events.push(json!({ "type": "user_message", "content": command }));
+                return events;
+            }
+            // A finished background task comes back as `task_done`. A
+            // message of images alone has no text but is the user's.
+            if trimmed.starts_with("<command-")
+                || trimmed.starts_with("<local-command-")
+                || trimmed.starts_with("<task-notification>")
+                || is_effort_echo(&message)
+                || (message.is_empty() && !has_image(content) && files.is_empty())
+            {
+                return events;
+            }
+            let mut echo = json!({ "type": "user_message", "content": message });
+            set_files(&mut echo, &files);
+            if has_image(content) {
+                if let Some(i) = self.sent_images.iter().position(|(t, _)| t == trimmed) {
+                    echo["images"] = self.sent_images.remove(i).1;
+                }
+            }
+            events.push(echo);
+            return events;
+        }
+        let mut events: Vec<Value> = content
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .flat_map(|block| self.tool_result_events(block, &frame["tool_use_result"]))
+            .collect();
+        if self.runs.agent_result(&frame["tool_use_result"]) {
+            events.push(self.runs.event());
+        }
+        events
+    }
+
+    /// What the main loop's stream did not show: Task subagents, Workflow
+    /// agents, compaction. A result's `modelUsage` covers them all, as
+    /// running totals; what grew since the last result, less the main
+    /// loop's own usage, is reported per model, one `aggregate` usage each
+    /// (summed over several requests). Background work that ends after a
+    /// result lands in the next one.
+    fn other_usage(&mut self, usage: &Value) -> Vec<Value> {
+        let streamed = std::mem::take(&mut self.streamed);
+        let current = model_totals(usage);
+        // Crash and startup-error results carry zeroed totals.
+        if current.values().all(|t| t.iter().all(|n| *n == 0)) {
+            return vec![];
+        }
+        let Some(mut before) = self.model_totals.replace(current.clone()) else {
+            return vec![];
+        };
+        // /clear starts the totals over.
+        if before.iter().any(|(model, b)| {
+            current
+                .get(model)
+                .is_none_or(|c| c.iter().zip(b).any(|(c, b)| c < b))
+        }) {
+            before.clear();
+        }
+        let mut events = Vec::new();
+        for (model, now) in &current {
+            let was = before.get(model).copied().unwrap_or_default();
+            let main = streamed.get(model).copied().unwrap_or_default();
+            let [input, read, write, output] =
+                std::array::from_fn(|i| now[i].saturating_sub(was[i]).saturating_sub(main[i]));
+            if input + read + write + output > 0 {
+                events.push(json!({
+                    "type": "usage",
+                    "aggregate": true,
+                    "model": model,
+                    "input_tokens": input + read + write,
+                    "cached_input_tokens": read,
+                    "cache_write_tokens": write,
+                    "output_tokens": output,
+                }));
+            }
+        }
+        events
+    }
+
+    /// The turn ended: the next held message starts the next one, unless
+    /// the CLI already has messages to run.
+    fn on_turn_end(&mut self, frame: &Value) -> Output {
+        let mut events = self.on_result(frame);
+        let mut frames = Vec::new();
+        if self.queued.is_empty() && !self.held.is_empty() {
+            frames.push(self.release(0));
+            events.push(self.queued_event());
+        }
+        Output { events, frames }
+    }
+
+    fn on_result(&mut self, frame: &Value) -> Vec<Value> {
+        self.active_turn = false;
+        let was_interrupting = std::mem::take(&mut self.interrupting);
+        let was_steered = std::mem::take(&mut self.steered);
+        let mut events = Vec::new();
+        if let Some(usage) = frame["modelUsage"].as_object() {
+            for (name, usage) in usage {
+                if let Some(window) = usage["contextWindow"].as_u64().filter(|w| *w > 0) {
+                    self.model_windows.insert(name.clone(), window);
+                }
+            }
+        }
+        events.extend(self.other_usage(&frame["modelUsage"]));
+        if let Some(window) = self.model_windows.get(&self.model).copied() {
+            if window != self.context_window {
+                self.context_window = window;
+                events.push(self.model_status());
+            }
+        }
+        if let Some(cost) = frame["total_cost_usd"].as_f64() {
+            events.push(
+                json!({ "type": "context_usage", "tokens": self.last_context, "cost": cost }),
+            );
+        }
+        let subtype = text(&frame["subtype"]);
+        let failed = frame["is_error"] == true || subtype.to_lowercase().starts_with("error");
+        let cut_by_steer = was_steered && subtype == "error_during_execution";
+        if failed && !was_interrupting && !cut_by_steer {
+            let errors = frame["errors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(text)
+                .filter(|error| !error.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let detail = [text(&frame["result"]), errors.as_str(), subtype]
+                .into_iter()
+                .find(|detail| !detail.is_empty())
+                .unwrap_or("error")
+                .to_string();
+            if detail.contains("No conversation found with session ID") {
+                events.push(json!({ "type": "resume_failed" }));
+            } else if !self.limit_hit {
+                events.push(error_event(&detail));
+            }
+        }
+        self.limit_hit = false;
+        events.extend(self.fast_state(frame));
+        events.push(json!({ "type": "status", "message": "ready" }));
+        events
+    }
+
+    /// A JSON-RPC message for the in-process MCP server: initialize and the
+    /// tool list are answered here, a tool call waits for the daemon
+    /// (`answer`); notifications get the empty reply the CLI expects.
+    fn on_mcp_message(&mut self, request_id: &str, message: &Value) -> Output {
+        let reply = |response: Value| {
+            json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": { "mcp_response": response } } })
+                .to_string()
+        };
+        let id = &message["id"];
+        let response = match text(&message["method"]) {
+            _ if id.is_null() => json!({ "jsonrpc": "2.0", "result": {}, "id": 0 }),
+            "initialize" => json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": MCP_SERVER, "version": env!("CARGO_PKG_VERSION") },
+            } }),
+            "tools/list" => {
+                // Always in the prompt, not behind tool search: the model
+                // should think of them without looking.
+                let tools: Vec<Value> = user_tools::offered(&self.app_tools_off)
+                    .into_iter()
+                    .map(|(name, description, schema)| {
+                        json!({
+                            "name": name, "description": description, "inputSchema": schema,
+                            "_meta": { "anthropic/alwaysLoad": true },
+                        })
+                    })
+                    .collect();
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
+            }
+            "tools/call" => {
+                self.calls.push(HostCall {
+                    token: json!({ "request_id": request_id, "id": id }),
+                    name: text(&message["params"]["name"]).to_string(),
+                    args: object(&message["params"]["arguments"]),
+                });
+                return Output::default();
+            }
+            method => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("unknown method {method}") } })
+            }
+        };
+        Output {
+            events: Vec::new(),
+            frames: vec![reply(response)],
+        }
+    }
+
+    fn on_control_request(&mut self, frame: &Value) -> Output {
+        let request = &frame["request"];
+        let request_id = text(&frame["request_id"]).to_string();
+        if request["subtype"] == "elicitation" {
+            self.approval_seq += 1;
+            let call = format!("approval-{}", self.approval_seq);
+            let server = text(&request["mcp_server_name"]);
+            let event = json!({
+                "type": "approval_request",
+                "call_id": call,
+                "name": "mcp_elicitation",
+                "summary": cap(format!("{server}: {}", text(&request["message"]))),
+                "subagent_id": null,
+                "hunks": null,
+                "url": request["url"],
+                "questions": elicitation_questions(&request["requested_schema"]),
+            });
+            self.approvals.insert(call, (request_id, request.clone()));
+            return Output::events(vec![event]);
+        }
+        if request["subtype"] == "mcp_message" && request["server_name"] == MCP_SERVER {
+            return self.on_mcp_message(&request_id, &request["message"]);
+        }
+        if request["subtype"] != "can_use_tool" {
+            let subtype = text(&request["subtype"]);
+            return Output {
+                frames: vec![json!({
+                    "type": "control_response",
+                    "response": { "subtype": "error", "request_id": request_id, "error": format!("unsupported by client: {subtype}") },
+                })
+                .to_string()],
+                events: vec![json!({ "type": "info", "message": format!("[claude] unsupported request: {subtype}") })],
+            };
+        }
+        let tool = text(&request["tool_name"]).to_string();
+        let input = object(&request["input"]);
+        self.approval_seq += 1;
+        let call = format!("approval-{}", self.approval_seq);
+        if tool == "AskUserQuestion" {
+            let event = json!({
+                "type": "approval_request",
+                "call_id": call,
+                "name": "ask_question",
+                "summary": approval_summary(request),
+                "subagent_id": null,
+                "hunks": null,
+                "questions": input.get("questions").cloned().unwrap_or(json!([])),
+            });
+            self.approvals.insert(call, (request_id, request.clone()));
+            return Output::events(vec![event]);
+        }
+        let mut events = Vec::new();
+        let tool_id = text(&request["tool_use_id"]).to_string();
+        if tool != "ExitPlanMode" && !tool_id.is_empty() {
+            let name = tool_name(&tool).to_string();
+            let known = self.tools.contains_key(&tool_id);
+            self.tools.insert(
+                tool_id.clone(),
+                ToolMeta {
+                    claude_name: tool.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                },
+            );
+            if !known {
+                events.push(json!({ "type": "tool_start", "call_id": tool_id, "name": name }));
+            }
+            events.push(json!({ "type": "tool_update", "call_id": tool_id, "output": card_json(&tool, &input) }));
+        }
+        events.push(json!({
+            "type": "approval_request",
+            "call_id": call,
+            "name": tool_name(&tool),
+            "summary": approval_summary(request),
+            "subagent_id": null,
+            "hunks": edit_hunks(&tool, &input),
+        }));
+        self.approvals.insert(call, (request_id, request.clone()));
+        Output::events(events)
+    }
+
+    fn on_control_response(&mut self, frame: &Value) -> Vec<Value> {
+        let response = &frame["response"];
+        let Some((subtype, tag)) = self.pending.remove(text(&response["request_id"])) else {
+            return vec![];
+        };
+        // Moved or not, the steer waits for one answer fewer.
+        if subtype == "background_tasks" && tag == "steer" {
+            if let Some(steering) = &mut self.steering {
+                steering.waiting = steering.waiting.saturating_sub(1);
+            }
+        }
+        if response["subtype"] == "error" {
+            if subtype == "set_model" {
+                self.pending_model.clear();
+            }
+            let message = match text(&response["error"]) {
+                "" => format!("{subtype} failed"),
+                error => error.to_string(),
+            };
+            return match subtype.as_str() {
+                // A CLI without get_settings has no ultracode: nothing to offer.
+                "get_settings" | "get_usage" => vec![],
+                // The title stays as it was; not the conversation's business.
+                "generate_session_title" => {
+                    jucode_agent_core::log_warn!(
+                        "daemon",
+                        "conversation title failed",
+                        error = message
+                    );
+                    vec![]
+                }
+                "side_question" => {
+                    vec![json!({ "type": "side_answer", "question": tag, "error": message })]
+                }
+                "get_task_output" => {
+                    vec![json!({ "type": "task_output", "task_id": tag, "error": message })]
+                }
+                "get_context_usage" => {
+                    vec![json!({ "type": "context_breakdown", "error": message })]
+                }
+                // Requests outside the turn: an `error` would end the one running.
+                "mcp_status"
+                | "mcp_toggle"
+                | "mcp_reconnect"
+                | "list_permission_rules"
+                | "stop_task"
+                | "background_tasks"
+                | "rename_session"
+                | "set_max_thinking_tokens" => {
+                    vec![json!({ "type": "info", "message": format!("[claude] {message}") })]
+                }
+                _ => vec![error_event(&message)],
+            };
+        }
+        match subtype.as_str() {
+            "generate_session_title" => match text(&response["response"]["title"]).trim() {
+                "" => vec![],
+                title => vec![json!({ "type": "session_title_generated", "title": title })],
+            },
+            "get_usage" => {
+                if self.model_totals.is_none() {
+                    self.model_totals = Some(model_totals(
+                        &response["response"]["session"]["model_usage"],
+                    ));
+                }
+                vec![]
+            }
+            "set_permission_mode" => {
+                if self.started {
+                    return vec![];
+                }
+                // The first ack means the engine is up; its init only comes
+                // with the first turn.
+                let acked = text(&response["response"]["mode"]);
+                self.engine_mode = if acked.is_empty() {
+                    self.mode.to_string()
+                } else {
+                    acked.to_string()
+                };
+                vec![
+                    json!({ "type": "approval_mode", "mode": from_claude_mode(&self.engine_mode) }),
+                    self.command_list(),
+                    json!({ "type": "status", "message": "ready" }),
+                ]
+            }
+            "list_models" => {
+                self.catalog = response["response"]["models"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|m| !text(&m["value"]).is_empty())
+                    .cloned()
+                    .collect();
+                if tag == "view" {
+                    return vec![self.model_view()];
+                }
+                let mut events = Vec::new();
+                if self.model.is_empty() {
+                    let default = self
+                        .catalog
+                        .iter()
+                        .find(|m| {
+                            let name = match text(&m["displayName"]) {
+                                "" => text(&m["value"]),
+                                name => name,
+                            }
+                            .to_lowercase();
+                            name.contains("default") || name.contains("recommended")
+                        })
+                        .or(self.catalog.first());
+                    if let Some(default) = default {
+                        let resolved = match text(&default["resolvedModel"]) {
+                            "" => text(&default["value"]),
+                            r => r,
+                        };
+                        if !resolved.is_empty() {
+                            self.model = resolved.to_string();
+                            events.push(self.model_status());
+                        }
+                    }
+                }
+                if tag == "boot" {
+                    self.engine_mode = "bypassPermissions".to_string();
+                    events.push(json!({ "type": "approval_mode", "mode": "full-auto" }));
+                    events.push(self.command_list());
+                    events.push(json!({ "type": "status", "message": "ready" }));
+                }
+                events
+            }
+            "initialize" => {
+                let reply = &response["response"];
+                self.set_commands(reply["commands"].as_array().map_or(&[], Vec::as_slice));
+                let mut events = vec![self.command_list()];
+                events.extend(self.fast_state(reply));
+                if tag == "fast" && self.fast_wanted && self.fast != "on" {
+                    let why = match self.fast_blocked.as_str() {
+                        "" => self.fast.as_str(),
+                        why => why,
+                    };
+                    events.push(json!({ "type": "info", "message": format!("[claude] fast mode unavailable: {why}") }));
+                }
+                events
+            }
+            "get_settings" => {
+                let applied = &response["response"]["applied"];
+                let effort = match text(&applied["effort"]) {
+                    e if EFFORT_LEVELS.contains(&e) => e.to_string(),
+                    _ => self.effort.clone(),
+                };
+                let on = applied["ultracode"] == true;
+                let available = applied["ultracodeAvailable"] == true;
+                if (&effort, on, available)
+                    == (&self.effort, self.ultracode, self.ultracode_available)
+                {
+                    return vec![];
+                }
+                self.effort = effort;
+                self.ultracode = on;
+                self.ultracode_available = available;
+                vec![self.model_status()]
+            }
+            "get_task_output" => {
+                let reply = &response["response"];
+                vec![
+                    json!({ "type": "task_output", "task_id": tag, "output": reply["output"], "truncated": reply["truncated"] }),
+                ]
+            }
+            "side_question" => {
+                let answer = &response["response"]["response"];
+                vec![json!({ "type": "side_answer", "question": tag, "answer": answer })]
+            }
+            "mcp_status" => vec![mcp_servers(&response["response"]["mcpServers"])],
+            "get_context_usage" => vec![context_breakdown(&response["response"])],
+            "list_permission_rules" => {
+                let state = &response["response"]["state"];
+                vec![
+                    json!({ "type": "permission_rules", "rules": state["rules"], "directories": state["workspaceDirectories"] }),
+                ]
+            }
+            "set_model" => {
+                let pick = std::mem::take(&mut self.pending_model);
+                if pick.is_empty() {
+                    return vec![];
+                }
+                let entry = self
+                    .catalog
+                    .iter()
+                    .find(|m| text(&m["value"]) == pick || text(&m["resolvedModel"]) == pick);
+                self.model = entry
+                    .map(|m| match text(&m["resolvedModel"]) {
+                        "" => text(&m["value"]).to_string(),
+                        r => r.to_string(),
+                    })
+                    .unwrap_or(pick);
+                self.context_window = self.model_windows.get(&self.model).copied().unwrap_or(0);
+                vec![self.model_status()]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Fast mode as an `initialize` reply or a `result` reports it.
+    fn fast_state(&mut self, frame: &Value) -> Vec<Value> {
+        let Some(state) = frame["fast_mode_state"].as_str() else {
+            return vec![];
+        };
+        let blocked = text(&frame["fast_mode_disabled_reason"]);
+        if (state, blocked) == (self.fast.as_str(), self.fast_blocked.as_str()) {
+            return vec![];
+        }
+        self.fast = state.to_string();
+        self.fast_blocked = blocked.to_string();
+        vec![self.model_status()]
+    }
+
+    /// `system/task_*`: Task subagents feed the subagent strip; finished
+    /// background work (not housekeeping) is announced.
+    fn on_task(&mut self, frame: &Value) -> Vec<Value> {
+        let traced = match text(&frame["subtype"]) {
+            "task_started" => self.runs.started(frame),
+            "task_progress" => self.runs.progress(frame),
+            "task_updated" => self.runs.updated(frame),
+            "task_notification" => self.runs.finished(frame),
+            _ => false,
+        };
+        let mut events = self.task_events(frame);
+        if traced {
+            // The list replaces the client's: with the runs saved before
+            // this process, or a restarted engine would drop them.
+            if !self.conversation.is_empty() {
+                let session = self.session_dir();
+                self.runs.seed(&session);
+            }
+            events.push(self.runs.event());
+        }
+        events
+    }
+
+    fn task_events(&mut self, frame: &Value) -> Vec<Value> {
+        let id = text(&frame["task_id"]).to_string();
+        let agent = |status: &str, message: &str, label: &str| json!({ "type": "subagent_lifecycle", "path": id, "label": label, "status": status, "message": message });
+        match text(&frame["subtype"]) {
+            "task_started" => {
+                let kind = text(&frame["task_type"]).to_string();
+                let task = Task {
+                    background: frame["is_backgrounded"] == true
+                        || (kind != "local_agent" && frame["is_backgrounded"] != false),
+                    kind,
+                    description: text(&frame["description"]).to_string(),
+                    tool_use_id: text(&frame["tool_use_id"]).to_string(),
+                    parent: text(&frame["parent_task_id"]).to_string(),
+                };
+                let events = if task.kind == "local_agent" {
+                    vec![agent("running", "", &task.description)]
+                } else {
+                    vec![]
+                };
+                self.tasks.insert(id.clone(), task);
+                events
+            }
+            "task_progress" => {
+                let Some(task) = self.tasks.get(&id) else {
+                    return vec![];
+                };
+                let message = [text(&frame["summary"]), text(&frame["last_tool_name"])]
+                    .into_iter()
+                    .find(|m| !m.is_empty())
+                    .unwrap_or_default();
+                if task.kind == "local_agent" {
+                    vec![agent("running", message, &task.description)]
+                } else {
+                    vec![
+                        json!({ "type": "task_progress", "task_id": id, "message": text(&frame["description"]) }),
+                    ]
+                }
+            }
+            "task_updated" => {
+                let Some(task) = self.tasks.get_mut(&id) else {
+                    return vec![];
+                };
+                if frame["patch"]["is_backgrounded"] == true {
+                    task.background = true;
+                }
+                // A stopped task may say so only here; the notification, if
+                // any, still announces it.
+                let status = text(&frame["patch"]["status"]);
+                if task.kind == "local_agent" && runs::is_final(status) {
+                    vec![agent(
+                        status,
+                        text(&frame["patch"]["error"]),
+                        &task.description,
+                    )]
+                } else {
+                    vec![]
+                }
+            }
+            "task_notification" => {
+                let task = self.tasks.remove(&id);
+                let status = text(&frame["status"]);
+                let mut events = Vec::new();
+                match &task {
+                    Some(task) if task.kind == "local_agent" => {
+                        events.push(agent(status, text(&frame["summary"]), &task.description));
+                    }
+                    Some(_) => {}
+                    // Started before this process: a subagent the client
+                    // shows ends; the client starts no row for it.
+                    None => events.push(agent(status, text(&frame["summary"]), "")),
+                }
+                let background = task.as_ref().is_none_or(|t| t.background);
+                if background && frame["skip_transcript"] != true && frame["ambient"] != true {
+                    events.push(json!({
+                        "type": "task_done",
+                        "task_id": id,
+                        "kind": task.map(|t| t.kind).unwrap_or_default(),
+                        "status": status,
+                        "summary": frame["summary"],
+                    }));
+                }
+                events
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Always-allow rules, kept for the session or saved to the project's
+    /// local settings or the user's: the CLI's own suggestions, else the
+    /// whole tool.
+    fn always_permissions(request: &Value, destination: &str) -> Value {
+        let suggested: Vec<Value> = request["permission_suggestions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                s["type"] == "addRules" && s["behavior"] == "allow" && s["rules"].is_array()
+            })
+            .map(|s| {
+                let mut s = s.clone();
+                s["destination"] = json!(destination);
+                s
+            })
+            .collect();
+        if suggested.is_empty() {
+            json!([{ "type": "addRules", "rules": [{ "toolName": request["tool_name"] }], "behavior": "allow", "destination": destination }])
+        } else {
+            json!(suggested)
+        }
+    }
+}
+
+/// `mcp_servers` from the CLI's server statuses (`mcp_status`, or the
+/// names and states `system/init` lists).
+/// Claude Code's `get_context_usage` as the protocol's `context_breakdown`:
+/// the context by category (system prompt, tools, memory files, skills,
+/// messages, …), each of a `kind` — `used`, `deferred` (tools loaded only when
+/// called), `buffer` (kept free for auto-compaction) or `free` — and the
+/// memory files it read.
+fn context_breakdown(usage: &Value) -> Value {
+    let categories: Vec<Value> = usage["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            // Older CLIs say only isDeferred.
+            let kind = match text(&c["kind"]) {
+                "" if c["isDeferred"] == true => "deferred",
+                "" => "used",
+                kind => kind,
+            };
+            json!({ "name": c["name"], "tokens": c["tokens"].as_u64().unwrap_or(0), "kind": kind })
+        })
+        .collect();
+    let memory: Vec<Value> = usage["memoryFiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| json!({ "path": f["path"], "tokens": f["tokens"].as_u64().unwrap_or(0) }))
+        .collect();
+    json!({
+        "type": "context_breakdown",
+        "total": usage["totalTokens"].as_u64().unwrap_or(0),
+        "max": usage["maxTokens"].as_u64().unwrap_or(0),
+        "categories": categories,
+        "memory_files": memory,
+    })
+}
+
+fn mcp_servers(servers: &Value) -> Value {
+    let servers: Vec<Value> = servers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|server| {
+            let (state, error) = match text(&server["status"]) {
+                "connected" => ("connected", text(&server["error"]).to_string()),
+                "failed" => ("failed", text(&server["error"]).to_string()),
+                "disabled" => ("disabled", String::new()),
+                "needs-auth" => ("failed", "needs authentication: run /mcp in Claude Code".to_string()),
+                _ => ("connecting", String::new()),
+            };
+            let transport = match text(&server["config"]["type"]) {
+                "" => "stdio",
+                kind => kind,
+            };
+            let tools: Vec<Value> = server["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|tool| json!({ "name": tool["name"], "description": tool["description"] }))
+                .collect();
+            let mut view = json!({ "name": server["name"], "transport": transport, "state": state, "tools": tools, "scope": server["scope"] });
+            if !error.is_empty() {
+                view["error"] = json!(error);
+            }
+            view
+        })
+        .collect();
+    json!({ "type": "mcp_servers", "servers": servers })
+}
+
+/// An MCP elicitation form as approval questions: a choice for enums and
+/// booleans, free text (no options) otherwise. Asked by the field's title.
+pub(super) fn elicitation_questions(schema: &Value) -> Value {
+    let fields = schema["properties"].as_object().into_iter().flatten();
+    let questions: Vec<Value> = fields
+        .map(|(key, field)| {
+            let options: Vec<Value> = match (field["enum"].as_array(), text(&field["type"])) {
+                (Some(values), _) => values.iter().map(|v| json!({ "label": text(v) })).collect(),
+                (None, "boolean") => vec![json!({ "label": "true" }), json!({ "label": "false" })],
+                _ => titled_choices(field)
+                    .map(|(_, label)| json!({ "label": label }))
+                    .collect(),
+            };
+            json!({
+                "question": match text(&field["title"]) { "" => key.as_str(), title => title },
+                "header": field["description"],
+                "options": options,
+                "multiSelect": false,
+            })
+        })
+        .collect();
+    json!(questions)
+}
+
+/// A titled enum's choices (`oneOf: [{const, title}]`): value and label.
+fn titled_choices(field: &Value) -> impl Iterator<Item = (&Value, &str)> {
+    field["oneOf"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|choice| {
+            let label = match text(&choice["title"]) {
+                "" => text(&choice["const"]),
+                title => title,
+            };
+            (&choice["const"], label)
+        })
+}
+
+/// The accepted form's content: each answer under its field, typed as the
+/// schema asks.
+pub(super) fn elicitation_content(schema: &Value, answers: &Value) -> Value {
+    let mut content = serde_json::Map::new();
+    let fields = schema["properties"].as_object().into_iter().flatten();
+    for (key, field) in fields {
+        let question = match text(&field["title"]) {
+            "" => key.as_str(),
+            title => title,
+        };
+        let Some(answer) = answers[question].as_str() else {
+            continue;
+        };
+        // A titled choice is answered by its title.
+        if let Some((value, _)) = titled_choices(field).find(|(_, label)| *label == answer) {
+            content.insert(key.clone(), value.clone());
+            continue;
+        }
+        let value = match text(&field["type"]) {
+            "boolean" => json!(answer == "true"),
+            "integer" => answer
+                .trim()
+                .parse::<i64>()
+                .map_or(json!(answer), |n| json!(n)),
+            "number" => answer
+                .trim()
+                .parse::<f64>()
+                .map_or(json!(answer), |n| json!(n)),
+            _ => json!(answer),
+        };
+        content.insert(key.clone(), value);
+    }
+    Value::Object(content)
+}
+
+/// Uncached input, cache reads, cache writes, output.
+type Tokens = [u64; 4];
+
+/// `modelUsage` by model, in `Tokens` order.
+fn model_totals(usage: &Value) -> HashMap<String, Tokens> {
+    let Some(models) = usage.as_object() else {
+        return HashMap::new();
+    };
+    models
+        .iter()
+        .map(|(model, u)| {
+            let n = |key: &str| u[key].as_u64().unwrap_or(0);
+            let tokens = [
+                n("inputTokens"),
+                n("cacheReadInputTokens"),
+                n("cacheCreationInputTokens"),
+                n("outputTokens"),
+            ];
+            (model.clone(), tokens)
+        })
+        .collect()
+}
+
+/// A user message frame sent with priority `now` (a steer).
+fn now_priority(frame: &str) -> String {
+    match serde_json::from_str::<Value>(frame) {
+        Ok(mut value) => {
+            value["priority"] = json!("now");
+            value.to_string()
+        }
+        Err(_) => frame.to_string(),
+    }
+}
+
+fn command_entry(name: &str, args: &str, description: &str) -> Value {
+    json!({ "command": format!("/{name}"), "marker": null, "args": args, "description": description })
+}
+
+impl Claude {
+    fn translate_line(&mut self, line: Line) -> Output {
+        let frame = match line {
+            // Diagnostics, kept for an exit message (Session::note_stderr);
+            // only a failed resume is acted on.
+            Line::Stderr(line) => {
+                return if line.contains("No conversation found with session ID") {
+                    Output::events(vec![json!({ "type": "resume_failed" })])
+                } else {
+                    Output::default()
+                };
+            }
+            Line::Frame(frame) => frame,
+        };
+        let parent = text(&frame["parent_tool_use_id"]);
+        if !parent.is_empty() {
+            let label = self
+                .tools
+                .get(parent)
+                .map(|t| text(&t.input["description"]).to_string())
+                .unwrap_or_default();
+            let mut events = self.subagent_frame(&frame);
+            for event in &mut events {
+                if event["type"] == "tool_start" && !label.is_empty() {
+                    event["subagent"] = json!(label);
+                }
+                // A subagent's work, not the conversation's own: a background
+                // one goes on after the turn.
+                event["nested"] = json!(true);
+            }
+            return Output::events(events);
+        }
+        let events = match text(&frame["type"]) {
+            "system" => match text(&frame["subtype"]) {
+                "init" => self.on_init(&frame),
+                "status" => self.on_status(&frame),
+                "compact_boundary" => vec![json!({ "type": "compaction_end" })],
+                "task_started" | "task_progress" | "task_updated" | "task_notification" => {
+                    self.on_task(&frame)
+                }
+                "background_tasks_changed" => {
+                    let tasks: Vec<Value> = frame["tasks"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|t| t["ambient"] != true)
+                        .map(|t| json!({ "id": t["task_id"], "kind": t["task_type"], "description": t["description"] }))
+                        .collect();
+                    vec![json!({ "type": "background_tasks", "tasks": tasks })]
+                }
+                "api_retry" => {
+                    let reason = match (&frame["error"], frame["error_status"].as_u64()) {
+                        (Value::String(error), _) if !error.is_empty() => error.clone(),
+                        (_, Some(status)) => format!("HTTP {status}"),
+                        _ => String::new(),
+                    };
+                    vec![json!({
+                        "type": "retrying",
+                        "attempt": frame["attempt"],
+                        "max_attempts": frame["max_retries"],
+                        "delay_ms": frame["retry_delay_ms"],
+                        "reason": reason,
+                    })]
+                }
+                "commands_changed" => {
+                    self.set_commands(frame["commands"].as_array().map_or(&[], Vec::as_slice));
+                    vec![self.command_list()]
+                }
+                "session_title_changed" => {
+                    vec![json!({ "type": "session_title", "title": frame["title"] })]
+                }
+                "model_fallback" | "model_refusal_fallback" => {
+                    let to = text(&frame["fallback_model"]).to_string();
+                    let reason = match text(&frame["subtype"]) {
+                        "model_refusal_fallback" => "refusal",
+                        _ => text(&frame["trigger"]),
+                    };
+                    let mut events = vec![json!({
+                        "type": "model_fallback",
+                        "from": compact_model(text(&frame["original_model"]), text(&frame["original_model"])),
+                        "to": compact_model(&to, &to),
+                        "reason": reason,
+                    })];
+                    // A refusal fallback swaps the session's model, unless
+                    // only a subagent's or side question's reply fell back.
+                    if frame["subtype"] == "model_refusal_fallback"
+                        && frame["scope"] != "local"
+                        && !to.is_empty()
+                    {
+                        self.model = to;
+                        events.push(self.model_status());
+                    }
+                    events
+                }
+                "permission_denied" => {
+                    let reason = text(&frame["reason"]);
+                    let reason = if reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {reason}")
+                    };
+                    vec![
+                        json!({ "type": "info", "message": format!("[claude] {} denied{reason}", tool_name(text(&frame["tool_name"]))) }),
+                    ]
+                }
+                "files_persisted" => {
+                    let names: Vec<&str> = frame["files"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|f| match text(&f["filename"]) {
+                            "" => text(&f["fileId"]),
+                            name => name,
+                        })
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    if names.is_empty() {
+                        vec![]
+                    } else {
+                        vec![
+                            json!({ "type": "info", "message": format!("[claude] saved: {}", names.join(", ")) }),
+                        ]
+                    }
+                }
+                "hook_response" if frame["exit_code"].as_i64().is_some_and(|code| code != 0) => {
+                    let detail = [text(&frame["stderr"]), text(&frame["output"])]
+                        .into_iter()
+                        .find(|d| !d.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("exit {}", frame["exit_code"]));
+                    vec![
+                        json!({ "type": "info", "message": format!("[claude] hook {} failed: {detail}", text(&frame["hook_name"])) }),
+                    ]
+                }
+                "mirror_error" => vec![error_event(match text(&frame["error"]) {
+                    "" => "workspace mirror error",
+                    e => e,
+                })],
+                _ => vec![],
+            },
+            "stream_event" => self.on_stream_event(&frame),
+            "assistant" => self.on_assistant(&frame),
+            "user" => self.on_user(&frame),
+            "result" => return self.on_turn_end(&frame),
+            "control_request" => return self.on_control_request(&frame),
+            "control_response" => self.on_control_response(&frame),
+            "rate_limit_event" => {
+                let events = rate_limit_events(&frame);
+                if let Some(limit) = events.iter().find(|e| e["type"] == "rate_limit") {
+                    self.limit = if limit["level"] == "ok" {
+                        Value::Null
+                    } else {
+                        limit.clone()
+                    };
+                }
+                events
+            }
+            "prompt_suggestion" => {
+                vec![json!({ "type": "prompt_suggestion", "text": frame["suggestion"] })]
+            }
+            _ => vec![],
+        };
+        Output::events(events)
+    }
+
+    fn encode_op(&mut self, op: &Value) -> Result<Output, String> {
+        let frames = match text(&op["op"]) {
+            "user_message" => {
+                let frames = vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()];
+                if op["images"]
+                    .as_array()
+                    .is_some_and(|images| !images.is_empty())
+                {
+                    self.sent_images.push((
+                        text(&op["content"]).trim().to_string(),
+                        op["images"].clone(),
+                    ));
+                    // Echoes that never came (a crash, a rewind) do not pile up.
+                    let excess = self.sent_images.len().saturating_sub(32);
+                    self.sent_images.drain(..excess);
+                }
+                if !self.active_turn {
+                    return Ok(Output {
+                        events: Vec::new(),
+                        frames,
+                    });
+                }
+                self.held.push(Held {
+                    text: text(&op["content"]).trim().to_string(),
+                    images: op["images"].clone(),
+                    files: op_files(op),
+                    frame: frames.into_iter().next().unwrap_or_default(),
+                });
+                return Ok(Output::events(vec![self.queued_event()]));
+            }
+            "approve" => {
+                let call = text(&op["call_id"]);
+                let Some((request_id, request)) = self.approvals.remove(call) else {
+                    return Err(format!("no open approval {call}"));
+                };
+                if request["subtype"] == "elicitation" {
+                    let result = if op["decision"] == "deny" {
+                        json!({ "action": "decline" })
+                    } else {
+                        json!({ "action": "accept", "content": elicitation_content(&request["requested_schema"], &op["answers"]) })
+                    };
+                    return Ok(Output {
+                        events: Vec::new(),
+                        frames: vec![json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": result } }).to_string()],
+                    });
+                }
+                let input = object(&request["input"]);
+                let tool = text(&request["tool_name"]);
+                let mut updated = input.clone();
+                if tool == "AskUserQuestion" && !op["answers"].is_null() {
+                    updated = json!({ "questions": input["questions"], "answers": op["answers"] });
+                } else if tool == "MultiEdit" {
+                    if let (Some(keep), Some(edits)) =
+                        (op["hunks"].as_array(), input["edits"].as_array())
+                    {
+                        let keep: Vec<&str> = keep.iter().map(text).collect();
+                        let edits: Vec<Value> = edits
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| keep.contains(&format!("e{i}").as_str()))
+                            .map(|(_, edit)| edit.clone())
+                            .collect();
+                        updated["edits"] = json!(edits);
+                    }
+                }
+                let result = if op["decision"] == "deny" {
+                    json!({ "behavior": "deny", "message": "The user denied this tool use." })
+                } else {
+                    let mut allow = json!({ "behavior": "allow", "updatedInput": updated });
+                    if op["always"] == true {
+                        let destination = match text(&op["always_scope"]) {
+                            "project" => "localSettings",
+                            "user" => "userSettings",
+                            _ => "session",
+                        };
+                        allow["updatedPermissions"] =
+                            Self::always_permissions(&request, destination);
+                    }
+                    allow
+                };
+                vec![json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": result } }).to_string()]
+            }
+            // With `index` (a held message, negative from the last): that
+            // one goes first once the turn has stopped.
+            "interrupt" => {
+                if !self.active_turn {
+                    return Ok(Output::default());
+                }
+                let fixed = self.queued.len();
+                if let Some(i) = queue_index(op["index"].as_i64(), fixed + self.held.len())
+                    .filter(|i| *i >= fixed)
+                {
+                    let chosen = self.held.remove(i - fixed);
+                    self.held.insert(0, chosen);
+                }
+                self.interrupting = true;
+                vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
+            }
+            // A held message (`index` in the listed messages, negative from
+            // the last; all held without one) goes to the CLI now, with
+            // priority `now`: the running turn stops what it does and takes
+            // it in. Foreground subagents move to the background first.
+            "steer" => {
+                if !self.active_turn {
+                    return Ok(Output::default());
+                }
+                let fixed = self.queued.len();
+                let picked: Vec<usize> = match op["index"].as_i64() {
+                    None => (0..self.held.len()).collect(),
+                    index => queue_index(index, fixed + self.held.len())
+                        .filter(|i| *i >= fixed)
+                        .map(|i| vec![i - fixed])
+                        .unwrap_or_default(),
+                };
+                if picked.is_empty() {
+                    return Ok(Output::default());
+                }
+                let mut steered = picked
+                    .iter()
+                    .rev()
+                    .map(|i| now_priority(&self.release(*i)))
+                    .collect::<Vec<_>>();
+                steered.reverse();
+                let events = vec![self.queued_event()];
+                // Already waiting for moves: these go with those.
+                if let Some(steering) = &mut self.steering {
+                    steering.frames.extend(steered);
+                    return Ok(Output::events(events));
+                }
+                let moves: Vec<String> = self
+                    .foreground_subagents()
+                    .into_iter()
+                    .map(|id| {
+                        self.control_request(
+                            json!({ "subtype": "background_tasks", "tool_use_id": id }),
+                            "steer",
+                        )
+                    })
+                    .collect();
+                if moves.is_empty() {
+                    self.steered = true;
+                    return Ok(Output {
+                        events,
+                        frames: steered,
+                    });
+                }
+                self.steering = Some(Steering {
+                    frames: steered,
+                    waiting: moves.len(),
+                    deadline: Instant::now() + STEER_MOVE_WAIT,
+                });
+                return Ok(Output {
+                    events,
+                    frames: moves,
+                });
+            }
+            // A held message taken back (the CLI's own are past that).
+            "unqueue" => {
+                let fixed = self.queued.len();
+                let Some(i) = queue_index(op["index"].as_i64(), fixed + self.held.len())
+                    .filter(|i| *i >= fixed)
+                else {
+                    return Ok(Output::default());
+                };
+                let held = self.held.remove(i - fixed);
+                if op["discard"] == true {
+                    return Ok(Output::events(vec![self.queued_event()]));
+                }
+                let mut unqueued =
+                    json!({ "type": "unqueued", "content": held.text, "images": held.images });
+                set_files(&mut unqueued, &held.files);
+                return Ok(Output::events(vec![self.queued_event(), unqueued]));
+            }
+            // A held message to another place among the held (`index` to
+            // `to`, in the listed messages; the CLI's own stay first).
+            "queue_move" => {
+                let fixed = self.queued.len();
+                let Some((from, to)) = queue_move_target(
+                    op["index"].as_i64(),
+                    op["to"].as_i64(),
+                    fixed + self.held.len(),
+                )
+                .filter(|(from, to)| *from >= fixed && *to >= fixed) else {
+                    return Ok(Output::default());
+                };
+                let item = self.held.remove(from - fixed);
+                self.held.insert(to - fixed, item);
+                return Ok(Output::events(vec![self.queued_event()]));
+            }
+            "set_approval_mode" => {
+                let mode = to_claude_mode(text(&op["mode"]));
+                self.mode = mode;
+                vec![self.control_request(
+                    json!({ "subtype": "set_permission_mode", "mode": mode }),
+                    "",
+                )]
+            }
+            "command" => {
+                let input = text(&op["input"]).trim();
+                let (command, arg) = match input.split_once(' ') {
+                    Some((command, arg)) => (command, arg.trim()),
+                    None => (input, ""),
+                };
+                match command {
+                    "/model" if arg.is_empty() => {
+                        vec![self.control_request(json!({ "subtype": "list_models" }), "view")]
+                    }
+                    "/model" => {
+                        let mut frames = Vec::new();
+                        let parts: Vec<&str> = arg.split_whitespace().collect();
+                        if let Some(effort) = parts.iter().find(|p| EFFORT_LEVELS.contains(p)) {
+                            if *effort != self.effort {
+                                frames.extend(self.flag_settings(json!({ "effortLevel": effort })));
+                            }
+                        }
+                        if let Some(name) = parts.iter().find(|p| !EFFORT_LEVELS.contains(p)) {
+                            if *name != self.model {
+                                self.pending_model = name.to_string();
+                                frames.push(self.control_request(
+                                    json!({ "subtype": "set_model", "model": name }),
+                                    "",
+                                ));
+                                frames.push(
+                                    self.control_request(json!({ "subtype": "get_settings" }), ""),
+                                );
+                            }
+                        }
+                        frames
+                    }
+                    // Claude Code's own spelling: `/effort ultracode [on|off]`.
+                    "/effort" if arg.starts_with("ultracode") => {
+                        let on = match arg["ultracode".len()..].trim() {
+                            "" => !self.ultracode,
+                            "on" => true,
+                            "off" => false,
+                            other => {
+                                return Err(format!(
+                                    "/effort ultracode takes on or off, not {other}"
+                                ))
+                            }
+                        };
+                        self.flag_settings(json!({ "ultracode": on }))
+                    }
+                    "/fast" | "/thinking" => {
+                        let on = match arg {
+                            "" if command == "/fast" => self.fast != "on",
+                            "" => !self.thinking,
+                            "on" => true,
+                            "off" => false,
+                            other => return Err(format!("{command} takes on or off, not {other}")),
+                        };
+                        if command == "/fast" {
+                            self.fast_request(on)
+                        } else {
+                            let frame = self.thinking_request(on);
+                            return Ok(Output {
+                                events: vec![self.model_status()],
+                                frames: vec![frame],
+                            });
+                        }
+                    }
+                    // A side question: answered from the conversation so far,
+                    // without tools, and never part of it.
+                    "/btw" if arg.is_empty() => return Err("/btw needs a question".to_string()),
+                    "/btw" => vec![self.control_request(
+                        json!({ "subtype": "side_question", "question": arg }),
+                        arg,
+                    )],
+                    "/resume" | "/rewind" | "/tree" | "/checkout" | "/fork" | "/undo" | "/new" => {
+                        return Err(format!(
+                            "{command} is not available in a Claude Code session"
+                        ))
+                    }
+                    _ => vec![Self::user_text(input)],
+                }
+            }
+            "stop_task" => vec![self.control_request(
+                json!({ "subtype": "stop_task", "task_id": op["task_id"] }),
+                "",
+            )],
+            // Every background task (a scheduled run stopped for its budget
+            // or its time).
+            "stop_background" => {
+                let ids: Vec<String> = self
+                    .tasks
+                    .iter()
+                    .filter(|(_, task)| task.background)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                ids.iter()
+                    .map(|id| {
+                        self.control_request(json!({ "subtype": "stop_task", "task_id": id }), "")
+                    })
+                    .collect()
+            }
+            // Background shell / Monitor output (its last 8 KiB).
+            "task_output" => vec![self.control_request(
+                json!({ "subtype": "get_task_output", "task_id": op["task_id"] }),
+                text(&op["task_id"]),
+            )],
+            "mcp_list" => vec![self.control_request(json!({ "subtype": "mcp_status" }), "")],
+            // What the context holds, by kind (Claude Code's /context).
+            "context_usage" => {
+                vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")]
+            }
+            "mcp_toggle" | "mcp_reconnect" => {
+                let request = if op["op"] == "mcp_toggle" {
+                    json!({ "subtype": "mcp_toggle", "serverName": op["name"], "enabled": op["enabled"] == true })
+                } else {
+                    json!({ "subtype": "mcp_reconnect", "serverName": op["name"] })
+                };
+                vec![
+                    self.control_request(request, ""),
+                    self.control_request(json!({ "subtype": "mcp_status" }), ""),
+                ]
+            }
+            // The agent trace: runs so far (with those saved before this
+            // process), and one subagent's own conversation.
+            "agent_runs" => {
+                if !self.conversation.is_empty() {
+                    let session = self.session_dir();
+                    self.runs.seed(&session);
+                }
+                return Ok(Output::events(vec![self.runs.event()]));
+            }
+            "subagent_transcript" => {
+                let id = text(&op["agent_id"]);
+                let event = match runs::transcript(&self.session_dir(), id) {
+                    Ok(items) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "items": items })
+                    }
+                    Err(error) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "error": error })
+                    }
+                };
+                return Ok(Output::events(vec![event]));
+            }
+            "permission_rules" => {
+                vec![self.control_request(json!({ "subtype": "list_permission_rules" }), "")]
+            }
+            // The user's name for the session, so `claude --resume` shows it too.
+            "rename" => vec![self.control_request(
+                json!({ "subtype": "rename_session", "title": op["title"], "source": "host" }),
+                "",
+            )],
+            // Claude Code names the session and keeps the name in its
+            // transcript, so `claude --resume` lists it too.
+            "generate_title" => vec![self.control_request(
+                json!({ "subtype": "generate_session_title", "description": op["description"], "persist": true }),
+                "",
+            )],
+            "shutdown" => vec![],
+            other => return Err(format!("Claude Code sessions do not support {other}")),
+        };
+        Ok(Output {
+            events: Vec::new(),
+            frames,
+        })
+    }
+}
+
+impl Adapter for Claude {
+    fn start(&mut self) -> Vec<String> {
+        let mut frames = if self.mode == "bypassPermissions" {
+            vec![self.control_request(json!({ "subtype": "list_models" }), "boot")]
+        } else {
+            let mode = self.mode;
+            vec![
+                self.control_request(
+                    json!({ "subtype": "set_permission_mode", "mode": mode }),
+                    "",
+                ),
+                self.control_request(json!({ "subtype": "list_models" }), ""),
+            ]
+        };
+        if self.fast_wanted {
+            frames.push(self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": { "fastMode": true } }),
+                "",
+            ));
+        }
+        // The command list with descriptions, before the first turn. The
+        // desktop has a stop button per background task, so an interrupt
+        // spares them.
+        // The in-process server, unless `command` left it out.
+        let servers: &[&str] = if user_tools::offered(&self.app_tools_off).is_empty() {
+            &[]
+        } else {
+            &[MCP_SERVER]
+        };
+        frames.push(self.control_request(
+            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true, "sdkMcpServers": servers }),
+            "",
+        ));
+        if self.ultracode {
+            frames.push(self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": { "ultracode": true } }),
+                "",
+            ));
+        }
+        if !self.thinking {
+            let frame = self.thinking_request(false);
+            frames.push(frame);
+        }
+        frames.push(self.control_request(json!({ "subtype": "get_settings" }), ""));
+        frames.push(self.control_request(json!({ "subtype": "mcp_status" }), ""));
+        // A resumed conversation's totals start from what it spent before.
+        if self.model_totals.is_none() {
+            frames.push(self.control_request(
+                json!({ "subtype": "get_usage", "skip_behaviors": true }),
+                "",
+            ));
+        }
+        frames
+    }
+
+    fn translate(&mut self, line: Line) -> Output {
+        let mut output = self.translate_line(line);
+        output.frames.extend(self.steer_ready());
+        output
+    }
+
+    fn encode(&mut self, op: &Value) -> Result<Output, String> {
+        let mut output = self.encode_op(op)?;
+        output.frames.extend(self.steer_ready());
+        Ok(output)
+    }
+
+    fn busy(&self) -> bool {
+        self.active_turn
+    }
+
+    fn restart_for(&self, op: &Value) -> Option<Options> {
+        if op["op"] != "set_approval_mode" {
+            return None;
+        }
+        let next = to_claude_mode(text(&op["mode"]));
+        let bypass = |mode: &str| mode == "bypassPermissions";
+        (bypass(next) != bypass(self.mode)).then(|| Options {
+            approval_mode: Some(next.to_string()),
+            model: (!self.model.is_empty())
+                .then(|| self.model.clone())
+                .or(self.requested_model.clone()),
+            resume: (!self.conversation.is_empty()).then(|| self.conversation.clone()),
+            resume_at: None,
+            ..self.keep(Options::default())
+        })
+    }
+
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        std::mem::take(&mut self.calls)
+    }
+
+    fn answer(&mut self, token: &Value, result: Result<Value, String>) -> Vec<String> {
+        let (body, is_error) = match result {
+            Ok(output) => (output.to_string(), false),
+            Err(error) => (error, true),
+        };
+        let response = json!({ "jsonrpc": "2.0", "id": token["id"], "result": {
+            "content": [{ "type": "text", "text": body }], "isError": is_error,
+        } });
+        vec![json!({ "type": "control_response", "response": { "subtype": "success", "request_id": token["request_id"], "response": { "mcp_response": response } } }).to_string()]
+    }
+
+    fn keep(&self, options: Options) -> Options {
+        Options {
+            ultracode: self.ultracode,
+            effort: Some(self.effort.clone()),
+            fast: self.fast == "on",
+            thinking: Some(self.thinking),
+            ..options
+        }
+    }
+
+    fn conversation(&self) -> Option<String> {
+        (!self.conversation.is_empty()).then(|| self.conversation.clone())
+    }
+
+    fn model(&self) -> Option<String> {
+        (!self.model.is_empty())
+            .then(|| self.model.clone())
+            .or(self.requested_model.clone())
+    }
+
+    fn approval_mode(&self) -> Option<String> {
+        Some(from_claude_mode(self.mode).to_string())
+    }
+}
+
+/// A subscription's usage from a `rate_limit_info`: per window when the
+/// event carries `unifiedWindows` (5-hour, weekly), else the limiting window.
+/// `utilization` is the share used, 0-1 (above 1 past a cap). Absent for
+/// API-key sessions.
+fn plan_usage(info: &Value) -> Option<Value> {
+    const WINDOWS: [(&str, u64); 3] = [
+        ("five_hour", 300),
+        ("seven_day", 10_080),
+        ("seven_day_overage_included", 10_080),
+    ];
+    let mut windows = Vec::new();
+    if let Some(unified) = info["unifiedWindows"].as_object() {
+        for (key, minutes) in WINDOWS {
+            if let Some(used) = unified.get(key).and_then(|w| w["utilization"].as_f64()) {
+                windows.push(super::plan_window(
+                    key,
+                    used * 100.0,
+                    &unified[key]["resetsAt"],
+                    Some(minutes),
+                ));
+            }
+        }
+    } else if let (Some(used), Some(key)) =
+        (info["utilization"].as_f64(), info["rateLimitType"].as_str())
+    {
+        let minutes = WINDOWS.iter().find(|(k, _)| *k == key).map(|(_, m)| *m);
+        windows.push(super::plan_window(
+            key,
+            used * 100.0,
+            &info["resetsAt"],
+            minutes,
+        ));
+    }
+    (!windows.is_empty()).then(|| json!({ "type": "plan_usage", "plan": null, "windows": windows }))
+}
+
+fn rate_limit_events(frame: &Value) -> Vec<Value> {
+    // Claude Code nests it as `rate_limit_info`; older builds as `rate_limit`.
+    let info = ["rate_limit_info", "rate_limit"]
+        .iter()
+        .map(|key| &frame[*key])
+        .find(|value| value.is_object())
+        .unwrap_or(frame);
+    let mut events = limit_banner(frame, info);
+    events.extend(plan_usage(info));
+    events
+}
+
+fn limit_banner(frame: &Value, info: &Value) -> Vec<Value> {
+    let status = [text(&info["status"]), text(&frame["status"])]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_lowercase();
+    let reset = ["resetsAt", "resets_at", "resetAt"]
+        .iter()
+        .find_map(|key| info[*key].as_f64())
+        .or_else(|| frame["resetsAt"].as_f64())
+        .unwrap_or(0.0);
+    let resets_at = if reset > 1e12 {
+        json!(reset as u64)
+    } else if reset > 1e9 {
+        json!((reset * 1000.0) as u64)
+    } else {
+        Value::Null
+    };
+    // Words for the user, if the engine sent any (the status is a code).
+    let message = [text(&info["message"]), text(&frame["message"])]
+        .into_iter()
+        .find(|m| !m.is_empty())
+        .unwrap_or_default();
+    // Which limit: `five_hour`, `seven_day`, `seven_day_opus`, `overage`…,
+    // and how much of it is used, in percent.
+    let notice = |level: &str| {
+        json!({
+            "type": "rate_limit",
+            "level": level,
+            "message": message,
+            "resets_at": resets_at,
+            "window": info["rateLimitType"].as_str(),
+            "used": info["utilization"].as_f64().map(|u| (u * 1000.0).round() / 10.0),
+            "overage": info["isUsingOverage"] == true,
+        })
+    };
+    let has = |words: &[&str]| words.iter().any(|word| status.contains(word));
+    if has(&["reject", "exceed", "limit_reached", "throttl"]) {
+        vec![notice("limited")]
+    } else if has(&["warn", "approaching"]) {
+        vec![notice("warning")]
+    } else if has(&["allow", "ok", "normal"]) {
+        vec![json!({ "type": "rate_limit", "level": "ok", "message": "", "resets_at": null })]
+    } else {
+        vec![]
+    }
+}
+
+// --- saved conversations ---
+
+/// Where Claude Code keeps its state: `CLAUDE_CONFIG_DIR`, which the engine
+/// inherits from the daemon, else `~/.claude`.
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".claude"))
+}
+
+/// `config_dir` of a CLI run with `env` (a session's `Options::env`) on top
+/// of the daemon's environment: the Desktop's per-engine variables may set
+/// `CLAUDE_CONFIG_DIR` where the daemon's own environment does not.
+pub fn config_dir_in(env: &[(String, String)]) -> PathBuf {
+    match env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+    {
+        Some((_, dir)) if !dir.is_empty() => PathBuf::from(dir),
+        Some(_) => home().join(".claude"),
+        None => config_dir(),
+    }
+}
+
+/// The config directories programs set for themselves (`probe`), by the
+/// program and the environment it runs with.
+type ProbeKey = (String, Vec<(String, String)>);
+static PROBED: std::sync::Mutex<Option<HashMap<ProbeKey, PathBuf>>> = std::sync::Mutex::new(None);
+
+/// The config directory a CLI run with `options` keeps its state in: the
+/// one already found for the session, else for a program of the user's
+/// (`bin`, e.g. an account switcher that sets `CLAUDE_CONFIG_DIR` itself
+/// before running Claude Code) the one it was seen to use, probed if never
+/// seen; else `config_dir_in` its environment.
+pub fn config_for(options: &Options) -> PathBuf {
+    known_config(options)
+        .or_else(|| {
+            let bin = options.bin.clone()?;
+            reprobe((bin, options.env.clone()))
+        })
+        .unwrap_or_else(|| config_dir_in(&options.env))
+}
+
+/// `config_for` as far as it is known without probing.
+fn known_config(options: &Options) -> Option<PathBuf> {
+    if let Some(dir) = &options.claude_config {
+        return Some(dir.clone());
+    }
+    let key = (options.bin.clone()?, options.env.clone());
+    PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(&key)
+        .cloned()
+}
+
+/// `config_for`, where conversation `id` of `cwd` is looked for: a program
+/// of the user's not seen to save it where it was last seen to (an account
+/// switched since) is asked again.
+pub fn config_with(options: &Options, cwd: &Path, id: &str) -> PathBuf {
+    let dir = config_for(options);
+    match &options.bin {
+        Some(bin) if options.claude_config.is_none() && !is_saved(&dir, cwd, id) => {
+            reprobe((bin.clone(), options.env.clone())).unwrap_or(dir)
+        }
+        _ => dir,
+    }
+}
+
+/// Runs `probe` for `key` and remembers what it found.
+fn reprobe(key: ProbeKey) -> Option<PathBuf> {
+    let dir = probe(&key.0, &key.1)?;
+    PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, dir.clone());
+    Some(dir)
+}
+
+/// Where program `bin` run with `env` has Claude Code keep its state: the
+/// `CLAUDE_CONFIG_DIR` in the environment of the Claude Code it starts,
+/// which reports its pid once initialized; None when that cannot be read.
+fn probe(bin: &str, env: &[(String, String)]) -> Option<PathBuf> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(bin)
+        .args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(home())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Kept open (Claude Code running) until its environment is read.
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let request = json!({ "type": "control_request", "request_id": "probe", "request": { "subtype": "initialize" } });
+    let _ = writeln!(stdin, "{request}");
+    let fallback = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if frame["type"] == "control_response" {
+                let pid = frame["response"]["response"]["pid"].as_u64();
+                let _ = sender.send(pid.map_or(fallback, |pid| pid as u32));
+                return;
+            }
+        }
+    });
+    let dir = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .ok()
+        .and_then(environment)
+        .map(|vars| {
+            vars.into_iter()
+                .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                .map(|(_, dir)| dir)
+                .filter(|dir| !dir.is_empty())
+                .map_or_else(|| home().join(".claude"), PathBuf::from)
+        });
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    dir
+}
+
+/// The environment of process `pid` (one of the user's).
+#[cfg(target_os = "linux")]
+fn environment(pid: u32) -> Option<Vec<(String, String)>> {
+    let raw = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(env_pairs(raw.split(|b| *b == 0)))
+}
+
+/// The environment of process `pid` (one of the user's): the strings after
+/// its arguments in `KERN_PROCARGS2` (argc, the executable path, padding,
+/// the arguments, then the environment).
+#[cfg(target_os = "macos")]
+fn environment(pid: u32) -> Option<Vec<(String, String)>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a size query (null buffer) on a valid mib.
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 || size < 4 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size];
+    // SAFETY: `buffer` holds `size` bytes, which `sysctl` writes at most.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buffer.truncate(size);
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?) as usize;
+    let rest = &buffer[4..];
+    // The executable path, the NULs padding it, then argc arguments.
+    let path_end = rest.iter().position(|b| *b == 0)?;
+    let start = path_end + rest[path_end..].iter().position(|b| *b != 0)?;
+    let env = rest[start..]
+        .split(|b| *b == 0)
+        .skip(argc)
+        .take_while(|s| !s.is_empty());
+    Some(env_pairs(env))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn environment(_pid: u32) -> Option<Vec<(String, String)>> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn env_pairs<'a>(strings: impl Iterator<Item = &'a [u8]>) -> Vec<(String, String)> {
+    strings
+        .filter_map(|s| {
+            let s = std::str::from_utf8(s).ok()?;
+            let (name, value) = s.split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Claude Code's project directory for `cwd`: every character of the real
+/// path (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`)
+/// that is not ASCII alphanumeric becomes `-`.
+fn project_dir(config: &Path, cwd: &Path) -> PathBuf {
+    let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let munged: String = real
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    config.join("projects").join(munged)
+}
+
+fn is_conversation_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.starts_with('-')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Rows Claude adds that are not conversation: subagent streams, meta notes,
+/// the post-compaction summary.
+/// The tool calls in a saved row, as the cards a live turn showed: an
+/// assistant row's calls are noted in `calls`, a user row's results to them
+/// become tool items (with `is_error` when the call failed). The todo list
+/// and the plan were not cards.
+fn tool_rows(row: &Value, calls: &mut HashMap<String, ToolMeta>) -> Vec<Value> {
+    let blocks = row["message"]["content"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for block in blocks {
+        match text(&block["type"]) {
+            _ if is_tool_use(block) => {
+                let claude_name = text(&block["name"]);
+                if !matches!(claude_name, "TodoWrite" | "ExitPlanMode") {
+                    calls.insert(
+                        text(&block["id"]).to_string(),
+                        ToolMeta {
+                            claude_name: claude_name.to_string(),
+                            name: tool_name(claude_name).to_string(),
+                            input: object(&block["input"]),
+                        },
+                    );
+                }
+            }
+            "tool_result" => {
+                let id = text(&block["tool_use_id"]);
+                if let Some(meta) = calls.remove(id) {
+                    let output = result_card(&meta, block, &row["toolUseResult"]);
+                    let mut item = json!({ "role": "tool", "name": meta.name, "output": output, "call_id": id });
+                    if block["is_error"] == true {
+                        item["is_error"] = json!(true);
+                    }
+                    items.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+/// When a saved row was written, ms since the epoch.
+fn row_time(row: &Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text(&row["timestamp"]))
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
+fn is_synthetic(row: &Value) -> bool {
+    [
+        "isSidechain",
+        "isMeta",
+        "isCompactSummary",
+        "isVisibleInTranscriptOnly",
+    ]
+    .iter()
+    .any(|key| row[*key] == true)
+}
+
+/// Slash commands that show in the conversation as what the user wrote.
+/// Claude echoes a command as `<command-name>/goal</command-name>
+/// <command-message>…</command-message><command-args>…</command-args>`;
+/// other commands (settings, /compact) stay out of the conversation.
+const SHOWN_COMMANDS: &[&str] = &["/goal"];
+
+/// `/goal <its condition>` for an echoed command that shows.
+fn shown_command(text: &str) -> Option<String> {
+    let between = |open: &str, close: &str| {
+        let start = text.find(open)? + open.len();
+        let end = start + text[start..].find(close)?;
+        Some(text[start..end].trim())
+    };
+    let name = between("<command-name>", "</command-name>")?;
+    if !SHOWN_COMMANDS.contains(&name) {
+        return None;
+    }
+    let args = between("<command-args>", "</command-args>").unwrap_or("");
+    Some(if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {args}")
+    })
+}
+
+/// The user's or the model's text in a saved message: text blocks, without
+/// the markup Claude adds (`<system-reminder>`, command echoes), except a
+/// command that shows.
+fn content_text(content: &Value) -> Option<String> {
+    let keep = |text: &str| {
+        let text = text.trim();
+        if text.starts_with('<') {
+            shown_command(text)
+        } else {
+            (!text.is_empty()).then(|| text.to_string())
+        }
+    };
+    if let Some(text) = content.as_str() {
+        return keep(text);
+    }
+    let text = content
+        .as_array()?
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .filter_map(keep)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn row_text(row: &Value) -> Option<String> {
+    content_text(&row["message"]["content"])
+}
+
+/// The files named by text blocks that are attached-file lines.
+/// A message sent as blocks (`user_content`): the user's text is the first
+/// text block, as it was typed; each attached file a text block after it.
+/// A message of files alone comes back without the empty text block.
+fn split_blocks(content: &Value) -> (String, Vec<String>) {
+    let mut texts = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "text")
+        .map(|block| text(&block["text"]))
+        .peekable();
+    let message = match texts.peek() {
+        Some(first) if attachments::line_path(first).is_none() => {
+            texts.next().unwrap_or_default().to_string()
+        }
+        _ => String::new(),
+    };
+    (message, texts.filter_map(attachments::line_path).collect())
+}
+
+fn has_image(content: &Value) -> bool {
+    content
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+}
+
+/// A saved user message as a transcript item: its text and its images, which
+/// Claude Code keeps inline; they are written to `images` (once: a file is
+/// named after its data) so the item names them by path, as a live echo does.
+/// A message of images alone shows too. Attached-file lines go to `files`.
+fn user_item(content: &Value, images: &Path) -> Option<Value> {
+    let (text, files) = match content_text(content) {
+        Some(text) => {
+            let (text, files) = attachments::split_files(&text);
+            (Some(text).filter(|text| !text.is_empty()), files)
+        }
+        None => (None, Vec::new()),
+    };
+    let paths: Vec<String> = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "image")
+        .filter_map(|block| saved_image(&block["source"], images))
+        .collect();
+    if text.is_none() && paths.is_empty() && files.is_empty() {
+        return None;
+    }
+    let mut item = json!({ "role": "user", "content": text.unwrap_or_default() });
+    if !paths.is_empty() {
+        item["images"] = json!(paths);
+    }
+    set_files(&mut item, &files);
+    Some(item)
+}
+
+fn saved_image(source: &Value, dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let ext = match text(&source["media_type"]) {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => return None,
+    };
+    let data = source["data"].as_str()?;
+    let digest = Sha256::digest(data.as_bytes());
+    let name: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{name}.{ext}"));
+    if !path.is_file() {
+        let bytes = STANDARD.decode(data).ok()?;
+        fs::create_dir_all(dir).ok()?;
+        let part = dir.join(format!("{name}.{ext}.part"));
+        fs::write(&part, bytes).ok()?;
+        fs::rename(&part, &path).ok()?;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// A message the user sent while a turn ran: Claude takes it in at the next
+/// tool boundary and saves it only as a `queued_command` attachment row.
+fn queued_prompt(row: &Value) -> Option<&Value> {
+    let attachment = &row["attachment"];
+    if row["type"] != "attachment"
+        || attachment["type"] != "queued_command"
+        || attachment["commandMode"] != "prompt"
+    {
+        return None;
+    }
+    Some(&attachment["prompt"])
+}
+
+fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
+    let reader = fs::File::open(path)
+        .ok()
+        .map(|file| BufReader::new(file.take(limit)));
+    reader
+        .into_iter()
+        .flat_map(|reader| reader.lines().map_while(Result::ok))
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+}
+
+/// A saved conversation as transcript items (the newest 500): the user's and
+/// the model's text and the tool calls, each with when it was written
+/// (`at`), from config directory `config`. The user's images are written
+/// under `uploads`.
+pub fn transcript(config: &Path, cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
+    transcript_in(config, cwd, id, &uploads.join("claude"))
+}
+
+fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
+    if !is_conversation_id(id) {
+        return vec![];
+    }
+    let mut calls = HashMap::new();
+    let mut items: Vec<Value> = rows(
+        &project_dir(config, cwd).join(format!("{id}.jsonl")),
+        64 * 1024 * 1024,
+    )
+    .filter(|row| !is_synthetic(row))
+    .flat_map(|row| {
+        let mut items = tool_rows(&row, &mut calls);
+        items.extend(match text(&row["type"]) {
+            "user" => user_item(&row["message"]["content"], images),
+            // The usage-limit notice Claude Code saves as a reply is none.
+            "assistant" if row["error"] == "rate_limit" => None,
+            // Its uuid: where a rewind or a fork resumes the conversation.
+            "assistant" => row_text(&row).map(|content| {
+                let mut item = json!({ "role": "assistant", "content": content });
+                if let Some(uuid) = row["uuid"].as_str() {
+                    item["uuid"] = json!(uuid);
+                }
+                item
+            }),
+            "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
+            _ => None,
+        });
+        // When each was said or ran: the turn's time and its line's clock.
+        if let Some(at) = row_time(&row) {
+            for item in &mut items {
+                item["at"] = json!(at);
+            }
+        }
+        items
+    })
+    .collect();
+    let excess = items.len().saturating_sub(500);
+    items.drain(..excess);
+    items
+}
+
+/// Conversations saved for `cwd` in config directory `config`, newest
+/// first: (id, title, updated ms).
+pub fn saved(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    saved_in(config, cwd)
+}
+
+/// Whether Claude Code saved conversation `id` for `cwd` in config directory
+/// `config` (it has at least one turn and can be resumed). Unlike `saved`,
+/// not limited to the newest ones.
+pub fn is_saved(config: &Path, cwd: &Path, id: &str) -> bool {
+    is_conversation_id(id)
+        && project_dir(config, cwd)
+            .join(format!("{id}.jsonl"))
+            .is_file()
+}
+
+fn saved_in(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    let Ok(entries) = fs::read_dir(project_dir(config, cwd)) else {
+        return vec![];
+    };
+    let mut found: Vec<(String, u64, PathBuf)> = entries
+        .flatten()
+        .take(2000)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path.file_stem()?.to_str()?.to_string();
+            if path.extension()? != "jsonl" || !is_conversation_id(&id) {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as u64;
+            Some((id, modified, path))
+        })
+        .collect();
+    found.sort_by_key(|(_, modified, _)| std::cmp::Reverse(*modified));
+    found.truncate(50);
+    found
+        .into_iter()
+        .map(|(id, modified, path)| (id, title(&path), modified))
+        .collect()
+}
+
+/// The stored AI title, else the first user message's first line.
+fn title(path: &Path) -> String {
+    let mut first = String::new();
+    for row in rows(path, 256 * 1024) {
+        match text(&row["type"]) {
+            "ai-title" if !text(&row["aiTitle"]).trim().is_empty() => {
+                return text(&row["aiTitle"]).trim().chars().take(80).collect();
+            }
+            "user" if first.is_empty() && !is_synthetic(&row) => {
+                // A message of files alone names no title.
+                if let Some(text) = row_text(&row) {
+                    first = attachments::split_files(&text)
+                        .0
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(80)
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    first
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claude() -> Claude {
+        Claude::new(&Options::default())
+    }
+
+    fn frame(claude: &mut Claude, value: Value) -> Vec<Value> {
+        claude.translate(Line::Frame(value)).events
+    }
+
+    fn types(events: &[Value]) -> Vec<&str> {
+        events.iter().map(|e| text(&e["type"])).collect()
+    }
+
+    #[test]
+    fn streaming_edit_reports_line_counts() {
+        let delta = |index: u64, partial: &str| json!({ "type": "stream_event", "event": { "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": partial } } });
+        let card =
+            |events: &[Value]| serde_json::from_str::<Value>(text(&events[0]["output"])).unwrap();
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "w1", "name": "Write", "input": {} } } }),
+        );
+        let preview = card(&frame(
+            &mut c,
+            delta(0, "{\"file_path\":\"/a/b.rs\",\"content\":\"one\\ntwo\\nth"),
+        ));
+        assert_eq!(
+            preview,
+            json!({ "path": "/a/b.rs", "paths": ["/a/b.rs"], "add": 3, "del": 0 })
+        );
+        // Throttled until the next tick; the finished input sends the diff.
+        assert!(frame(&mut c, delta(0, "ree\\nfour")).is_empty());
+        let done = card(&frame(&mut c, delta(0, "\"}")));
+        assert_eq!(done["diff"], "+one\n+two\n+three\n+four");
+
+        frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "e1", "name": "Edit", "input": {} } } }),
+        );
+        let preview = card(&frame(
+            &mut c,
+            delta(
+                1,
+                "{\"file_path\":\"x\",\"old_string\":\"a\\nb\",\"new_string\":\"c",
+            ),
+        ));
+        assert_eq!(
+            (preview["add"].clone(), preview["del"].clone()),
+            (json!(1), json!(2))
+        );
+
+        // Other tools wait for their whole input.
+        frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "content_block_start", "index": 2, "content_block": { "type": "tool_use", "id": "b1", "name": "Bash", "input": {} } } }),
+        );
+        assert!(frame(&mut c, delta(2, "{\"command\":\"l")).is_empty());
+    }
+
+    #[test]
+    fn closes_partial_json() {
+        assert_eq!(
+            close_partial_json("{\"a\":\"x\\"),
+            Some(json!({ "a": "x" }))
+        );
+        assert_eq!(
+            close_partial_json("{\"a\":\"x\\u00"),
+            Some(json!({ "a": "x" }))
+        );
+        assert_eq!(close_partial_json("{\"a\":\"é"), Some(json!({ "a": "é" })));
+        assert_eq!(
+            close_partial_json("{\"a\":[{\"b\":1},"),
+            Some(json!({ "a": [{ "b": 1 }] }))
+        );
+        assert_eq!(close_partial_json("{\"a\": "), Some(json!({ "a": null })));
+        assert_eq!(close_partial_json("{\"a\":1,\"conte"), None);
+    }
+
+    #[test]
+    fn the_gateway_key_stays_out_of_the_command_line() {
+        let mut command = Command::new("claude");
+        use_gateway(
+            &mut command,
+            "sess-1",
+            "http://127.0.0.1:7788/gw",
+            "jgw-secretkey",
+            None,
+        )
+        .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().all(|a| !a.contains("secretkey")), "{args:?}");
+        let path = args.last().unwrap().clone();
+        assert!(path.ends_with("claude-gateway-sess-1.json"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("jgw-secretkey"));
+        forget_gateway("jgw-secretkey");
+        assert!(!std::path::Path::new(&path).exists());
+        // A custom provider's one model serves the background requests too.
+        let mut command = Command::new("claude");
+        use_gateway(
+            &mut command,
+            "sess-2",
+            "http://x/gw",
+            "jgw-k2",
+            Some("deepseek-chat"),
+        )
+        .unwrap();
+        let path = command
+            .get_args()
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            "deepseek-chat"
+        );
+        assert_eq!(
+            settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"],
+            "deepseek-chat"
+        );
+        forget_gateway("jgw-k2");
+    }
+
+    #[test]
+    fn a_rate_limit_event_shows_the_banner_and_the_plan_usage() {
+        let mut c = claude();
+        // The shape Claude Code 2.1 emits for a subscription session.
+        let events = frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "status": "allowed_warning", "resetsAt": 1790800000, "rateLimitType": "five_hour", "utilization": 0.83,
+                "unifiedWindows": {
+                    "five_hour": { "utilization": 0.83, "resetsAt": 1790800000 },
+                    "seven_day": { "utilization": 0.412, "resetsAt": 1791300000 }
+                }
+            } }),
+        );
+        assert_eq!(types(&events), ["rate_limit", "plan_usage"]);
+        assert_eq!(events[0]["level"], "warning");
+        assert_eq!(events[0]["window"], "five_hour");
+        assert_eq!(events[0]["used"], 83.0);
+        // The status is a code, not words for the user.
+        assert_eq!(events[0]["message"], "");
+        assert_eq!(events[0]["resets_at"], 1_790_800_000_000u64);
+        let windows = events[1]["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(
+            windows[0],
+            json!({ "key": "five_hour", "used": 83.0, "resets_at": 1_790_800_000_000u64, "minutes": 300 })
+        );
+        assert_eq!(windows[1]["used"], 41.2);
+        // Only the limiting window: that one.
+        let events = frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed", "rateLimitType": "seven_day", "utilization": 0.2 } }),
+        );
+        assert_eq!(types(&events), ["rate_limit", "plan_usage"]);
+        assert_eq!(events[1]["windows"][0]["minutes"], 10_080);
+        // An API-key session: status only.
+        let events = frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed" } }),
+        );
+        assert_eq!(types(&events), ["rate_limit"]);
+    }
+
+    #[test]
+    fn a_turn_stopped_by_the_usage_limit_reports_the_limit_not_a_reply() {
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": 1790800000, "rateLimitType": "five_hour", "utilization": 1.0 } }),
+        );
+        let hit = frame(
+            &mut c,
+            json!({ "type": "assistant", "error": "rate_limit", "message": { "model": "<synthetic>", "content": [
+                { "type": "text", "text": "You've hit your session limit · resets 12:40pm" } ] } }),
+        );
+        assert_eq!(types(&hit), ["rate_limit"]);
+        assert_eq!(hit[0]["level"], "limited");
+        assert_eq!(hit[0]["window"], "five_hour");
+        assert_eq!(hit[0]["resets_at"], 1_790_800_000_000u64);
+        assert_eq!(
+            hit[0]["message"],
+            "You've hit your session limit · resets 12:40pm"
+        );
+        let end = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "success", "is_error": true, "result": "You've hit your session limit · resets 12:40pm" }),
+        );
+        assert!(!end.iter().any(|e| e["type"] == "error"));
+        // The next failure is an error again.
+        let end = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "boom" }),
+        );
+        assert!(end.iter().any(|e| e["type"] == "error"));
+    }
+
+    #[test]
+    fn a_turn_streams_text_and_tools_and_ends_ready() {
+        let mut c = claude();
+        let boot = c.start();
+        assert_eq!(boot.len(), 5);
+        assert!(boot[0].contains("set_permission_mode") && boot[0].contains("\"default\""));
+        assert!(boot[2].contains("initialize"));
+        assert!(boot[3].contains("get_settings"));
+        assert!(boot[4].contains("mcp_status"));
+        let ready = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "jucode-1", "response": { "mode": "default" } } }),
+        );
+        assert_eq!(types(&ready), ["approval_mode", "command_list", "status"]);
+        let listed = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "jucode-3", "response": { "commands": [
+                { "name": "review", "description": "Review a diff (user)", "argumentHint": "" },
+                { "name": "compact", "description": "Free up context", "argumentHint": "<instructions>", "builtin": true },
+                { "name": "model", "description": "Set the AI model", "argumentHint": "<model>", "builtin": true }
+            ] } } }),
+        );
+        let names: Vec<&str> = listed[0]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["/model", "/resume", "/btw", "/compact", "/review"]);
+        assert_eq!(listed[0]["commands"][3]["args"], "<instructions>");
+        assert_eq!(listed[0]["commands"][3]["description"], "Free up context");
+
+        let init = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "abc", "model": "claude-opus-4-8", "permissionMode": "default", "cwd": "/p", "slash_commands": ["compact", "context"] }),
+        );
+        assert_eq!(
+            types(&init),
+            [
+                "startup",
+                "model_status",
+                "command_list",
+                "approval_mode",
+                "status"
+            ]
+        );
+        assert_eq!(init[1]["model_label"], "Opus 4.8");
+        // Names only the init frame lists join the described ones.
+        let names: Vec<&str> = init[2]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["/model", "/resume", "/btw", "/compact", "/review", "/context"]
+        );
+        assert_eq!(c.conversation().as_deref(), Some("abc"));
+
+        assert_eq!(
+            types(&frame(
+                &mut c,
+                json!({ "type": "system", "subtype": "status", "status": "requesting" })
+            )),
+            ["connecting"]
+        );
+        assert!(c.busy());
+        assert_eq!(
+            types(&frame(
+                &mut c,
+                json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10 } } } }),
+            )),
+            ["thinking_start", "context_usage"]
+        );
+        let usage = frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "input_tokens": 10, "cache_read_input_tokens": 3000, "cache_creation_input_tokens": 40, "cache_creation": { "ephemeral_5m_input_tokens": 30, "ephemeral_1h_input_tokens": 10 }, "output_tokens": 5 } } }),
+        );
+        assert_eq!(
+            usage[0],
+            json!({ "type": "usage", "input_tokens": 3050, "cached_input_tokens": 3000, "cache_write_tokens": 40, "cache_write_1h_tokens": 10, "output_tokens": 5 })
+        );
+        frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 7, "cache_read_input_tokens": 100 } } } }),
+        );
+        let usage = frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "output_tokens": 2 } } }),
+        );
+        assert_eq!(usage[0]["input_tokens"], 107);
+        assert_eq!(usage[0]["cached_input_tokens"], 100);
+        assert_eq!(
+            types(&frame(
+                &mut c,
+                json!({ "type": "stream_event", "event": { "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } } })
+            )),
+            ["assistant_start"]
+        );
+        let delta = frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hel" } } }),
+        );
+        assert_eq!(delta[0]["delta"], "Hel");
+        // The completed block only adds what did not stream.
+        let done = frame(
+            &mut c,
+            json!({ "type": "assistant", "uuid": "u1", "message": { "content": [{ "type": "text", "text": "Hello" }] } }),
+        );
+        assert_eq!(done[0], json!({ "type": "assistant_delta", "delta": "lo" }));
+        assert_eq!(done[1]["type"], "assistant_uuid");
+
+        let start = frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "t1", "name": "Bash", "input": {} } } }),
+        );
+        assert_eq!(types(&start), ["tool_start", "tool_update"]);
+        assert_eq!(start[0]["name"], "bash");
+        let filled = frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"command\":\"ls\"}" } } }),
+        );
+        assert_eq!(filled[0]["output"], "{\"command\":\"ls\"}");
+        let result = frame(
+            &mut c,
+            json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "a\nb" }] }, "tool_use_result": { "stdout": "a\nb" } }),
+        );
+        assert_eq!(result[0]["type"], "tool_output");
+        assert_eq!(
+            serde_json::from_str::<Value>(text(&result[0]["output"])).unwrap()["stdout"],
+            "a\nb"
+        );
+
+        let end = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "success", "total_cost_usd": 0.5, "modelUsage": { "claude-opus-4-8": { "contextWindow": 200000 } } }),
+        );
+        assert_eq!(types(&end), ["model_status", "context_usage", "status"]);
+        assert!(!c.busy());
+    }
+
+    #[test]
+    fn usage_beyond_the_main_loop_is_reported_from_the_running_totals() {
+        let totals = |opus: [u64; 4], haiku: [u64; 4]| {
+            let model = |[i, r, w, o]: [u64; 4]| json!({ "inputTokens": i, "cacheReadInputTokens": r, "cacheCreationInputTokens": w, "outputTokens": o, "costUSD": 0.1 });
+            json!({ "claude-opus-5-5": model(opus), "claude-haiku-5-5": model(haiku) })
+        };
+        let result =
+            |usage: Value| json!({ "type": "result", "subtype": "success", "modelUsage": usage });
+        let usage_of = |events: &[Value]| -> Vec<Value> {
+            events
+                .iter()
+                .filter(|e| e["type"] == "usage")
+                .cloned()
+                .collect()
+        };
+        let main_request = |c: &mut Claude| {
+            frame(
+                c,
+                json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10, "cache_read_input_tokens": 1000 } } } }),
+            );
+            frame(
+                c,
+                json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "output_tokens": 5 } } }),
+            );
+        };
+
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" }),
+        );
+        main_request(&mut c);
+        // A subagent on haiku ran beside the main loop's one request.
+        let end = frame(&mut c, result(totals([10, 1000, 0, 5], [3, 0, 200, 50])));
+        assert_eq!(
+            usage_of(&end),
+            [
+                json!({ "type": "usage", "aggregate": true, "model": "claude-haiku-5-5", "input_tokens": 203, "cached_input_tokens": 0, "cache_write_tokens": 200, "output_tokens": 50 })
+            ]
+        );
+        assert_eq!(end.last().unwrap()["message"], "ready");
+        // A background agent finished after that result; the next turn's
+        // result carries it, and a compaction on opus besides.
+        main_request(&mut c);
+        let end = frame(
+            &mut c,
+            result(totals([30, 2000, 100, 10], [4, 200, 200, 60])),
+        );
+        let usage = usage_of(&end);
+        assert_eq!(usage.len(), 2);
+        let of = |model: &str| usage.iter().find(|e| e["model"] == model).unwrap().clone();
+        assert_eq!(
+            (
+                of("claude-opus-5-5")["input_tokens"].as_u64(),
+                of("claude-opus-5-5")["output_tokens"].as_u64()
+            ),
+            (Some(110), Some(0))
+        );
+        assert_eq!(
+            (
+                of("claude-haiku-5-5")["input_tokens"].as_u64(),
+                of("claude-haiku-5-5")["output_tokens"].as_u64()
+            ),
+            (Some(201), Some(10))
+        );
+        // A zeroed result changes nothing; /clear starts the totals over.
+        assert!(usage_of(&frame(&mut c, result(totals([0; 4], [0; 4])))).is_empty());
+        main_request(&mut c);
+        assert!(usage_of(&frame(&mut c, result(totals([10, 1000, 0, 5], [0; 4])))).is_empty());
+
+        // Resumed: the totals already hold earlier turns.
+        let mut c = Claude::new(&Options {
+            resume: Some("s".into()),
+            ..Options::default()
+        });
+        let boot = c.start();
+        frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id(&boot, "get_usage"), "response": { "session": { "model_usage": totals([100, 9000, 50, 70], [5, 0, 0, 5]) } } } }),
+        );
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" }),
+        );
+        main_request(&mut c);
+        assert!(usage_of(&frame(
+            &mut c,
+            result(totals([110, 10000, 50, 75], [5, 0, 0, 5]))
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn a_permission_prompt_becomes_an_approval_answered_once() {
+        let mut c = claude();
+        let events = frame(
+            &mut c,
+            json!({ "type": "control_request", "request_id": "r9", "request": { "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t2", "input": { "command": "rm -rf build" } } }),
+        );
+        assert_eq!(
+            types(&events),
+            ["tool_start", "tool_update", "approval_request"]
+        );
+        let call = text(&events[2]["call_id"]).to_string();
+        assert_eq!(events[2]["summary"], "rm -rf build");
+
+        let reply = c
+            .encode(
+                &json!({ "op": "approve", "call_id": call, "decision": "allow", "always": true }),
+            )
+            .unwrap();
+        let sent: Value = serde_json::from_str(&reply.frames[0]).unwrap();
+        assert_eq!(sent["response"]["request_id"], "r9");
+        assert_eq!(sent["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            sent["response"]["response"]["updatedPermissions"][0]["destination"],
+            "session"
+        );
+        assert!(c
+            .encode(&json!({ "op": "approve", "call_id": call, "decision": "allow" }))
+            .is_err());
+    }
+
+    #[test]
+    fn multi_edit_hunks_approve_only_the_chosen_edits() {
+        let mut c = claude();
+        let input = json!({ "file_path": "/p/a.rs", "edits": [{ "old_string": "a", "new_string": "b" }, { "old_string": "c", "new_string": "d" }] });
+        let events = frame(
+            &mut c,
+            json!({ "type": "control_request", "request_id": "r1", "request": { "subtype": "can_use_tool", "tool_name": "MultiEdit", "tool_use_id": "t", "input": input } }),
+        );
+        let request = events.last().unwrap();
+        assert_eq!(request["hunks"][1]["id"], "e1");
+        let reply = c.encode(&json!({ "op": "approve", "call_id": request["call_id"], "decision": "allow", "hunks": ["e1"] })).unwrap();
+        let sent: Value = serde_json::from_str(&reply.frames[0]).unwrap();
+        assert_eq!(
+            sent["response"]["response"]["updatedInput"]["edits"],
+            json!([{ "old_string": "c", "new_string": "d" }])
+        );
+    }
+
+    #[test]
+    fn full_access_needs_a_restart_on_the_same_conversation() {
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "abc", "model": "claude-haiku-4-5", "permissionMode": "default" }),
+        );
+        assert!(c
+            .restart_for(&json!({ "op": "set_approval_mode", "mode": "auto-edit" }))
+            .is_none());
+        let next = c
+            .restart_for(&json!({ "op": "set_approval_mode", "mode": "full-access" }))
+            .unwrap();
+        assert_eq!(next.approval_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(next.resume.as_deref(), Some("abc"));
+        let args: Vec<String> = command("abc", &next)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--permission-prompt-tool", "stdio"]));
+        assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
+    }
+
+    /// The id of the control request of `subtype` among `frames`.
+    fn request_id(frames: &[String], subtype: &str) -> String {
+        frames
+            .iter()
+            .map(|f| serde_json::from_str::<Value>(f).unwrap())
+            .rfind(|f| f["request"]["subtype"] == subtype)
+            .map(|f| text(&f["request_id"]).to_string())
+            .unwrap()
+    }
+
+    fn reply(id: String, response: Value) -> Value {
+        json!({ "type": "control_response", "response": { "subtype": "success", "request_id": id, "response": response } })
+    }
+
+    #[test]
+    fn session_settings_follow_the_engine_and_survive_a_restart() {
+        let mut c = Claude::new(&Options::from_json(
+            &json!({ "ultracode": true, "effort": "high", "thinking": false }),
+        ));
+        let boot = c.start();
+        assert!(boot.iter().any(|f| f.contains(r#""ultracode":true"#)));
+        assert!(boot
+            .iter()
+            .any(|f| f.contains(r#""thinking_display":"omitted""#)));
+        assert!(boot
+            .iter()
+            .any(|f| f.contains(r#""perTaskStopAffordance":true"#)));
+        let settings = |id: String, effort: &str, on: bool| {
+            reply(
+                id,
+                json!({ "applied": { "effort": effort, "ultracode": on, "ultracodeAvailable": true } }),
+            )
+        };
+        let status = frame(
+            &mut c,
+            settings(request_id(&boot, "get_settings"), "high", true),
+        );
+        assert_eq!(status[0]["ultracode"], true);
+        assert_eq!(status[0]["ultracode_available"], true);
+        assert_eq!(status[0]["reasoning_effort"], "high");
+        assert_eq!(status[0]["thinking_summaries"], false);
+
+        // Effort is a flag setting now, not a `/effort` message.
+        let effort = c
+            .encode(&json!({ "op": "command", "input": "/model claude-opus-5-5 low" }))
+            .unwrap()
+            .frames;
+        assert!(effort[0].contains(r#""effortLevel":"low""#));
+        let status = frame(
+            &mut c,
+            settings(request_id(&effort, "get_settings"), "low", true),
+        );
+        assert_eq!(status[0]["reasoning_effort"], "low");
+
+        let off = c
+            .encode(&json!({ "op": "command", "input": "/effort ultracode off" }))
+            .unwrap()
+            .frames;
+        assert!(off[0].contains(r#""ultracode":false"#));
+        let status = frame(
+            &mut c,
+            settings(request_id(&off, "get_settings"), "low", false),
+        );
+        assert_eq!(status[0]["ultracode"], false);
+        assert!(c
+            .encode(&json!({ "op": "command", "input": "/effort ultracode maybe" }))
+            .is_err());
+        let on = c
+            .encode(&json!({ "op": "command", "input": "/effort ultracode" }))
+            .unwrap()
+            .frames;
+        frame(
+            &mut c,
+            settings(request_id(&on, "get_settings"), "low", true),
+        );
+
+        let thinking = c
+            .encode(&json!({ "op": "command", "input": "/thinking on" }))
+            .unwrap();
+        assert!(thinking.frames[0].contains(r#""thinking_display":"summarized""#));
+        assert_eq!(thinking.events[0]["thinking_summaries"], true);
+
+        let next = c
+            .restart_for(&json!({ "op": "set_approval_mode", "mode": "full-access" }))
+            .unwrap();
+        assert!(next.ultracode);
+        assert_eq!(next.effort.as_deref(), Some("low"));
+        assert_eq!(next.thinking, Some(true));
+        let args: Vec<String> = command("abc", &next)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["--effort", "low"]));
+    }
+
+    #[test]
+    fn fast_mode_is_asked_for_and_explains_a_refusal() {
+        let mut c = claude();
+        let boot = c.start();
+        let status = frame(
+            &mut c,
+            reply(
+                request_id(&boot, "initialize"),
+                json!({ "commands": [], "fast_mode_state": "off", "fast_mode_disabled_reason": "sdk_opt_in_required" }),
+            ),
+        );
+        let status = status.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["fast_available"], true);
+        let on = c
+            .encode(&json!({ "op": "command", "input": "/fast on" }))
+            .unwrap()
+            .frames;
+        assert!(on[0].contains(r#""fastMode":true"#));
+        let events = frame(
+            &mut c,
+            reply(
+                request_id(&on, "initialize"),
+                json!({ "commands": [], "fast_mode_state": "off", "fast_mode_disabled_reason": "not_first_party" }),
+            ),
+        );
+        assert!(events
+            .iter()
+            .any(|e| e["message"] == "[claude] fast mode unavailable: not_first_party"));
+        let status = events.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["fast_available"], false);
+        // A turn reports it too.
+        let events = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "success", "fast_mode_state": "on" }),
+        );
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "model_status" && e["fast"] == true));
+        assert!(c.keep(Options::default()).fast);
+    }
+
+    #[test]
+    fn a_cli_without_get_settings_offers_no_ultracode_quietly() {
+        let mut c = claude();
+        let boot = c.start();
+        let events = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&boot, "get_settings"), "error": "unknown subtype" } }),
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_subagent_stopped_by_an_update_or_from_before_this_process_ends() {
+        let mut c = claude();
+        let system = |extra: Value| {
+            let mut frame = json!({ "type": "system" });
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            frame
+        };
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a1", "task_type": "local_agent", "description": "Scan" }),
+            ),
+        );
+        let killed = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_updated", "task_id": "a1", "patch": { "status": "killed" } }),
+            ),
+        );
+        assert_eq!(killed[0]["type"], "subagent_lifecycle");
+        assert_eq!(killed[0]["status"], "killed");
+        assert_eq!(killed.last().unwrap()["agents"][0]["status"], "killed");
+        // Still running: nothing to report.
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a2", "task_type": "local_agent", "description": "Watch" }),
+            ),
+        );
+        let paused = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_updated", "task_id": "a2", "patch": { "status": "paused" } }),
+            ),
+        );
+        assert!(paused.is_empty());
+        // Started under another process: its end still reaches the client.
+        let ended = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_notification", "task_id": "old", "status": "stopped", "summary": "" }),
+            ),
+        );
+        assert_eq!(ended[0]["type"], "subagent_lifecycle");
+        assert_eq!(ended[0]["path"], "old");
+        assert_eq!(ended[0]["status"], "stopped");
+    }
+
+    #[test]
+    fn stopping_the_background_stops_background_tasks_only() {
+        let mut c = claude();
+        for (id, kind, background) in [("b1", "local_bash", true), ("a1", "local_agent", false)] {
+            frame(
+                &mut c,
+                json!({ "type": "system", "subtype": "task_started", "task_id": id, "task_type": kind, "description": "d", "is_backgrounded": background }),
+            );
+        }
+        let stop = c
+            .encode(&json!({ "op": "stop_background" }))
+            .unwrap()
+            .frames;
+        assert_eq!(stop.len(), 1);
+        assert!(stop[0].contains(r#""subtype":"stop_task""#) && stop[0].contains("b1"));
+    }
+
+    #[test]
+    fn subagents_and_background_tasks_report_their_progress() {
+        let mut c = claude();
+        let system = |extra: Value| {
+            let mut frame = json!({ "type": "system" });
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            frame
+        };
+        let started = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a1", "task_type": "local_agent", "description": "Scan auth", "is_backgrounded": false }),
+            ),
+        );
+        assert_eq!(started[0]["type"], "subagent_lifecycle");
+        assert_eq!(started[0]["label"], "Scan auth");
+        let progress = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_progress", "task_id": "a1", "description": "Scan auth", "summary": "Reading login.rs" }),
+            ),
+        );
+        assert_eq!(progress[0]["message"], "Reading login.rs");
+        let done = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_notification", "task_id": "a1", "status": "completed", "summary": "Agent done" }),
+            ),
+        );
+        assert_eq!(done[0]["status"], "completed");
+        // A foreground subagent's result is its Agent card, not news.
+        assert!(!done.iter().any(|e| e["type"] == "task_done"));
+        assert_eq!(done.last().unwrap()["agents"][0]["status"], "completed");
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a2", "task_type": "local_agent", "description": "Watch CI", "is_backgrounded": false }),
+            ),
+        );
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_updated", "task_id": "a2", "patch": { "is_backgrounded": true } }),
+            ),
+        );
+        let done = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_notification", "task_id": "a2", "status": "completed", "summary": "CI green" }),
+            ),
+        );
+        assert_eq!(done[1]["type"], "task_done");
+        assert_eq!(done[1]["kind"], "local_agent");
+
+        let tasks = frame(
+            &mut c,
+            system(json!({ "subtype": "background_tasks_changed", "tasks": [
+                { "task_id": "w1", "task_type": "local_workflow", "description": "Review" },
+                { "task_id": "x", "task_type": "local_bash", "description": "watch", "ambient": true }
+            ] })),
+        );
+        assert_eq!(
+            tasks[0]["tasks"],
+            json!([{ "id": "w1", "kind": "local_workflow", "description": "Review" }])
+        );
+        let stop = c
+            .encode(&json!({ "op": "stop_task", "task_id": "w1" }))
+            .unwrap()
+            .frames;
+        assert!(stop[0].contains(r#""subtype":"stop_task""#) && stop[0].contains("w1"));
+        let ask = c
+            .encode(&json!({ "op": "task_output", "task_id": "b2" }))
+            .unwrap()
+            .frames;
+        let output = frame(
+            &mut c,
+            reply(
+                request_id(&ask, "get_task_output"),
+                json!({ "output": "ok\n", "truncated": false, "total_bytes": 3 }),
+            ),
+        );
+        assert_eq!(
+            output[0],
+            json!({ "type": "task_output", "task_id": "b2", "output": "ok\n", "truncated": false })
+        );
+
+        // The finished task's own user message is not a message from the user.
+        let echo = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": "<task-notification>\n<task-id>w1</task-id>\n</task-notification>" } }),
+        );
+        assert!(echo.is_empty());
+    }
+
+    #[test]
+    fn a_workflows_progress_feeds_the_agent_trace() {
+        let mut c = claude();
+        let started = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "task_started", "task_id": "w1", "task_type": "local_workflow", "workflow_name": "review", "description": "Review" }),
+        );
+        assert_eq!(started.last().unwrap()["type"], "agent_runs");
+        let progress = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "task_progress", "task_id": "w1", "description": "Find: bugs-0",
+                "usage": { "total_tokens": 10, "tool_uses": 0, "duration_ms": 5 },
+                "workflow_progress": [{ "type": "workflow_agent", "agentId": "a1", "label": "bugs-0", "state": "running" }] }),
+        );
+        assert_eq!(progress[0]["type"], "task_progress");
+        assert_eq!(progress[1]["workflows"][0]["agents"][0]["label"], "bugs-0");
+        let asked = c.encode(&json!({ "op": "agent_runs" })).unwrap().events;
+        assert_eq!(asked[0]["workflows"][0]["id"], "w1");
+        let missing = c
+            .encode(&json!({ "op": "subagent_transcript", "agent_id": "a1" }))
+            .unwrap()
+            .events;
+        assert_eq!(missing[0]["type"], "subagent_transcript");
+        assert!(missing[0]["error"].is_string());
+    }
+
+    #[test]
+    fn a_read_card_names_the_line_it_started_at() {
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs" })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 1 })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 120, "limit": 40 })),
+            json!({ "path": "/a.rs", "line": 120 })
+        );
+    }
+
+    #[test]
+    fn a_subagents_tool_card_names_the_subagent() {
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "assistant", "message": { "content": [
+                { "type": "tool_use", "id": "t1", "name": "Agent", "input": { "description": "Scan auth", "prompt": "…" } }
+            ] } }),
+        );
+        let events = frame(
+            &mut c,
+            json!({ "type": "assistant", "parent_tool_use_id": "t1", "message": { "content": [
+                { "type": "tool_use", "id": "t2", "name": "Read", "input": { "file_path": "/a" } }
+            ] } }),
+        );
+        let start = events.iter().find(|e| e["type"] == "tool_start").unwrap();
+        assert_eq!(start["subagent"], "Scan auth");
+    }
+
+    #[test]
+    fn engine_notices_become_events() {
+        let mut c = claude();
+        let retry = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "api_retry", "attempt": 2, "max_retries": 10, "retry_delay_ms": 4000, "error_status": 529, "error": null }),
+        );
+        assert_eq!(
+            retry[0],
+            json!({ "type": "retrying", "attempt": 2, "max_attempts": 10, "delay_ms": 4000, "reason": "HTTP 529" })
+        );
+        let fallback = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "model_fallback", "trigger": "overloaded", "original_model": "claude-opus-5-5", "fallback_model": "claude-sonnet-5-5" }),
+        );
+        assert_eq!(fallback[0]["reason"], "overloaded");
+        assert_eq!(fallback.len(), 1);
+        let refusal = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "model_refusal_fallback", "original_model": "claude-opus-5-5", "fallback_model": "claude-sonnet-5-5" }),
+        );
+        assert_eq!(refusal[0]["reason"], "refusal");
+        assert_eq!(refusal[1]["model"], "claude-sonnet-5-5");
+        let suggestion = frame(
+            &mut c,
+            json!({ "type": "prompt_suggestion", "suggestion": "run the tests" }),
+        );
+        assert_eq!(
+            suggestion[0],
+            json!({ "type": "prompt_suggestion", "text": "run the tests" })
+        );
+        let title = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "session_title_changed", "title": "Fix login" }),
+        );
+        assert_eq!(
+            title[0],
+            json!({ "type": "session_title", "title": "Fix login" })
+        );
+        let commands = frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "commands_changed", "commands": [{ "name": "deploy", "description": "Ship it" }] }),
+        );
+        assert!(commands[0]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["command"] == "/deploy"));
+    }
+
+    #[test]
+    fn claude_code_names_the_session_and_keeps_the_name() {
+        let mut c = claude();
+        let ask = c
+            .encode(&json!({ "op": "generate_title", "description": "[图片 #1] 修复打印乱码" }))
+            .unwrap()
+            .frames;
+        assert!(ask[0].contains(r#""description":"[图片 #1] 修复打印乱码""#));
+        assert!(ask[0].contains(r#""persist":true"#));
+        let named = frame(
+            &mut c,
+            reply(
+                request_id(&ask, "generate_session_title"),
+                json!({ "title": "打印乱码修复" }),
+            ),
+        );
+        assert_eq!(
+            named,
+            vec![json!({ "type": "session_title_generated", "title": "打印乱码修复" })]
+        );
+        // A failure leaves the title alone and the turn untouched.
+        let ask = c
+            .encode(&json!({ "op": "generate_title", "description": "x" }))
+            .unwrap()
+            .frames;
+        let id = request_id(&ask, "generate_session_title");
+        let failed = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "error", "request_id": id, "error": "boom" } }),
+        );
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn a_side_question_answers_outside_the_conversation() {
+        let mut c = claude();
+        assert!(c
+            .encode(&json!({ "op": "command", "input": "/btw" }))
+            .is_err());
+        let ask = c
+            .encode(&json!({ "op": "command", "input": "/btw what is foo?" }))
+            .unwrap()
+            .frames;
+        assert!(ask[0].contains(r#""question":"what is foo?""#));
+        let answer = frame(
+            &mut c,
+            reply(
+                request_id(&ask, "side_question"),
+                json!({ "response": "A helper.", "synthetic": false }),
+            ),
+        );
+        assert_eq!(
+            answer[0],
+            json!({ "type": "side_answer", "question": "what is foo?", "answer": "A helper." })
+        );
+    }
+
+    #[test]
+    fn mcp_servers_are_listed_toggled_and_reconnected() {
+        let mut c = claude();
+        let toggle = c
+            .encode(&json!({ "op": "mcp_toggle", "name": "docs", "enabled": false }))
+            .unwrap()
+            .frames;
+        assert!(
+            toggle[0].contains(r#""serverName":"docs""#)
+                && toggle[0].contains(r#""enabled":false"#)
+        );
+        let servers = frame(
+            &mut c,
+            reply(
+                request_id(&toggle, "mcp_status"),
+                json!({ "mcpServers": [
+                { "name": "docs", "status": "disabled", "config": { "type": "http" } },
+                { "name": "gh", "status": "needs-auth" },
+                { "name": "fs", "status": "connected", "tools": [{ "name": "read", "description": "Read" }] }
+            ] }),
+            ),
+        );
+        let servers = servers[0]["servers"].as_array().unwrap();
+        assert_eq!(servers[0]["transport"], "http");
+        assert_eq!(servers[0]["state"], "disabled");
+        assert_eq!(servers[1]["state"], "failed");
+        assert_eq!(servers[2]["tools"][0]["name"], "read");
+        // A failed request outside a turn is a notice, not a turn error.
+        let failed = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&toggle, "mcp_toggle"), "error": "no such server" } }),
+        );
+        assert_eq!(failed[0]["type"], "info");
+    }
+
+    #[test]
+    fn context_usage_is_the_breakdown_by_kind() {
+        let mut c = claude();
+        let asked = c.encode(&json!({ "op": "context_usage" })).unwrap().frames;
+        let out = frame(
+            &mut c,
+            reply(
+                request_id(&asked, "get_context_usage"),
+                json!({
+                    "categories": [
+                        { "name": "System prompt", "tokens": 3100, "color": "x", "kind": "used" },
+                        { "name": "MCP tools", "tokens": 900, "color": "x", "isDeferred": true },
+                        { "name": "Messages", "tokens": 41000, "color": "x" },
+                        { "name": "Free space", "tokens": 150000, "color": "x", "kind": "free" }
+                    ],
+                    "totalTokens": 45000, "maxTokens": 200000,
+                    "memoryFiles": [{ "path": "/p/CLAUDE.md", "type": "Project", "tokens": 600 }]
+                }),
+            ),
+        );
+        assert_eq!(out[0]["type"], "context_breakdown");
+        assert_eq!(out[0]["total"], 45000);
+        assert_eq!(out[0]["max"], 200000);
+        let kinds: Vec<&str> = out[0]["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["used", "deferred", "used", "free"]);
+        assert_eq!(out[0]["memory_files"][0]["tokens"], 600);
+        // An older CLI without it: the panel stops waiting, the turn goes on.
+        let asked = c.encode(&json!({ "op": "context_usage" })).unwrap().frames;
+        let failed = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&asked, "get_context_usage"), "error": "unsupported" } }),
+        );
+        assert_eq!(
+            failed[0],
+            json!({ "type": "context_breakdown", "error": "unsupported" })
+        );
+    }
+
+    #[test]
+    fn an_mcp_elicitation_is_a_form_on_the_approval_card() {
+        let mut c = claude();
+        let out = c.translate(Line::Frame(
+            json!({ "type": "control_request", "request_id": "e1", "request": {
+            "subtype": "elicitation", "mcp_server_name": "jira", "message": "Pick a project",
+            "requested_schema": { "type": "object", "properties": {
+                "project": { "type": "string", "enum": ["WEB", "API"] },
+                "count": { "type": "integer", "title": "How many" },
+                "notify": { "type": "boolean" }
+            } }
+        } }),
+        ));
+        let card = &out.events[0];
+        assert_eq!(card["name"], "mcp_elicitation");
+        let asked = |q: &str| {
+            card["questions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["question"] == q)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(asked("project")["options"][1]["label"], "API");
+        assert_eq!(asked("How many")["options"], json!([]));
+        assert_eq!(asked("notify")["options"][0]["label"], "true");
+        let call = text(&card["call_id"]).to_string();
+        let sent = c
+            .encode(
+                &json!({ "op": "approve", "call_id": call, "decision": "allow",
+                "answers": { "project": "API", "How many": "3", "notify": "true" } }),
+            )
+            .unwrap()
+            .frames;
+        let sent: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(
+            sent["response"]["response"],
+            json!({ "action": "accept", "content": { "project": "API", "count": 3, "notify": true } })
+        );
+    }
+
+    #[test]
+    fn a_titled_enum_is_offered_by_title_and_answered_by_value() {
+        let schema = json!({ "type": "object", "properties": { "env": {
+            "type": "string", "title": "Where",
+            "oneOf": [{ "const": "prod", "title": "Production" }, { "const": "dev" }]
+        } } });
+        let questions = elicitation_questions(&schema);
+        assert_eq!(
+            questions[0]["options"],
+            json!([{ "label": "Production" }, { "label": "dev" }])
+        );
+        assert_eq!(
+            elicitation_content(&schema, &json!({ "Where": "Production" })),
+            json!({ "env": "prod" })
+        );
+        assert_eq!(
+            elicitation_content(&schema, &json!({ "Where": "dev" })),
+            json!({ "env": "dev" })
+        );
+    }
+
+    #[test]
+    fn always_allow_can_be_saved_for_the_project() {
+        let mut c = claude();
+        let out = c.translate(Line::Frame(json!({ "type": "control_request", "request_id": "r1", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "t1", "input": { "command": "ls" }
+        } })));
+        let call = out
+            .events
+            .iter()
+            .find(|e| e["type"] == "approval_request")
+            .map(|e| text(&e["call_id"]).to_string())
+            .unwrap();
+        let sent = c
+            .encode(&json!({ "op": "approve", "call_id": call, "decision": "allow", "always": true, "always_scope": "project" }))
+            .unwrap()
+            .frames;
+        assert!(sent[0].contains(r#""destination":"localSettings""#));
+        let rules = c
+            .encode(&json!({ "op": "permission_rules" }))
+            .unwrap()
+            .frames;
+        let listed = frame(
+            &mut c,
+            reply(
+                request_id(&rules, "list_permission_rules"),
+                json!({ "state": { "rules": [{ "behavior": "allow", "source": "localSettings", "rule": "Bash(ls)", "editability": "persistent" }], "workspaceDirectories": [] } }),
+            ),
+        );
+        assert_eq!(listed[0]["rules"][0]["rule"], "Bash(ls)");
+    }
+
+    #[test]
+    fn an_attached_image_goes_as_an_image_block() {
+        let dir = std::env::temp_dir().join(format!("jucode-image-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+        let other = dir.join("notes.bmp");
+        fs::write(&other, b"x").unwrap();
+        let content = Claude::user_content(
+            &json!({ "content": "look", "images": [png.to_str().unwrap(), other.to_str().unwrap()] }),
+        );
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "iVBORw==");
+        assert_eq!(content[2]["type"], "text");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sessions_environment_names_the_config_directory() {
+        let env = |dir: &str| vec![("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())];
+        assert_eq!(config_dir_in(&env("/tmp/c")), PathBuf::from("/tmp/c"));
+        assert_eq!(config_dir_in(&env("")), home().join(".claude"));
+        assert_eq!(config_dir_in(&[]), config_dir());
+    }
+
+    #[test]
+    fn the_desktop_may_name_the_binary_and_its_environment() {
+        let options = Options::from_json(&json!({
+            "bin": "/opt/claude/bin/claude",
+            "env": { "CLAUDE_CONFIG_DIR": "/tmp/c" },
+        }));
+        assert!(options.runs_programs());
+        let dir = std::env::temp_dir().join(format!("jucode-bin-test-{}", std::process::id()));
+        let hub = crate::hub::Hub::new(
+            crate::store::Store::open(dir.clone()).unwrap(),
+            "test",
+            None,
+        );
+        let (command, _) = super::super::command(
+            &hub,
+            super::super::Kind::Claude,
+            "x",
+            Path::new("/p"),
+            &options,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(dir);
+        assert_eq!(command.get_program(), "/opt/claude/bin/claude");
+        assert!(command
+            .get_envs()
+            .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == Some("/tmp/c".as_ref())));
+        assert!(!Options::from_json(&json!({ "model": "m" })).runs_programs());
+    }
+
+    #[test]
+    fn a_new_session_pins_its_id_and_slash_commands_pass_through() {
+        let args: Vec<String> = command("1111-2222", &Options::default())
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["--session-id", "1111-2222"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--permission-mode", "default"]));
+        let mut c = claude();
+        let frames = c
+            .encode(&json!({ "op": "command", "input": "/compact" }))
+            .unwrap()
+            .frames;
+        assert!(frames[0].contains("/compact"));
+        assert!(c
+            .encode(&json!({ "op": "command", "input": "/resume x" }))
+            .is_err());
+        // Nothing queued, nothing running: nothing to steer.
+        assert!(c
+            .encode(&json!({ "op": "steer" }))
+            .unwrap()
+            .frames
+            .is_empty());
+    }
+
+    #[test]
+    fn replayed_user_messages_skip_command_echoes() {
+        let mut c = claude();
+        assert_eq!(
+            frame(
+                &mut c,
+                json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "fix it" }] } })
+            )[0]["content"],
+            "fix it"
+        );
+        assert!(frame(&mut c, json!({ "type": "user", "isReplay": true, "message": { "content": "<command-name>/compact</command-name>" } })).is_empty());
+        assert!(frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": "/effort high" } })
+        )
+        .is_empty());
+        // A goal is what the user asked for: it shows.
+        let goal = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>tests pass</command-args>" } }),
+        );
+        assert_eq!(
+            goal,
+            vec![json!({ "type": "user_message", "content": "/goal tests pass" })]
+        );
+    }
+
+    #[test]
+    fn a_message_of_images_alone_is_echoed() {
+        let mut c = claude();
+        let image = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } });
+        let echo = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }, image] } }),
+        );
+        // Not sent from here: its images have no path to show.
+        assert_eq!(echo, vec![json!({ "type": "user_message", "content": "" })]);
+        // Sent mid-turn, it leaves the queue when Claude takes it in.
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "", "images": ["/no/such.png"] }))
+            .unwrap();
+        assert_eq!(
+            queued.events,
+            vec![json!({ "type": "pending_messages", "messages": [""], "fixed": 0 })]
+        );
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }, image] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
+                // Sent from here: by the paths it was sent with.
+                json!({ "type": "user_message", "content": "", "images": ["/no/such.png"] })
+            ]
+        );
+        // Nothing to show without text or image.
+        assert!(frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }] } })
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn saved_messages_keep_their_images() {
+        let home = std::env::temp_dir().join(format!("claude-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let cwd = Path::new("/work/pics");
+        let dir = home.join(".claude/projects/-work-pics");
+        fs::create_dir_all(&dir).unwrap();
+        let png = STANDARD.encode(b"png bytes");
+        let image = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": png } });
+        fs::write(
+            dir.join("33-44.jsonl"),
+            [
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "" }, image] } }),
+                json!({ "type": "user", "isMeta": true, "message": { "content": [{ "type": "text", "text": "[Image: source: /tmp/1.png]" }] } }),
+                json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "red" }] } }),
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "and this" }, image] } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "commandMode": "prompt", "prompt": [image] } }),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        let images = home.join("images");
+        let items = transcript_in(&home.join(".claude"), cwd, "33-44", &images);
+        let path = items[0]["images"][0].as_str().unwrap().to_string();
+        assert!(path.starts_with(images.to_str().unwrap()) && path.ends_with(".png"));
+        assert_eq!(fs::read(&path).unwrap(), b"png bytes");
+        assert_eq!(
+            items,
+            vec![
+                json!({ "role": "user", "content": "", "images": [path] }),
+                json!({ "role": "assistant", "content": "red" }),
+                json!({ "role": "user", "content": "and this", "images": [path] }),
+                json!({ "role": "user", "content": "", "images": [path] }),
+            ]
+        );
+        // Read again, the same file.
+        assert_eq!(
+            transcript_in(&home.join(".claude"), cwd, "33-44", &images),
+            items
+        );
+        assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_attached_file_goes_as_a_line_of_its_own() {
+        let content = Claude::user_content(
+            &json!({ "content": "read", "files": ["/tmp/my report.pdf", "/tmp/会议.mp4"] }),
+        );
+        assert_eq!(
+            content,
+            vec![
+                json!({ "type": "text", "text": "read" }),
+                json!({ "type": "text", "text": "[Attached file \"my report.pdf\" is saved at: /tmp/my report.pdf]" }),
+                json!({ "type": "text", "text": "[Attached file \"会议.mp4\" is saved at: /tmp/会议.mp4]" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn attached_files_show_as_files_when_echoed_and_saved() {
+        let line = |path: &str| json!({ "type": "text", "text": attachments::file_line(path) });
+        let mut c = claude();
+        let echo = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "read" }, line("/a/x.pdf")] } }),
+        );
+        assert_eq!(
+            echo,
+            vec![json!({ "type": "user_message", "content": "read", "files": ["/a/x.pdf"] })]
+        );
+        // Files alone show too.
+        let alone = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [line("/a/x.pdf")] } }),
+        );
+        assert_eq!(
+            alone,
+            vec![json!({ "type": "user_message", "content": "", "files": ["/a/x.pdf"] })]
+        );
+
+        // Held and taken back, or taken in together: each with its files.
+        let mut c = mid_turn(&["apple"]);
+        c.encode(&json!({ "op": "user_message", "content": "banana", "files": ["/b/y.zip"] }))
+            .unwrap();
+        c.encode(&json!({ "op": "user_message", "content": "oops", "files": ["/c/z.txt"] }))
+            .unwrap();
+        let back = c.encode(&json!({ "op": "unqueue", "index": -1 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "images": null, "files": ["/c/z.txt"] })
+        );
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }, line("/b/y.zip")] } }),
+        );
+        assert_eq!(
+            taken[1..],
+            [
+                json!({ "type": "user_message", "content": "apple" }),
+                json!({ "type": "user_message", "content": "banana", "files": ["/b/y.zip"] }),
+            ]
+        );
+
+        let home = std::env::temp_dir().join(format!("claude-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let dir = home.join(".claude/projects/-work-docs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("55-66.jsonl"),
+            [
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "read" }, line("/a/x.pdf")] } }),
+                json!({ "type": "user", "message": { "content": "plain" } }),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_in(
+                &home.join(".claude"),
+                Path::new("/work/docs"),
+                "55-66",
+                &home.join("images")
+            ),
+            vec![
+                json!({ "role": "user", "content": "read", "files": ["/a/x.pdf"] }),
+                json!({ "role": "user", "content": "plain" }),
+            ]
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A Claude with a turn running ("first"), then `texts` sent during it.
+    fn mid_turn(texts: &[&str]) -> Claude {
+        let mut c = claude();
+        c.encode(&json!({ "op": "user_message", "content": "first" }))
+            .unwrap();
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        for text in texts {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn a_message_sent_mid_turn_waits_and_starts_the_next_turn() {
+        let mut c = claude();
+        let idle = c
+            .encode(&json!({ "op": "user_message", "content": "first" }))
+            .unwrap();
+        assert!(idle.events.is_empty());
+        assert_eq!(idle.frames.len(), 1);
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "also this " }))
+            .unwrap();
+        // Held here, not written to the CLI.
+        assert!(queued.frames.is_empty());
+        assert_eq!(
+            queued.events,
+            vec![json!({ "type": "pending_messages", "messages": ["also this"], "fixed": 0 })]
+        );
+        // The turn ends: it goes, listed as fixed until the CLI replays it.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert!(ended.frames[0].contains("also this"));
+        assert!(ended.events.contains(
+            &json!({ "type": "pending_messages", "messages": ["also this"], "fixed": 1 })
+        ));
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "also this " }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
+                json!({ "type": "user_message", "content": "also this " })
+            ]
+        );
+    }
+
+    #[test]
+    fn steering_writes_a_held_message_to_the_cli_now() {
+        let mut c = mid_turn(&["apple", "banana"]);
+        let steer = c.encode(&json!({ "op": "steer", "index": -1 })).unwrap();
+        assert_eq!(steer.frames.len(), 1);
+        assert!(steer.frames[0].contains("banana"));
+        assert_eq!(
+            steer.events,
+            vec![
+                json!({ "type": "pending_messages", "messages": ["banana", "apple"], "fixed": 1 })
+            ]
+        );
+        // The CLI has it: no steering or taking it back again.
+        assert!(c
+            .encode(&json!({ "op": "steer", "index": 0 }))
+            .unwrap()
+            .frames
+            .is_empty());
+        assert!(c
+            .encode(&json!({ "op": "unqueue", "index": 0 }))
+            .unwrap()
+            .events
+            .is_empty());
+        // The turn ends with banana not yet taken in: apple waits for it.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert!(ended.frames.is_empty());
+    }
+
+    #[test]
+    fn a_steer_goes_with_priority_now() {
+        let mut c = mid_turn(&["apple"]);
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        let frame: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        assert_eq!(frame["priority"], "now");
+        assert_eq!(frame["message"]["content"][0]["text"], "apple");
+        // It cuts the turn short (claude 2.1 ends it as
+        // error_during_execution): no error, just the end of that turn.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert!(ended.events.iter().all(|e| e["type"] != "error"));
+        // The next turn's failure is reported again.
+        let failed = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert!(failed.events.iter().any(|e| e["type"] == "error"));
+    }
+
+    #[test]
+    fn a_steer_moves_foreground_subagents_to_the_background_first() {
+        let mut c = mid_turn(&["apple"]);
+        let started = |id: &str, tool: &str, extra: Value| {
+            let mut frame = json!({ "type": "system", "subtype": "task_started", "task_id": id, "tool_use_id": tool, "task_type": "local_agent", "description": "look", "is_backgrounded": false });
+            for (k, v) in extra.as_object().unwrap() {
+                frame[k] = v.clone();
+            }
+            Line::Frame(frame)
+        };
+        c.translate(started("a1", "t1", json!({})));
+        // Already in the background, or launched by a subagent: left alone.
+        c.translate(started("a2", "t2", json!({ "is_backgrounded": true })));
+        c.translate(started("a3", "t3", json!({ "parent_task_id": "a1" })));
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        assert_eq!(steer.frames.len(), 1);
+        let moved: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        assert_eq!(
+            moved["request"],
+            json!({ "subtype": "background_tasks", "tool_use_id": "t1" })
+        );
+        // Listed as handed over already.
+        assert_eq!(
+            steer.events,
+            vec![json!({ "type": "pending_messages", "messages": ["apple"], "fixed": 1 })]
+        );
+        // Other output meanwhile: still waiting.
+        let streamed = c.translate(Line::Frame(
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        ));
+        assert!(streamed.frames.is_empty());
+        // Moved: the message goes.
+        let answered = c.translate(Line::Frame(json!({ "type": "control_response", "response": { "subtype": "success", "request_id": moved["request_id"], "response": { "backgrounded": true } } })));
+        assert_eq!(answered.frames.len(), 1);
+        assert!(
+            answered.frames[0].contains("apple")
+                && answered.frames[0].contains("\"priority\":\"now\"")
+        );
+        assert!(answered.events.is_empty());
+    }
+
+    #[test]
+    fn a_steer_waiting_for_moves_goes_when_the_turn_ends_or_a_move_fails() {
+        let mut c = mid_turn(&["apple"]);
+        c.translate(Line::Frame(json!({ "type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "t1", "task_type": "local_agent", "is_backgrounded": false })));
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert_eq!(ended.frames.len(), 1);
+        assert!(ended.frames[0].contains("apple"));
+
+        let mut c = mid_turn(&["apple"]);
+        c.translate(Line::Frame(json!({ "type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "t1", "task_type": "local_agent", "is_backgrounded": false })));
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        let moved: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        let failed = c.translate(Line::Frame(json!({ "type": "control_response", "response": { "subtype": "error", "request_id": moved["request_id"], "error": "background tasks are disabled" } })));
+        assert_eq!(failed.frames.len(), 1);
+        // Not an error that ends the turn.
+        assert!(failed.events.iter().all(|e| e["type"] != "error"));
+    }
+
+    #[test]
+    fn interrupting_for_a_held_message_sends_it_first() {
+        let mut c = mid_turn(&["apple", "banana", "cherry"]);
+        let stop = c
+            .encode(&json!({ "op": "interrupt", "index": -1 }))
+            .unwrap();
+        assert!(stop.frames[0].contains("interrupt"));
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert_eq!(ended.frames.len(), 1);
+        assert!(ended.frames[0].contains("cherry"));
+    }
+
+    #[test]
+    fn held_messages_reorder_and_drop_but_not_past_the_clis_own() {
+        let mut c = mid_turn(&["apple", "banana", "cherry"]);
+        c.encode(&json!({ "op": "steer", "index": 0 })).unwrap();
+        // apple is the CLI's now: the others move among themselves only.
+        assert!(c
+            .encode(&json!({ "op": "queue_move", "index": 2, "to": 0 }))
+            .unwrap()
+            .events
+            .is_empty());
+        let moved = c
+            .encode(&json!({ "op": "queue_move", "index": 2, "to": 1 }))
+            .unwrap();
+        assert_eq!(
+            moved.events,
+            vec![
+                json!({ "type": "pending_messages", "messages": ["apple", "cherry", "banana"], "fixed": 1 })
+            ]
+        );
+        let dropped = c
+            .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
+            .unwrap();
+        assert_eq!(
+            dropped.events,
+            vec![
+                json!({ "type": "pending_messages", "messages": ["apple", "banana"], "fixed": 1 })
+            ]
+        );
+    }
+
+    #[test]
+    fn a_held_message_can_be_taken_back() {
+        let mut c = mid_turn(&[]);
+        c.encode(&json!({ "op": "user_message", "content": "oops", "images": ["/tmp/a.png"] }))
+            .unwrap();
+        let back = c.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events,
+            vec![
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
+                json!({ "type": "unqueued", "content": "oops", "images": ["/tmp/a.png"] }),
+            ]
+        );
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert!(ended.frames.is_empty());
+    }
+
+    #[test]
+    fn queued_messages_taken_in_together_each_show_as_sent() {
+        let mut c = mid_turn(&["apple", "banana"]);
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
+                json!({ "type": "user_message", "content": "apple" }),
+                json!({ "type": "user_message", "content": "banana" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_names_are_compact() {
+        assert_eq!(
+            compact_model("claude-opus-4-8[1m]", "opus[1m]"),
+            "Opus 4.8 (1M)"
+        );
+        assert_eq!(
+            compact_model("claude-haiku-4-5-20251001", "haiku"),
+            "Haiku 4.5"
+        );
+        assert_eq!(compact_model("", "sonnet"), "Sonnet");
+    }
+
+    #[test]
+    fn user_tools_are_served_in_process() {
+        let mut c = claude();
+        let mcp = |id: u64, message: Value| {
+            Line::Frame(
+                json!({ "type": "control_request", "request_id": format!("m{id}"), "request": { "subtype": "mcp_message", "server_name": "jucode", "message": message } }),
+            )
+        };
+        let listed = c.translate(mcp(
+            1,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        ));
+        let reply: Value = serde_json::from_str(&listed.frames[0]).unwrap();
+        let tools = &reply["response"]["response"]["mcp_response"]["result"]["tools"];
+        assert_eq!(tools[0]["name"], "present_files");
+        assert_eq!(tools[0]["_meta"]["anthropic/alwaysLoad"], true);
+        let called = c.translate(mcp(2, json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "present_files", "arguments": { "files": ["a.mp4"] } } })));
+        assert!(called.frames.is_empty());
+        let calls = c.take_calls();
+        assert_eq!((calls.len(), calls[0].name.as_str()), (1, "present_files"));
+        let answer: Value =
+            serde_json::from_str(&c.answer(&calls[0].token, Err("no such file: a.mp4".into()))[0])
+                .unwrap();
+        assert_eq!(answer["response"]["request_id"], "m2");
+        let response = &answer["response"]["response"]["mcp_response"];
+        assert_eq!(
+            (
+                response["id"].as_u64(),
+                response["result"]["isError"].as_bool()
+            ),
+            (Some(7), Some(true))
+        );
+        assert_eq!(tool_name("mcp__jucode__present_files"), "present_files");
+        assert_eq!(tool_name("mcp__jucode__other"), "mcp__jucode__other");
+        let allowed = command("s", &Options::default())
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .find(|arg| arg.starts_with("mcp__jucode__"))
+            .unwrap();
+        assert!(
+            allowed.contains("mcp__jucode__present_files,")
+                && allowed.ends_with("mcp__jucode__send_session"),
+            "{allowed}"
+        );
+    }
+
+    #[test]
+    fn app_tools_turned_off_are_not_served() {
+        let some = Options {
+            app_tools_off: vec!["present_files"],
+            ..Options::default()
+        };
+        let args = |options: &Options| -> Vec<String> {
+            command("s", options)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect()
+        };
+        assert!(!args(&some).iter().any(|arg| arg.contains("present_files")));
+        let mut c = Claude::new(&some);
+        let listed = c.translate(Line::Frame(
+            json!({ "type": "control_request", "request_id": "m1", "request": { "subtype": "mcp_message", "server_name": "jucode", "message": { "jsonrpc": "2.0", "id": 1, "method": "tools/list" } } }),
+        ));
+        let reply: Value = serde_json::from_str(&listed.frames[0]).unwrap();
+        assert_eq!(
+            reply["response"]["response"]["mcp_response"]["result"]["tools"][0]["name"],
+            "propose_schedule"
+        );
+        let none = Options {
+            app_tools_off: user_tools::NAMES.to_vec(),
+            ..Options::default()
+        };
+        assert!(!args(&none)
+            .iter()
+            .any(|arg| arg == "--mcp-config" || arg == "--allowedTools"));
+        let init = Claude::new(&none).start();
+        assert!(
+            init.iter()
+                .any(|frame| frame.contains("\"sdkMcpServers\":[]")),
+            "{init:?}"
+        );
+    }
+
+    #[test]
+    fn a_fork_resumes_the_conversation_as_a_new_one() {
+        let options = Options {
+            fork_from: Some("orig".into()),
+            resume_at: Some("u-9".into()),
+            ..Options::default()
+        };
+        let args: Vec<String> = command("new-id", &options)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let at = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(
+            args[at..at + 5],
+            [
+                "--resume",
+                "orig",
+                "--fork-session",
+                "--session-id",
+                "new-id"
+            ]
+        );
+        assert!(args.windows(2).any(|w| w == ["--resume-session-at", "u-9"]));
+    }
+
+    #[test]
+    fn replay_keeps_tool_cards() {
+        let mut calls = HashMap::new();
+        let call = json!({ "type": "assistant", "message": { "content": [
+            { "type": "tool_use", "id": "t1", "name": "mcp__jucode__present_files" },
+            { "type": "tool_use", "id": "t2", "name": "Bash", "input": { "command": "ls" } },
+            { "type": "tool_use", "id": "t3", "name": "Edit", "input": { "file_path": "/a.rs", "old_string": "x", "new_string": "y" } },
+            { "type": "tool_use", "id": "t4", "name": "TodoWrite", "input": { "todos": [] } },
+        ] } });
+        assert!(tool_rows(&call, &mut calls).is_empty());
+        let result = json!({ "type": "user", "toolUseResult": { "stdout": "a\n", "stderr": "" }, "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "t2", "content": "a" },
+            { "type": "tool_result", "tool_use_id": "t1", "content": [{ "type": "text", "text": "{\"files\":[]}" }] },
+            { "type": "tool_result", "tool_use_id": "t3", "content": "String not found", "is_error": true },
+            { "type": "tool_result", "tool_use_id": "t4", "content": "ok" },
+        ] } });
+        assert_eq!(
+            tool_rows(&result, &mut calls),
+            vec![
+                json!({ "role": "tool", "name": "bash", "output": "{\"command\":\"ls\",\"stdout\":\"a\\n\"}", "call_id": "t2" }),
+                json!({ "role": "tool", "name": "present_files", "output": "{\"files\":[]}", "call_id": "t1" }),
+                json!({ "role": "tool", "name": "str_replace", "output": "{\"error\":\"String not found\",\"path\":\"/a.rs\"}", "call_id": "t3", "is_error": true }),
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_stamps_when_each_row_was_written() {
+        let row = json!({ "timestamp": "2026-10-23T12:00:00.250Z" });
+        assert_eq!(row_time(&row), Some(1_792_756_800_250));
+        assert_eq!(row_time(&json!({})), None);
+    }
+
+    #[test]
+    fn saved_conversations_are_read_from_the_project_directory() {
+        let home = std::env::temp_dir().join(format!("claude-home-{}", std::process::id()));
+        let cwd = Path::new("/work/my_app");
+        let dir = home.join(".claude/projects/-work-my-app");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("11-22.jsonl"),
+            [
+                json!({ "type": "user", "message": { "content": "hello there" } }),
+                json!({ "type": "user", "isMeta": true, "message": { "content": "caveat" } }),
+                json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "hi" }, { "type": "tool_use" }] } }),
+                json!({ "type": "user", "message": { "content": "<command-name>/x</command-name>" } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "commandMode": "prompt", "prompt": [{ "type": "text", "text": "and the docs" }] } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "commandMode": "task-notification", "prompt": "<task-notification>" } }),
+                json!({ "type": "user", "message": { "content": "<command-name>/goal</command-name><command-args>done</command-args>" } }),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        let items = transcript_in(&home.join(".claude"), cwd, "11-22", &home.join("images"));
+        let listed = saved_in(&home.join(".claude"), cwd);
+        assert_eq!(
+            items,
+            vec![
+                json!({ "role": "user", "content": "hello there" }),
+                json!({ "role": "assistant", "content": "hi" }),
+                json!({ "role": "user", "content": "and the docs" }),
+                json!({ "role": "user", "content": "/goal done" })
+            ]
+        );
+        assert_eq!(listed[0].0, "11-22");
+        assert_eq!(listed[0].1, "hello there");
+        assert!(
+            transcript_in(&home.join(".claude"), cwd, "../etc", &home.join("images")).is_empty()
+        );
+
+        // A symlinked directory is saved under its real path.
+        let real = home.join("real-dir");
+        let link = home.join("link-dir");
+        fs::create_dir_all(&real).unwrap();
+        let _ = fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(unix)]
+        assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
+    }
+
+    #[test]
+    fn the_projects_extra_dirs_are_added_to_both_commands() {
+        let options = Options {
+            dirs: vec![PathBuf::from("/work/api"), PathBuf::from("/work/docs")],
+            ..Options::default()
+        };
+        for command in [command("s-1", &options), tui("s-1", &options, true)] {
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let joined = args.join(" ");
+            assert!(joined.contains("--add-dir /work/api"), "{joined}");
+            assert!(joined.contains("--add-dir /work/docs"), "{joined}");
+        }
+    }
+}

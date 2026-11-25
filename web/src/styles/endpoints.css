@@ -1,0 +1,353 @@
+/* Endpoints (接入指南) page. */
+/* ============ Endpoints (接入指南) — Premium Noir =============
+   Self-contained styling that mirrors the marketing hero on top of
+   the .premium-card glass + cursor-glow scaffolding. The page is
+   public, sits *outside* .pn-console, so we don't reuse any of the
+   console-scoped Radix overrides. */
+
+.ep-shell {
+  position: relative;
+  min-height: 100vh;
+  padding: 56px 24px 96px;
+  background:
+    radial-gradient(1200px 600px at 50% -10%,
+      color-mix(in oklab, var(--c-on-surface) 4%, transparent), transparent 60%),
+    var(--c-background);
+  overflow: hidden;
+}
+.ep-shell > .hero-pattern { z-index: 0; opacity: 0.55; }
+
+.ep-container {
+  position: relative;
+  z-index: 1;
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 36px;
+}
+
+.ep-hero { text-align: left; }
+.ep-title {
+  font-family: var(--font-display);
+  font-size: clamp(28px, 4vw, 44px);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0 0 12px;
+  background: linear-gradient(155deg,
+    var(--c-on-surface) 0%,
+    var(--c-on-surface) 62%,
+    color-mix(in oklab, var(--c-primary-bright) 55%, var(--c-on-surface) 45%) 100%);
+  -webkit-background-clip: text;
+          background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+.ep-sub {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--c-on-surface-variant);
+  max-width: 700px;
+}
+.ep-inline {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--c-card-faint-bg);
+  border: 1px solid var(--c-outline-variant);
+  color: var(--c-on-surface);
+}
+.ep-link {
+  color: color-mix(in oklab, var(--c-primary-bright) 80%, var(--c-on-surface));
+  font-weight: 500;
+}
+.ep-link:hover { text-decoration: underline; }
+
+/* Three endpoint cards. Use the existing .premium-card scaffolding
+   (cursor-glow border + glass) and add the accent-tinted top bar +
+   monospace URL block + click-to-copy footer. */
+.ep-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
+  gap: 16px;
+}
+.ep-card {
+  padding: 22px;
+  border-radius: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ep-card-title {
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--c-on-surface);
+  letter-spacing: -0.01em;
+}
+.ep-card-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ep-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ep-row-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--c-on-surface-variant);
+}
+.ep-card-url {
+  appearance: none;
+  background: var(--c-card-faint-bg);
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--c-on-surface);
+  transition: border-color var(--dur-base) var(--ease-io), background var(--dur-base) var(--ease-io), transform var(--dur-fast) var(--ease-out);
+  width: 100%;
+  font-family: inherit;
+}
+.ep-card-url code {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: var(--text-body-sm);
+  letter-spacing: -0.01em;
+  word-break: break-all;
+  color: var(--c-on-surface);
+}
+.ep-card-url:hover {
+  border-color: color-mix(in oklab, var(--c-primary) 40%, var(--c-outline-variant));
+  background: color-mix(in oklab, var(--c-primary) 3%, var(--c-card-faint-bg));
+}
+.ep-card-url:active { transform: translateY(1px); }
+.ep-card-url-empty { color: var(--c-on-surface-variant); }
+.ep-card-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--c-on-surface-variant);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--c-card-faint-bg);
+  border: 1px solid var(--c-outline-variant);
+  white-space: nowrap;
+  transition: color var(--dur-base) var(--ease-io), background var(--dur-base) var(--ease-io), border-color var(--dur-base) var(--ease-io);
+  flex-shrink: 0;
+}
+.ep-card-copy.is-copied {
+  color: var(--c-tertiary);
+  border-color: color-mix(in oklab, var(--c-tertiary) 40%, var(--c-outline-variant));
+}
+.ep-card-copy.is-error {
+  color: var(--c-error);
+  border-color: color-mix(in oklab, var(--c-error) 40%, var(--c-outline-variant));
+}
+.ep-card-hint {
+  font-size: var(--text-body-sm);
+  line-height: 1.55;
+  color: var(--c-on-surface-variant);
+}
+
+/* Accent left-bar on hover for each card variant. The cursor-glow
+   from .premium-card already paints a moving ring; this static bar
+   just gives a quieter identity per card type. */
+.ep-card-purple { box-shadow: inset 2px 0 0 color-mix(in oklab, var(--c-primary-bright) 70%, transparent); }
+.ep-card-blue   { box-shadow: inset 2px 0 0 color-mix(in oklab, var(--c-secondary) 70%, transparent); }
+.ep-card-amber  { box-shadow: inset 2px 0 0 color-mix(in oklab, var(--c-warning) 80%, transparent); }
+
+/* Snippet section — terminal chrome wrapping the active example. */
+.ep-snippet {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ep-snippet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.ep-snippet-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--c-on-surface);
+}
+.ep-tabbar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--c-card-faint-bg);
+  border: 1px solid var(--c-outline-variant);
+}
+.ep-tab {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--c-on-surface-variant);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background var(--dur-base) var(--ease-io), color var(--dur-base) var(--ease-io);
+}
+.ep-tab:hover { color: var(--c-on-surface); }
+.ep-tab.is-active {
+  background: var(--c-primary);
+  color: var(--c-on-primary);
+  box-shadow: none;
+}
+
+.ep-terminal {
+  background: var(--c-terminal-bg);
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 14px;
+  overflow: hidden;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.18),
+    0 18px 38px -18px rgba(0, 0, 0, 0.5);
+}
+.ep-terminal-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 11px 14px;
+  background: var(--c-terminal-header-bg);
+  border-bottom: 1px solid var(--c-outline-variant);
+}
+.ep-traffic {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.08);
+}
+.ep-traffic-r { background: var(--c-danger); }
+.ep-traffic-y { background: var(--c-warning); }
+.ep-traffic-g { background: var(--c-success-fill); }
+.ep-terminal-body { padding: 0; }
+
+.ep-codeblock { display: flex; flex-direction: column; }
+.ep-codeblock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-bottom: 1px dashed var(--c-outline-variant);
+  background: var(--c-card-faint-bg);
+}
+.ep-codeblock-file {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--c-on-surface-variant);
+}
+.ep-codeblock-lang {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--c-primary) 16%, transparent);
+  color: var(--c-primary-bright);
+  text-transform: uppercase;
+  font-size: var(--text-caption);
+  letter-spacing: 0.08em;
+}
+.ep-codeblock-title { color: var(--c-on-surface); }
+.ep-codeblock-copy {
+  appearance: none;
+  background: var(--c-card-faint-bg);
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 6px;
+  padding: 4px 9px;
+  color: var(--c-on-surface-variant);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  transition: color var(--dur-base) var(--ease-io), border-color var(--dur-base) var(--ease-io), background var(--dur-base) var(--ease-io);
+}
+.ep-codeblock-copy:hover { color: var(--c-on-surface); border-color: color-mix(in oklab, var(--c-on-surface) 25%, var(--c-outline-variant)); }
+.ep-codeblock-copy.is-copied {
+  color: var(--c-tertiary);
+  border-color: color-mix(in oklab, var(--c-tertiary) 40%, var(--c-outline-variant));
+}
+.ep-codeblock-copy.is-error {
+  color: var(--c-error);
+  border-color: color-mix(in oklab, var(--c-error) 40%, var(--c-outline-variant));
+}
+.ep-codeblock-pre {
+  margin: 0;
+  padding: 18px 18px 22px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--c-on-surface);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.ep-tips {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 12px;
+}
+.ep-tip-card {
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: var(--c-card-faint-bg);
+  border: 1px solid var(--c-outline-variant);
+}
+.ep-tip-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in oklab, var(--c-primary) 18%, transparent);
+  color: var(--c-primary-bright);
+  flex-shrink: 0;
+}
+.ep-tip-title {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-on-surface);
+  margin-bottom: 2px;
+}
+.ep-tip-body {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--c-on-surface-variant);
+}
+
